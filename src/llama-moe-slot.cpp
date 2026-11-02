@@ -701,6 +701,11 @@ install_timing start_demand(
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto & state = layers[il];
             const auto & layer = model.layers[il];
+            // Appended prediction blocks are not executed by the main model.
+            if (model.arch == LLM_ARCH_QWEN35MOE &&
+                il >= model.hparams.n_layer - model.hparams.nextn_predict_layers) {
+                continue;
+            }
 
             bind(state, layer.ffn_gate_up_exps, n_slots);
             bind(state, layer.ffn_gate_exps,    n_slots);
@@ -807,7 +812,7 @@ install_timing start_demand(
                         continue;
                     }
                     try {
-                        const int32_t expect = (model.arch == LLM_ARCH_QWEN4EXP &&
+                        const int32_t expect = (llm_arch_supports_les(model.arch) &&
                             !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS"))
                             ? int32_t(fam[k].first->ne[2])
                             : (layer_width[il] > 0 ? layer_width[il] : decode_window + prefetch_slots);
@@ -830,7 +835,7 @@ install_timing start_demand(
                 if (fail.empty()) {
                     finalize_pack(state.dec_bindings, state.dec_pack_order, state.dec_pack_ok,
                                   state.dec_pack_base, state.dec_pack_stride, state.dec_pack_path);
-                    if (model.arch == LLM_ARCH_QWEN4EXP && std::getenv("LLAMA_LES_DECODE_BANK") &&
+                    if (llm_arch_supports_les(model.arch) && std::getenv("LLAMA_LES_DECODE_BANK") &&
                         prefetch_unified && layer_width[il] == 15 && state.window_width > 15) {
                         state.protected_cache.configure(15, state.window_width, n_expert);
                     }
@@ -1710,7 +1715,7 @@ install_timing start_demand(
 
     bool prefill_pipeline_enabled(int n_rows) const {
 #if defined(__APPLE__) && TARGET_OS_OSX
-        if (model.arch != LLM_ARCH_QWEN4EXP || n_rows < 1024) {
+        if (!llm_arch_supports_les(model.arch) || n_rows < 1024) {
             return false;
         }
         const char * value = std::getenv("LLAMA_MOE_PREFILL_PIPELINE");
@@ -2385,8 +2390,8 @@ bool llama_moe_slot_runtime::adaptive_phase_change(bool decode) const {
 
 void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
     if (!adaptive_phase_change(decode)) return;
-    if (pimpl->model.arch != LLM_ARCH_QWEN4EXP || pimpl->decode_window <= 0)
-        throw std::runtime_error("adaptive LES requires Qwen4Exp with decode windows");
+    if (!llm_arch_supports_les(pimpl->model.arch) || pimpl->decode_window <= 0)
+        throw std::runtime_error("adaptive LES requires a supported Qwen MoE with decode windows");
     pimpl->join_demand();
     pimpl->lookahead.drain();
     pimpl->stop_prefill_read();

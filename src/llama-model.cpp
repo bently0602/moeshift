@@ -1224,7 +1224,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     load_arch_hparams(ml);
 
     if (pimpl->moe_experts) {
-        if (arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP) {
+        if (!llm_arch_supports_les(arch)) {
             throw std::runtime_error("MoE experts currently supports only qwen35moe and qwen4exp");
         }
         if (pimpl->moe_experts->expert_count() != (int32_t) hparams.n_expert ||

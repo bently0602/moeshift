@@ -1,4 +1,3 @@
-extern thread_local struct ggml_tensor * les_parallel_ffn;
 #include "llama-graph.h"
 #include "../ggml/src/ggml-metal/ggml-metal-impl.h"
 #include "../ggml/src/ggml-impl.h"
@@ -1638,7 +1637,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
 
-    if (arch == LLM_ARCH_QWEN4EXP && moe_decode_phase && les_parallel_ffn) {
+    if (llm_arch_supports_les(arch) && moe_decode_phase && les_parallel_ffn) {
         ggml_build_forward_expand(gf, selected_experts_mm);
         ggml_build_forward_expand(gf, les_parallel_ffn);
         les_parallel_ffn = nullptr;
@@ -1647,7 +1646,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
 
-    if (arch == LLM_ARCH_QWEN4EXP && moe_decode_phase && n_tokens == 1 &&
+    if (llm_arch_supports_les(arch) && moe_decode_phase && n_tokens == 1 &&
         moe_slots && !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && loras->empty()) {
@@ -3232,4 +3231,69 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+ggml_tensor * llm_graph_context::build_qwen_moe_ffn(ggml_tensor * cur, const llama_layer & L, const int il) {
+    GGML_ASSERT(L.ffn_gate_inp != nullptr);
+
+    ggml_tensor * p_up   = moe_decode_phase && L.ffn_up_exps_dec      ? L.ffn_up_exps_dec      : L.ffn_up_exps;
+    ggml_tensor * p_gate = moe_decode_phase && L.ffn_gate_exps_dec    ? L.ffn_gate_exps_dec    : L.ffn_gate_exps;
+    ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
+    ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
+
+    auto build_shared = [&]() -> ggml_tensor * {
+        ggml_tensor * ffn_shexp =
+            build_ffn(cur,
+                L.ffn_up_shexp, NULL, L.ffn_up_shexp_s,
+                L.ffn_gate_shexp, NULL, L.ffn_gate_shexp_s,
+                L.ffn_down_shexp, NULL, L.ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+        ggml_tensor * shared_gate = build_lora_mm(L.ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+
+        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        cb(shared_gate, "shared_expert_gate_sigmoid", il);
+
+        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+        cb(ffn_shexp, "ffn_shexp_gated", il);
+
+        return ffn_shexp;
+    };
+    ggml_tensor * shared_ready = nullptr;
+    if (moe_decode_phase && moe_slots && L.ffn_up_shexp) {
+        shared_ready = build_shared();
+        les_parallel_ffn = shared_ready;
+    }
+
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            L.ffn_gate_inp,
+            p_up,
+            p_gate,
+            p_down,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, p_gu,
+            L.ffn_up_exps_s,
+            L.ffn_gate_exps_s,
+            L.ffn_down_exps_s);
+    cb(moe_out, "ffn_moe_out", il);
+
+    // shared experts, as in the Qwen3Next reference
+    if (L.ffn_up_shexp != nullptr) {
+        ggml_tensor * ffn_shexp = shared_ready ? shared_ready : build_shared();
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cb(cur, "ffn_out", il);
+    } else {
+        cur = moe_out;
+    }
+
+    return cur;
 }
