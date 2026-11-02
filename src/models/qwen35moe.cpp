@@ -207,7 +207,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_transformer_layers - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked) {
+        if (il == n_transformer_layers - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked && !moe_slots) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -224,8 +224,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cb(attn_post_norm, "attn_post_norm", il);
 
         ggml_tensor * lookahead_next = nullptr;
-        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && ubatch.n_tokens == 1 &&
-            il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
+        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && moe_decode_phase &&
+            il + 1 < n_transformer_layers && model.layers[il + 1].ffn_gate_inp != nullptr) {
             ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, attn_post_norm);
             cb(prefetch_router_logits, "prefetch_router_logits", il);
             lookahead_next = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth()));
@@ -242,6 +242,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
+
+        // Preserve batch width through the MoE so slot writes match its prefill/decode views.
+        if (il == n_transformer_layers - 1 && inp_out_ids && cparams.embeddings_pre_norm_masked && moe_slots) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -516,67 +521,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 }
 
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
-    // Check if this is an MoE layer
-    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
-
-    // MoE-SSD 阶段选张量：decode 用每层独立的窗口张量（base 上的 view），
-    // prefill 用共享窗口。两者 ne[2] 不同，所以必须由阶段决定，不能共用。
-    const auto & L = model.layers[il];
-    ggml_tensor * p_up   = moe_decode_phase && L.ffn_up_exps_dec      ? L.ffn_up_exps_dec      : L.ffn_up_exps;
-    ggml_tensor * p_gate = moe_decode_phase && L.ffn_gate_exps_dec    ? L.ffn_gate_exps_dec    : L.ffn_gate_exps;
-    ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
-    ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
-
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            p_up,
-            p_gate,
-            p_down,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, p_gu,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
-
-    // Add shared experts if present - following Qwen3Next reference implementation
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // Apply shared expert gating as in the reference implementation
-        // The shared expert has its own gate that is sigmoided
-        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
-        // Apply sigmoid to the gate
-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
-
-
-        // Apply the gate to the shared expert output
-        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
-        cb(ffn_shexp, "ffn_shexp_gated", il);
-
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
-    } else {
-        cur = moe_out;
-    }
-
-    return cur;
+    return build_qwen_moe_ffn(cur, model.layers[il], il);
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 MoE

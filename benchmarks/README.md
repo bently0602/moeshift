@@ -10,8 +10,9 @@ in the issue; the runner collects no system or personal information.
 
 Requires Python 3 (standard library only), an installed or built MoEShift, and a
 working model configuration. Download or clone this repository and open Terminal
-in its root folder. Use the recommended Qwen 3.8 Flash Next IQ3_XXS model for
-comparable results. The configured context must accommodate the long prompt plus
+in its root folder. Set the `model` field in both `short.json` and `long.json` to your configured
+model ID. Compare results for the same model and quantization; the historical
+Flash Next/Strata comparison in the main README uses a separate 256-output-token run. The configured context must accommodate the long prompt plus
 512 output tokens; `args.ctx-size` of at least `8192` is recommended.
 
 Stop any running MoEShift instance and disconnect other inference clients, then:

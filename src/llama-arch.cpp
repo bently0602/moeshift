@@ -1001,3 +1001,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
             return true;
     }
 }
+
+bool llm_arch_supports_les(const llm_arch & arch) {
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
+}

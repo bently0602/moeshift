@@ -1438,7 +1438,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!quiet && !decode && std::getenv("LLAMA_LES_DECODE_BANK"))
             fprintf(stderr, "moeshift: adaptive-batch: tokens=%u cap=%u\n", ubatch.n_tokens, cparams.n_ubatch);
     }
-    if (model.arch == LLM_ARCH_QWEN4EXP &&
+    if (llm_arch_supports_les(model.arch) &&
         moe_slots && ubatch.n_tokens <= uint32_t(moe_slots->window_max_rows())) {
         size_t reserved = 0;
         for (auto * backend : backend_ptrs) reserved += ggml_backend_sched_get_buffer_size(sched.get(), backend);

@@ -1,6 +1,7 @@
 # Protected decode cache
 
-MoEShift uses a two-tier, demand-scored LRFU cache for Qwen 3.8 Flash Next.
+Both [supported architectures](../architecture.md#supported-llm-architectures)
+use the same two-tier, demand-scored LRFU cache.
 Configure it inside the model profile's `env` object in
 `~/.config/moeshift/config.json`:
 
@@ -59,13 +60,17 @@ weights or precision. The half-life is not a measured optimum for every workload
 ## Capacity and memory
 
 The protected-slot limit is `min(prefill bank, expert count, 1024) - 15`.
-With 512 experts and a 512-slot prefill bank, valid values are 0–497.
-Invalid capacities are rejected.
+With the shipped prefill banks, valid values are 0–497 for Flash Next and
+0–241 for Qwen3.5. Invalid capacities are rejected.
 
-For the reference IQ3_XXS files, adding one protected slot to each of 48 layers
-reserves 83.8144 MB of expert tensors (decimal). The default 24 slots therefore
-reserve 2,011.5456 MB, plus metadata. This is tensor allocation, not total
-process memory. The score vectors use 98,304 bytes (512 floats × 48 layers).
+| Tested quantization | Expert layers | Extra memory per protected slot across layers |
+|---|---:|---:|
+| Flash Next GSQ-RCO IQ3_XXS | 48 | 83.8144 MB |
+| Qwen3.5 UD Q6_K XL | 40 | 113.8852 MB |
+
+These are expert tensor bytes (decimal), not total process memory. Each profile
+ships with 24 protected slots. Larger caches can reduce reads but use more RAM;
+measure decode speed and memory pressure before retaining an increase.
 
 Set `env.LLAMA_MOE_QUIET` to `0` to see `protected-cache` diagnostics.
 The reported recent/protected counts and expert bytes describe the active cache.

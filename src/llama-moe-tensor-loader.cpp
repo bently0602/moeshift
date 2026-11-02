@@ -33,7 +33,7 @@ llama_moe_tensor_loader::llama_moe_tensor_loader(llama_model_base & model, llama
     }
     // Qwen's mixed quantizations can share transient prefill storage. Decode
     // windows use byte offsets, so different expert strides never overlap.
-    if (model.arch == LLM_ARCH_QWEN4EXP && !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS")) {
+    if (llm_arch_supports_les(model.arch) && !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS")) {
         for (int fi = 0; fi < 4; ++fi) {
             std::vector<int> members;
             for (const auto & group : groups[fi]) {
@@ -62,7 +62,7 @@ llama_moe_tensor_loader::llama_moe_tensor_loader(llama_model_base & model, llama
                 const auto * e = model.moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
                 bytes += width_of(il) * e->bytes_per_expert;
             }
-            if (model.arch == LLM_ARCH_QWEN4EXP && dec_enabled) {
+            if (llm_arch_supports_les(model.arch) && dec_enabled) {
                 size_t stride_sum = 0;
                 for (int il : kv.second)
                     stride_sum += model.moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str())->bytes_per_expert;
@@ -163,7 +163,7 @@ void llama_moe_tensor_loader::finish() {
         };
 
         int overlay_width = 0;
-        if (model.arch == LLM_ARCH_QWEN4EXP && dec_enabled &&
+        if (llm_arch_supports_les(model.arch) && dec_enabled &&
             !std::getenv("LLAMA_LES_DECODE_BANK") &&
             !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS")) {
             overlay_width = 512;
@@ -204,7 +204,7 @@ void llama_moe_tensor_loader::finish() {
                 }
                 resident += ggml_nbytes(base);
                 n_grp++;
-                if (model.arch == LLM_ARCH_QWEN4EXP && !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS")) {
+                if (llm_arch_supports_les(model.arch) && !std::getenv("LLAMA_QWEN_SEPARATE_PREFILL_BANKS")) {
                     size_t max_stride = e->bytes_per_expert;
                     for (int il : members) max_stride = std::max(max_stride, (model.layers[il].*fams[fi].pf)->nb[2]);
                     size_t decode_offset = overlay_width ? 0 : prefill_cap * max_stride;

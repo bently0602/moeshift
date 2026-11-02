@@ -23,7 +23,7 @@ private:
     int64_t width_of(int il) const {
         if (!dec_enabled || il < 0 || il >= (int) layer_c.size()) return 0;
         const char * unified = std::getenv("LLAMA_MOE_PREFETCH_UNIFIED");
-        const bool protected_cache = model.arch == LLM_ARCH_QWEN4EXP &&
+        const bool protected_cache = llm_arch_supports_les(model.arch) &&
             std::getenv("LLAMA_LES_DECODE_BANK") && layer_c[il] == 12 && k_pf == 3 &&
             !(unified && *unified == '0');
         const int maximum = int(std::min<int64_t>({prefill_cap, model.hparams.n_expert, 1024})) - 15;

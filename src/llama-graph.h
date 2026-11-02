@@ -840,6 +840,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     llama_moe_slot_runtime       * moe_slots;
     bool                           moe_decode_phase;
+    mutable ggml_tensor *          les_parallel_ffn = nullptr;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -911,6 +912,8 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    ggml_tensor * build_qwen_moe_ffn(ggml_tensor * cur, const llama_layer & layer, int il);
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

@@ -16,10 +16,20 @@ and coding while the model works—all locally, with no cloud subscription.
 *Qwen 3.8 Flash Next running locally with MoEShift, connected to OpenCode.*
 
 **Alpha release.** The core runtime is working, and the project is evolving
-quickly. You may encounter rough edges; your feedback helps shape the next release. This build
-was tested using ISTA-DASLab GSQ-RCO IQ3_XXS so far.
+quickly. You may encounter rough edges; your feedback helps shape the next release.
+Tested models and quantizations are listed below.
 
-## Benchmarks
+## Tested models and benchmarks
+
+| Model | GGUF architecture | Tested quantization |
+|---|---|---|
+| Qwen 3.8 Flash Next (125B) | `qwen4exp` | ISTA-DASLab GSQ-RCO IQ3_XXS |
+| Qwen3.5-35B-A3B | `qwen35moe` | UD Q6_K XL (Q6_K/Q8_0 experts) |
+
+Both use the shared SSD expert runtime on Apple Silicon. See
+[supported architectures](docs/architecture.md#supported-llm-architectures).
+
+### Qwen 3.8 Flash Next
 
 Compared with **Strata**, a popular choice for local MoE inference, on a
 **Mac mini M4 Pro with 24 GB unified memory**. Both ran Qwen 3.8 Flash Next
@@ -39,12 +49,28 @@ tokens and 256 output tokens. Strata: 0.2.7, build 0.1.52.
 Time includes server-measured prompt processing and generation, excluding
 startup. Memory is macOS `footprint -p` peak physical process footprint.
 
+### Qwen3.5-35B-A3B
+
+UD Q6_K XL on the same Mac mini M4 Pro with 24 GB unified memory.
+Medians of three measured runs after warmup, with no cached prompt tokens and
+512 output tokens, using the [benchmark runner](benchmarks/README.md).
+These runs use different output lengths from the Flash Next comparison above.
+
+| Measurement | Short prompt | Long prompt |
+|---|---|---|
+| Input tokens | 72 | 6,060 |
+| Inference time ↓ | **37.15 s** | **51.79 s** |
+| Prompt processing ↑ | **20.44 tok/s** | **420.33 tok/s** |
+| Text generation ↑ | **15.13 tok/s** | **13.72 tok/s** |
+
+Runtime tuning and peak process memory were not recorded in this report.
+
 ## What you need
 
 - A **Mac with Apple Silicon** (M-series).
 - At least **10 GB of RAM**.
-- A fast SSD with at least **120 GB of free space** for the model and its prepared
-  files.
+- A fast SSD with space for both the GGUF and prepared expert files: at least
+  **120 GB** for the Flash Next setup below, or about **60 GB** for Qwen3.5 UD Q6_K XL.
 - [Homebrew](https://brew.sh/), the package manager for macOS. If you have never
   used it, follow its installation instructions, then return here.
 
@@ -61,6 +87,10 @@ The installation includes model preparation tools. MoEShift creates
 your settings on subsequent launches and upgrades.
 
 ## 2. Download the model
+
+The walkthrough uses Flash Next. For Qwen3.5, use
+`Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf`, prepare its experts with the same commands,
+and configure the `qwen-3.5-35b-a3b-q6-xl` profile instead.
 
 Use the **IQ3_XXS quantization by ISTA-DASLab**:
 [Qwen3.8-Flash-Next-GSQ-RCO-GGUF on Hugging Face](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS).
@@ -108,7 +138,7 @@ Open the configuration:
 open -e "$HOME/.config/moeshift/config.json"
 ```
 
-Inside `models` → `qwen-3.8-flash-next-rco-gsq-iq3-xxs` → `args`, replace these two values:
+Inside `models` → your chosen model ID → `args`, replace these two values:
 
 | Setting | What to enter |
 |---|---|
@@ -116,7 +146,10 @@ Inside `models` → `qwen-3.8-flash-next-rco-gsq-iq3-xxs` → `args`, replace th
 | `moe-experts` | The full path to the folder created in step 3. |
 
 Use full paths in JSON (not `~` or `$HOME`), keep the quotes and commas, and save.
-Leave the other settings at their defaults for your first run.
+Both model profiles are included in the template. Existing user configurations
+are preserved; copy the desired profile from [the template](configs/moeshift.json)
+if it is missing. Use its model ID in API requests and clients. Leave the other
+settings at their defaults for your first run.
 
 
 ## 5. Start MoEShift
@@ -169,7 +202,7 @@ MoEShift to apply it.
 | Setting | Default | Direct effect |
 |---|---|---|
 | `args.ctx-size` | `65536` | Maximum conversation length in tokens. Lower it to limit memory growth during long conversations; raise it to allow longer conversations, with more memory use as they grow. |
-| `args.moe-prefill-bank` | `512` | Expert cache used when reading your prompt. More slots can reduce SSD reads and speed up prompt processing, using more RAM; fewer slots save RAM. |
+| `args.moe-prefill-bank` | `512` / `256`¹ | Expert cache used when reading your prompt. More slots can reduce SSD reads and speed up prompt processing, using more RAM; fewer slots save RAM. |
 | `args.prefill-max-tokens` | `3072` | Amount of prompt text processed per batch. Smaller batches reduce peak working memory; larger batches can improve prompt-processing speed. |
 | `env.LLAMA_MOE_PROTECTED_SLOTS` | `24` | Extra experts kept in memory while generating replies. More slots can reduce SSD reads and improve speed, using more RAM; fewer slots save RAM. |
 | `args.threads` | `10` | CPU threads available to inference. More threads can help CPU work but compete with other apps; more is not always faster. |
@@ -177,7 +210,9 @@ MoEShift to apply it.
 | `env.LLAMA_MOE_QUIET` | `1` | Keeps expert diagnostics out of Terminal. Set to `0` for more detail when investigating a problem. |
 | `port` | `8080` | Change this if another application already uses the port; use the same port in your client. |
 
-The default settings are tuned for Qwen 3.8 Flash Next RCO GSQ IQ3 XXS on Mac mini M4 Pro with 24GB unified memory that I used during my tests. The
+¹ Flash Next / Qwen3.5. Slot sizes depend on the model and quantization;
+equal slot counts do not imply equal memory use. The Flash Next defaults were
+tuned on a Mac mini M4 Pro with 24 GB unified memory. The
 [full configuration reference](configs/README.md) covers the remaining options,
 valid combinations and command-line overrides. Settings under `env` are edited
 in this file, rather than exported in Terminal.
