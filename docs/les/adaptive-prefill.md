@@ -25,7 +25,7 @@ slots; see [protected decode cache](protected-decode-cache.md).
 The server fills each batch with available prompt tokens up to the configured
 limit. Context checkpoints can split it further. The shared bank is reused across
 layers: 512 slots cover Flash Next's 512 experts;
-256 cover Qwen3.5's 256 experts.
+256 cover Qwen3.6's 256 experts.
 
 Before switching phases, the runtime synchronizes GPU work and drains expert
 readers. It invalidates cached mappings and sets the active Metal buffer ranges

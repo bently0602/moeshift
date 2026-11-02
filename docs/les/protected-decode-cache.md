@@ -61,12 +61,12 @@ weights or precision. The half-life is not a measured optimum for every workload
 
 The protected-slot limit is `min(prefill bank, expert count, 1024) - 15`.
 With the shipped prefill banks, valid values are 0–497 for Flash Next and
-0–241 for Qwen3.5. Invalid capacities are rejected.
+0–241 for Qwen3.6. Invalid capacities are rejected.
 
 | Tested quantization | Expert layers | Extra memory per protected slot across layers |
 |---|---:|---:|
 | Flash Next GSQ-RCO IQ3_XXS | 48 | 83.8144 MB |
-| Qwen3.5 UD Q6_K XL | 40 | 113.8852 MB |
+| Qwen3.6 UD Q6_K XL | 40 | 113.8852 MB |
 
 These are expert tensor bytes (decimal), not total process memory. Each profile
 ships with 24 protected slots. Larger caches can reduce reads but use more RAM;

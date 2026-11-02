@@ -5,7 +5,7 @@ The [standard template](moeshift.json) includes both tested model profiles:
 | Model ID and alias | Prefill slots | Protected slots per layer |
 |---|---:|---:|
 | `qwen-3.8-flash-next-rco-gsq-iq3-xxs` | 512 | 24 |
-| `qwen-3.5-35b-a3b-q6-xl` | 256 | 24 |
+| `qwen-3.6-35b-a3b-q6-xl` | 256 | 24 |
 
 Set the paths in the desired profile and use its ID in API requests. The server
 loads it on demand; switching models stops the previous worker. Existing user
@@ -38,7 +38,7 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `args.ctx-size`, `args.ctx-checkpoints` | `65536` tokens; `1` checkpoint |
 | `args.threads` | `10` CPU threads |
 | `args.prefill-max-tokens` | `3072` tokens per prefill microbatch |
-| `args.moe-prefill-bank`, `args.moe-decode-bank` | `512` / `256` shared expert slots during prefill (Flash Next / Qwen3.5); larger banks use more RAM; `0` shared slots retained during decode |
+| `args.moe-prefill-bank`, `args.moe-decode-bank` | `512` / `256` shared expert slots during prefill (Flash Next / Qwen3.6); larger banks use more RAM; `0` shared slots retained during decode |
 | `args.n-gpu-layers`, `args.flash-attn` | `99`, `on`; expert execution requires Metal |
 | `args.cache-type-k`, `args.cache-type-v` | `q8_0` KV quantization; the Qwen4Exp indexer stores keys only |
 | `args.no-mmap` | `true`; explicit reads for Qwen weights |

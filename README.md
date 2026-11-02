@@ -24,7 +24,7 @@ Tested models and quantizations are listed below.
 | Model | GGUF architecture | Tested quantization |
 |---|---|---|
 | Qwen 3.8 Flash Next (125B) | `qwen4exp` | ISTA-DASLab GSQ-RCO IQ3_XXS |
-| Qwen3.5-35B-A3B | `qwen35moe` | UD Q6_K XL (Q6_K/Q8_0 experts) |
+| Qwen3.6-35B-A3B | `qwen35moe` | UD Q6_K XL (Q6_K/Q8_0 experts) |
 
 Both use the shared SSD expert runtime on Apple Silicon. See
 [supported architectures](docs/architecture.md#supported-llm-architectures).
@@ -49,7 +49,7 @@ tokens and 256 output tokens. Strata: 0.2.7, build 0.1.52.
 Time includes server-measured prompt processing and generation, excluding
 startup. Memory is macOS `footprint -p` peak physical process footprint.
 
-### Qwen3.5-35B-A3B
+### Qwen3.6-35B-A3B
 
 UD Q6_K XL on the same Mac mini M4 Pro with 24 GB unified memory.
 Medians of three measured runs after warmup, with no cached prompt tokens and
@@ -59,9 +59,9 @@ These runs use different output lengths from the Flash Next comparison above.
 | Measurement | Short prompt | Long prompt |
 |---|---|---|
 | Input tokens | 72 | 6,060 |
-| Inference time ↓ | **37.15 s** | **51.79 s** |
-| Prompt processing ↑ | - | **420.33 tok/s** |
-| Text generation ↑ | **15.13 tok/s** | **13.72 tok/s** |
+| Inference time ↓ | **34.25 s** | **49.45 s** |
+| Prompt processing ↑ | - | **417.24 tok/s** |
+| Text generation ↑ | **16.50 tok/s** | **14.66 tok/s** |
 
 Runtime tuning and peak process memory were not recorded in this report.
 
@@ -70,7 +70,7 @@ Runtime tuning and peak process memory were not recorded in this report.
 - A **Mac with Apple Silicon** (M-series).
 - At least **10 GB of RAM**.
 - A fast SSD with space for both the GGUF and prepared expert files: at least
-  **120 GB** for the Flash Next setup below, or about **60 GB** for Qwen3.5 UD Q6_K XL.
+  **120 GB** for the Flash Next setup below, or about **60 GB** for Qwen3.6 UD Q6_K XL.
 - [Homebrew](https://brew.sh/), the package manager for macOS. If you have never
   used it, follow its installation instructions, then return here.
 
@@ -88,25 +88,35 @@ your settings on subsequent launches and upgrades.
 
 ## 2. Download the model
 
-The walkthrough uses Flash Next. For Qwen3.5, use
-`Qwen3.5-35B-A3B-UD-Q6_K_XL.gguf`, prepare its experts with the same commands,
-and configure the `qwen-3.5-35b-a3b-q6-xl` profile instead.
+Choose a model and quantization from its download page:
 
-Use the **IQ3_XXS quantization by ISTA-DASLab**:
-[Qwen3.8-Flash-Next-GSQ-RCO-GGUF on Hugging Face](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS).
-Download **both** files into the same folder, keeping their names:
+| Model | Download |
+|---|---|
+| Qwen 3.8 Flash Next | [ISTA-DASLab GGUF files](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main) |
+| Qwen3.6-35B-A3B | [Unsloth GGUF files](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) |
+
+Quantization is your choice: smaller files reduce storage and expert-cache memory;
+higher precision requires more space and memory. The benchmarks above apply only
+to the tested quantizations listed above.
+
+Download all shards of your chosen quantization into the same folder, keeping
+their names. Both models use the same preparation steps and the same
+`~/.config/moeshift/config.json`; each has its own entry under `models`.
+
+The commands below use Flash Next **GSQ-RCO IQ3_XXS** as an example:
 
 - [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf?download=true)
 - [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf?download=true)
 
-These are large downloads, about **76 GB combined**. If you already have these
-exact files, reuse them. MoEShift does not distribute or requantize the model.
+These two files total about **76 GB**. Reuse them if already downloaded.
+MoEShift does not distribute or requantize models.
 
 ## 3. Get the downloaded model ready to use
 
 Run this once to copy the model's specialized parts (“experts”) into files
-MoEShift can read directly from SSD. Keep both original GGUF downloads.
-Change `MODEL` if you downloaded them somewhere other than `~/Downloads`:
+MoEShift can read directly from SSD. Keep all original GGUF files.
+Set `MODEL` to your GGUF (the first shard for split files) and `EXPERTS` to a
+separate output folder for that model and quantization:
 
 ```sh
 MODEL="$HOME/Downloads/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
@@ -126,7 +136,8 @@ Then check that the new files match the downloaded model:
 ```
 
 Wait for both commands to finish successfully. Verification compares the copied
-weights with the originals. Keep the output folder intact (about **43 GB**).
+weights with the originals. Keep the output folder intact (about **43 GB** for
+the Flash Next IQ3_XXS example).
 If interrupted, retry into a new empty folder and verify again.
 
 ## 4. Set the model paths in the configuration file
@@ -210,7 +221,7 @@ MoEShift to apply it.
 | `env.LLAMA_MOE_QUIET` | `1` | Keeps expert diagnostics out of Terminal. Set to `0` for more detail when investigating a problem. |
 | `port` | `8080` | Change this if another application already uses the port; use the same port in your client. |
 
-¹ Flash Next / Qwen3.5. Slot sizes depend on the model and quantization;
+¹ Flash Next / Qwen3.6. Slot sizes depend on the model and quantization;
 equal slot counts do not imply equal memory use. The Flash Next defaults were
 tuned on a Mac mini M4 Pro with 24 GB unified memory. The
 [full configuration reference](configs/README.md) covers the remaining options,

@@ -12,11 +12,11 @@ configuration contains a profile for each tested model.
 | GGUF architecture | Tested model | Model-specific graph |
 |---|---|---|
 | `qwen4exp` | Qwen 3.8 Flash Next | Hybrid attention, hyper-connections, sparse-attention indexer and optional PLE |
-| `qwen35moe` | Qwen3.5-35B-A3B | Hybrid attention with standard residual connections and RMS normalization |
+| `qwen35moe` | Qwen3.6-35B-A3B | Hybrid attention with standard residual connections and RMS normalization |
 
 Both share expert loading, mixed-quantization prefill banks, adaptive phase
 changes, protected decode caching and Metal resident/missing execution.
-Appended Qwen3.5 MTP blocks are excluded from main-model expert scheduling.
+Appended Qwen3.6 MTP blocks are excluded from main-model expert scheduling.
 Tested quantizations and measurements are listed in the [README](../README.md#tested-models-and-benchmarks);
 other models using these architecture names have not been validated.
 
@@ -189,7 +189,7 @@ Prefill processes prompt microbatches using a shared expert bank. Decode uses
 smaller per-layer expert windows so that repeated token generation does not
 require retaining the full prefill bank.
 
-The profiles use 512 prefill slots for Flash Next or 256 for Qwen3.5, a zero-slot retained shared
+The profiles use 512 prefill slots for Flash Next or 256 for Qwen3.6, a zero-slot retained shared
 decode bank, and a separate per-layer decode allocation of **39 slots**:
 12 decode slots plus 3 prefetch slots form the 15-slot recent group, with
 24 additional protected slots. A slot holds the packed tensors for one expert;
