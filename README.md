@@ -60,7 +60,7 @@ These runs use different output lengths from the Flash Next comparison above.
 |---|---|---|
 | Input tokens | 72 | 6,060 |
 | Inference time ↓ | **37.15 s** | **51.79 s** |
-| Prompt processing ↑ | **20.44 tok/s** | **420.33 tok/s** |
+| Prompt processing ↑ | - | **420.33 tok/s** |
 | Text generation ↑ | **15.13 tok/s** | **13.72 tok/s** |
 
 Runtime tuning and peak process memory were not recorded in this report.
