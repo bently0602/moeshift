@@ -10,8 +10,13 @@ The [standard template](moeshift.json) includes both tested model profiles:
 ## Manual setup
 
 1. Download the GGUF for your model, keeping all shards together. If you
-   already prepared experts for that exact GGUF, skip to step 3. The
-   [tested downloads](../README.md#install-and-start-moeshift) are listed in the project README.
+   already prepared experts for that exact GGUF, skip to step 3.
+
+   | Tested model | GGUF downloads |
+   |---|---|
+   | ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF · IQ3_XXS | [Shard 1](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf?download=true) and [shard 2](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf?download=true) |
+   | unsloth/Qwen3.6-35B-A3B-GGUF · UD-Q6_K_XL | [Single GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf?download=true) |
+
 2. Prepare and verify the experts. For a Homebrew install, the example below
    assumes the Qwen3.6 GGUF is in Downloads. Adjust `MODEL` for your file
    (use the first shard for a split model) and choose a new or empty `EXPERTS`
