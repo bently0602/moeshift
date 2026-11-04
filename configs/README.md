@@ -7,17 +7,45 @@ The [standard template](moeshift.json) includes both tested model profiles:
 | `qwen-3.8-flash-next-rco-gsq-iq3-xxs` | 512 | 24 |
 | `qwen-3.6-35b-a3b-q6-xl` | 256 | 24 |
 
-Set the paths in the desired profile and use its ID in API requests. The server
-loads it on demand; switching models stops the previous worker. Existing user
-configurations are preserved, so copy missing profiles from the template.
-See [supported architectures](../docs/architecture.md#supported-llm-architectures).
-Run `moeshift` to use `~/.config/moeshift/config.json` by default.
-If `XDG_CONFIG_HOME` is set, the user path becomes `$XDG_CONFIG_HOME/moeshift/config.json`.
-Set `args.model` to the first GGUF shard and `args.moe-experts` to the prepared folder.
+## Manual setup
+
+1. Download the GGUF for your model, keeping all shards together. If you
+   already prepared experts for that exact GGUF, skip to step 3. The
+   [tested downloads](../README.md#install-and-start-moeshift) are listed in the project README.
+2. Prepare and verify the experts. For a Homebrew install, the example below
+   assumes the Qwen3.6 GGUF is in Downloads. Adjust `MODEL` for your file
+   (use the first shard for a split model) and choose a new or empty `EXPERTS`
+   directory. Keep both the GGUF and the prepared files.
+
+   ```sh
+   MODEL="$HOME/Downloads/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+   EXPERTS="$HOME/.moeshift/models/qwen-3.6-35b-a3b-q6-xl/experts"
+   PREFIX="$(brew --prefix moeshift)"
+   TOOL="$PREFIX/share/moeshift/tools/moe/experts.py"
+   "$PREFIX/libexec/bin/python" "$TOOL" extract --model "$MODEL" --out-dir "$EXPERTS"
+   "$PREFIX/libexec/bin/python" "$TOOL" verify --model "$MODEL" --experts "$EXPERTS"
+   ```
+
+3. Open the configuration file printed by the wizard. For the default or XDG location:
+
+   ```sh
+   open -e "${XDG_CONFIG_HOME:-$HOME/.config}/moeshift/config.json"
+   ```
+
+   Under `models`, find your model ID from the table above. In its `args`,
+   replace `model` with the full GGUF path and `moe-experts` with the full path
+   to the folder containing `manifest.json`. Use actual paths in JSON:
+   `~` and `$HOME` are shell shortcuts and are not expanded there.
+   Keep the existing alias and tuning values. You can remove profiles you do not use.
+
+4. Save the file and run `moeshift`. Use the displayed API URL and the model
+   ID in your client. The first inference request loads the model.
+
+## Configuration reference
 
 Lookup order: explicit `--config FILE`, `moeshift.json` in the current directory,
 `$XDG_CONFIG_HOME/moeshift/config.json`
-(or `~/.config/moeshift/config.json`), then the installed default.
+(or `~/.config/moeshift/config.json`). When none exists, an interactive launch opens the setup wizard.
 Profile paths resolve relative to the configuration file.
 
 CLI profile overrides apply to every configured model. The JSON profile is the
@@ -56,4 +84,6 @@ Use the argument names as CLI overrides (`--ctx-size`, `--threads`, etc.).
 set in the profile. Stop with Ctrl-C. The worker, its readers and the GPU
 keepalive terminate with the server, including after a forced server exit.
 
-The `env` entries above belong inside the JSON profile, not in your shell environment. The installed template is `share/moeshift/moeshift.json`. On first launch, if no current-directory or user configuration exists, MoEShift copies that template to the user path without overwriting an existing file. Edit its model paths before inference.
+The installed template is `share/moeshift/moeshift.json`. Guided setup writes only the selected profile. Manual setup copies both example profiles and prints the config location. File paths in the generated profile are absolute. Downloaded GGUFs and experts live under `~/.moeshift/models/<model-id>/`; local GGUFs stay in place.
+
+An invalid user configuration can be reconfigured interactively. MoEShift reports the reason and saves the original next to the replacement. For unattended startup, supply an existing configuration or pass `--config FILE`.

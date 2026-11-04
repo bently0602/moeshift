@@ -57,7 +57,7 @@ def scalar(reader: GGUFReader, key: str, default: Any = None) -> Any:
 
 
 def resolve_model_paths(model: Path) -> list[Path]:
-    model = model.expanduser().resolve()
+    model = model.expanduser().absolute()  # Keep shard names in symlink-based HF snapshots.
     reader = GGUFReader(str(model), "r")
     split_count = int(scalar(reader, "split.count", 1))
     if split_count == 1:
@@ -166,7 +166,7 @@ def copy_range(source: Any, output: Any, offset: int, size: int, label: str) -> 
         remaining -= len(data)
 
 
-def extract(args: argparse.Namespace) -> int:
+def extract(args: argparse.Namespace, *, on_layer=None, verbose=True) -> int:
     model_paths = resolve_model_paths(args.model)
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +183,7 @@ def extract(args: argparse.Namespace) -> int:
 
     with ExitStack() as stack:
         sources = [stack.enter_context(path.open("rb")) for path in model_paths]
-        for layer, layer_entries in sorted(by_layer.items()):
+        for index, (layer, layer_entries) in enumerate(sorted(by_layer.items()), 1):
             layer_entries.sort(key=lambda item: FAMILY_ORDER[item["tensor_family"]])
             stride = sum(entry["bytes_per_expert"] for entry in layer_entries)
             family_offset = 0
@@ -205,6 +205,9 @@ def extract(args: argparse.Namespace) -> int:
                             f"{entry['tensor_name']} expert {expert}",
                         )
 
+            if on_layer is not None:
+                on_layer(index, len(by_layer))
+
     manifest = {
         "schema_version": 1,
         "experts_kind": "omni_moe_gguf",
@@ -218,13 +221,14 @@ def extract(args: argparse.Namespace) -> int:
         json.dump(manifest, output, indent=2)
         output.write("\n")
 
-    total = sum(entry["exact_byte_length"] for entry in entries)
-    print(f"moeshift: wrote {len(entries)} tensors in {len(by_layer)} layers ({total} bytes)")
-    print(out_dir / "manifest.json")
+    if verbose:
+        total = sum(entry["exact_byte_length"] for entry in entries)
+        print(f"moeshift: wrote {len(entries)} tensors in {len(by_layer)} layers ({total} bytes)")
+        print(out_dir / "manifest.json")
     return 0
 
 
-def verify(args: argparse.Namespace) -> int:
+def verify(args: argparse.Namespace, *, verbose=True) -> int:
     model_paths = resolve_model_paths(args.model)
     manifest_path = args.experts.expanduser().resolve()
     if manifest_path.is_dir():
@@ -264,8 +268,9 @@ def verify(args: argparse.Namespace) -> int:
 
     if {entry["tensor_name"] for entry in entries} != set(expected_by_name):
         raise SystemExit("manifest tensor set does not match the requested GGUF tensors")
-    mode = "metadata" if args.metadata_only else "metadata and bytes"
-    print(f"moeshift: verified {len(entries)} tensors ({mode})")
+    if verbose:
+        mode = "metadata" if args.metadata_only else "metadata and bytes"
+        print(f"moeshift: verified {len(entries)} tensors ({mode})")
     return 0
 
 

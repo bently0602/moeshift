@@ -260,6 +260,8 @@ class RouterTest(unittest.TestCase):
         self.log.seek(0)
         output = self.log.read()
         self.assertIn("moeshift", output)
+        self.assertIn(f"moeshift: Ready. Listening on http://127.0.0.1:{self.port}/v1 with a b fail", output)
+        self.assertNotIn("moeshift models:", output)
         self.assertNotIn("LES router", output)
         for line in output.splitlines():
             if line.strip(): self.assertIn("moeshift", line)

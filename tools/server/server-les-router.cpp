@@ -4,6 +4,7 @@
 #include <cpp-httplib/httplib.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -165,6 +166,88 @@ struct les_worker {
         throw std::runtime_error("Worker failed to load model: " + name + " (see worker log)");
     }
 };
+
+void apply_overrides(json & config, int argc, char ** argv) {
+    for (int i = 0; i < argc; i += 2) {
+        require(i + 1 < argc, "Expected a value for " + std::string(argv[i]));
+        const std::string key(argv[i]);
+        if (key == "--port") {
+            config["port"] = json::parse(argv[i + 1]);
+            continue;
+        }
+        const std::map<std::string, std::string> env_options{
+            {"--moe-protected-slots", "LLAMA_MOE_PROTECTED_SLOTS"},
+            {"--moe-decode-window", "LLAMA_MOE_DECODE_WINDOW"}};
+        require(key.size() > 2 && key.substr(0, 2) == "--", "Expected an option");
+        for (auto & profile : config.at("models")) {
+            const auto env = env_options.find(key);
+            if (env != env_options.end()) profile["env"][env->second] = argv[i + 1];
+            else if (key == "--no-mmap") profile["args"]["no-mmap"] = json::parse(argv[i + 1]);
+            else profile["args"][key.substr(2)] = argv[i + 1];
+        }
+    }
+}
+
+void validate_config(const json & config, const std::filesystem::path & base, std::string & binary,
+                     common_params & params, std::set<std::string> & aliases) {
+    check_keys(config, {"binary", "host", "port", "models"});
+    if (config.contains("binary")) binary = resolve_path(base, config.at("binary"));
+    else {
+#ifdef __APPLE__
+        uint32_t size = 0;
+        _NSGetExecutablePath(nullptr, &size);
+        std::vector<char> path(size);
+        require(_NSGetExecutablePath(path.data(), &size) == 0, "Cannot resolve executable");
+        binary = std::filesystem::canonical(path.data()).string();
+#else
+        throw std::runtime_error("MoEShift requires macOS");
+#endif
+    }
+    require(access(binary.c_str(), X_OK) == 0, "Worker binary is not executable: " + binary);
+    require(config.at("host").is_string(), "host must be a string");
+    params.hostname = scalar(config.at("host"));
+    require(params.hostname == "127.0.0.1" || params.hostname == "::1" || params.hostname == "localhost",
+            "MoEShift only accepts localhost addresses");
+    require(config.at("port").is_number_integer(), "port must be an integer");
+    require(config.at("port") > 0 && config.at("port") <= 65535, "port must be in 1..65535");
+    params.port = config.at("port").get<int>();
+    params.timeout_read = params.timeout_write = 600;
+    const auto & models = config.at("models");
+    require(models.is_object() && !models.empty(), "models must be a nonempty object");
+    const std::set<std::string> allowed_env{
+        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
+        "LLAMA_MOE_PREFETCH_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH",
+        "LLAMA_MOE_PREFILL_PIPELINE", "LLAMA_MOE_PROTECTED_SLOTS", "LLAMA_MOE_QUIET"};
+    for (const auto & entry : models.items()) {
+        scalar(entry.key());
+        check_keys(entry.value(), {"args", "env"});
+        const auto & args = entry.value().at("args");
+        const auto & env = entry.value().at("env");
+        check_keys(args, moeshift_model_options);
+        check_keys(env, allowed_env);
+        resolve_path(base, args.at("model"));
+        resolve_path(base, args.at("moe-experts"));
+        require(args.at("alias").is_string(), "alias must be a string");
+        const auto alias = scalar(args.at("alias"));
+        require(alias == entry.key(), "alias must match its models key: " + entry.key());
+        require(alias.find(',') == std::string::npos, "One alias is allowed per profile");
+        for (const auto & arg : args.items()) {
+            if (arg.key() == "no-mmap") {
+                require(arg.value().is_boolean(), "no-mmap must be a boolean");
+            } else {
+                scalar(arg.value());
+            }
+        }
+        for (const auto & value : env.items()) { scalar(value.value()); }
+        if (env.contains("LLAMA_MOE_PROTECTED_SLOTS") && scalar(env.at("LLAMA_MOE_PROTECTED_SLOTS")) != "0") {
+            require(env.contains("LLAMA_MOE_DECODE_WINDOW") && scalar(env.at("LLAMA_MOE_DECODE_WINDOW")) == "12" &&
+                    env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")) == "3" &&
+                    env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH")) == "1",
+                    "Protected LRFU cache requires decode window 12 and enabled prefetch depth 3; set protected slots to 0 to disable it");
+        }
+        aliases.insert(alias);
+    }
+}
 #endif
 } // namespace
 
@@ -175,90 +258,34 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
     std::cerr << "moeshift configuration router currently requires macOS or Linux\n";
     return 1;
 #else
+    bool validating_file = false;
     try {
         const auto base = std::filesystem::absolute(config_path).parent_path();
         std::ifstream input(config_path);
-        require(input.good(), "Cannot open configuration file");
+        require(input.good(), std::string("Cannot open configuration file: ") + config_path);
+        validating_file = true;
         auto config = json::parse(input);
-        for (int i = 0; i < argc; i += 2) {
-            require(i + 1 < argc, "Expected a value for " + std::string(argv[i]));
-            const std::string key(argv[i]);
-            if (key == "--port") {
-                config["port"] = json::parse(argv[i + 1]);
-                continue;
-            }
-            const std::map<std::string, std::string> env_options{
-                {"--moe-protected-slots", "LLAMA_MOE_PROTECTED_SLOTS"},
-                {"--moe-decode-window", "LLAMA_MOE_DECODE_WINDOW"}};
-            require(key.size() > 2 && key.substr(0, 2) == "--", "Expected an option");
-            for (auto & profile : config.at("models")) {
-                const auto env = env_options.find(key);
-                if (env != env_options.end()) profile["env"][env->second] = argv[i + 1];
-                else if (key == "--no-mmap") profile["args"]["no-mmap"] = json::parse(argv[i + 1]);
-                else profile["args"][key.substr(2)] = argv[i + 1];
-            }
-        }
-        check_keys(config, {"binary", "host", "port", "models"});
         std::string binary;
-        if (config.contains("binary")) binary = resolve_path(base, config.at("binary"));
-        else {
-#ifdef __APPLE__
-            uint32_t size = 0;
-            _NSGetExecutablePath(nullptr, &size);
-            std::vector<char> path(size);
-            require(_NSGetExecutablePath(path.data(), &size) == 0, "Cannot resolve executable");
-            binary = std::filesystem::canonical(path.data()).string();
-#else
-            throw std::runtime_error("MoEShift requires macOS");
-#endif
-        }
-        require(access(binary.c_str(), X_OK) == 0, "Worker binary is not executable: " + binary);
         common_params params;
-        require(config.at("host").is_string(), "host must be a string");
-        params.hostname = scalar(config.at("host"));
-        require(params.hostname == "127.0.0.1" || params.hostname == "::1" || params.hostname == "localhost",
-                "MoEShift only accepts localhost addresses");
-        require(config.at("port").is_number_integer(), "port must be an integer");
-        require(config.at("port") > 0 && config.at("port") <= 65535, "port must be in 1..65535");
-        params.port = config.at("port").get<int>();
-        params.timeout_read = params.timeout_write = 600;
-        const auto & models = config.at("models");
-        require(models.is_object() && !models.empty(), "models must be a nonempty object");
         std::set<std::string> aliases;
-        const std::set<std::string> allowed_env{
-            "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
-            "LLAMA_MOE_PREFETCH_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH",
-            "LLAMA_MOE_PREFILL_PIPELINE", "LLAMA_MOE_PROTECTED_SLOTS", "LLAMA_MOE_QUIET"};
-        for (const auto & entry : models.items()) {
-            scalar(entry.key());
-            check_keys(entry.value(), {"args", "env"});
-            const auto & args = entry.value().at("args");
-            const auto & env = entry.value().at("env");
-            check_keys(args, moeshift_model_options);
-            check_keys(env, allowed_env);
-            resolve_path(base, args.at("model"));
-            resolve_path(base, args.at("moe-experts"));
-            require(args.at("alias").is_string(), "alias must be a string");
-            const auto alias = scalar(args.at("alias"));
-            require(alias == entry.key(), "alias must match its models key: " + entry.key());
-            require(alias.find(',') == std::string::npos, "One alias is allowed per profile");
-            for (const auto & arg : args.items()) {
-                if (arg.key() == "no-mmap") {
-                    require(arg.value().is_boolean(), "no-mmap must be a boolean");
-                } else {
-                    scalar(arg.value());
-                }
+        if (argc) {
+            // Validate the saved file separately only when the overridden profile fails.
+            auto overridden = config;
+            try {
+                apply_overrides(overridden, argc, argv);
+                validate_config(overridden, base, binary, params, aliases);
+                config = std::move(overridden);
+            } catch (const std::exception &) {
+                validating_file = true;
+                validate_config(config, base, binary, params, aliases);
+                validating_file = false;
+                throw;
             }
-            for (const auto & value : env.items()) { scalar(value.value()); }
-            if (env.contains("LLAMA_MOE_PROTECTED_SLOTS") && scalar(env.at("LLAMA_MOE_PROTECTED_SLOTS")) != "0") {
-                require(env.contains("LLAMA_MOE_DECODE_WINDOW") && scalar(env.at("LLAMA_MOE_DECODE_WINDOW")) == "12" &&
-                        env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")) == "3" &&
-                        env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH")) == "1",
-                        "Protected LRFU cache requires decode window 12 and enabled prefetch depth 3; set protected slots to 0 to disable it");
-            }
-            aliases.insert(alias);
+        } else {
+            validate_config(config, base, binary, params, aliases);
         }
-
+        const auto & models = config.at("models");
+        validating_file = false;
         std::mutex mutex;
         std::condition_variable cv;
         bool busy = false;
@@ -310,7 +337,19 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
         http.post("/v1/completions", infer);
         require(http.start(), "HTTP startup failed");
         http.is_ready.store(true);
-        std::cerr << "moeshift listening on " << http.listening_address << "/v1\n";
+        if (isatty(STDERR_FILENO)) {
+            const char * term = std::getenv("TERM");
+            const bool color = !std::getenv("NO_COLOR") && (!term || std::strcmp(term, "dumb") != 0);
+            std::cerr << "\n" << (color ? "\033[1;32m" : "") << "✓  MoEShift is ready!"
+                      << (color ? "\033[0m" : "") << "\n\n"
+                      << "   Local API   " << http.listening_address << "/v1\n";
+            for (const auto & alias : aliases) std::cerr << "   Model       " << alias << '\n';
+            std::cerr << "\n   Press Ctrl-C to stop.\n\n";
+        } else {
+            std::cerr << "moeshift: Ready. Listening on " << http.listening_address << "/v1 with";
+            for (const auto & alias : aliases) std::cerr << " " << alias;
+            std::cerr << "\n";
+        }
         while (!stop_requested) { std::this_thread::sleep_for(100ms); }
         http.stop();
         {
@@ -321,8 +360,8 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
         if (http.thread.joinable()) { http.thread.join(); }
         return 0;
     } catch (const std::exception & e) {
-        std::cerr << "moeshift: " << e.what() << '\n';
-        return 1;
+        std::cerr << "moeshift: " << (validating_file ? std::string(config_path) + ": " : "") << e.what() << '\n';
+        return validating_file ? invalid_router_config : 1;
     }
 #endif
 }

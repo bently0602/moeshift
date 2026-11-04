@@ -60,40 +60,63 @@ int main(int argc, char ** argv) {
                       << "Profile options override the configuration file; inference parallelism is always 1.\n";
             return 0;
         }
-        std::string config = "moeshift.json";
-        int first = 1;
-        if (argc > 1 && std::string(argv[1]) == "--config") {
-            if (argc < 3) { std::cerr << "moeshift: --config requires a file\n"; return 1; }
-            config = argv[2]; first = 3;
-        } else if (!std::filesystem::exists(config)) {
-            const char * home = std::getenv("HOME");
-            const char * xdg = std::getenv("XDG_CONFIG_HOME");
-            const auto user_config = xdg && *xdg ? std::filesystem::path(xdg) / "moeshift/config.json"
-                : std::filesystem::path(home ? home : "") / ".config/moeshift/config.json";
-            if (std::filesystem::exists(user_config)) config = user_config.string();
-            else {
+        try {
+            std::filesystem::path config = "moeshift.json";
+            int first = 1;
+            bool user_file = false;
+            if (argc > 1 && std::string(argv[1]) == "--config") {
+                if (argc < 3) { std::cerr << "moeshift: --config requires a file\n"; return 1; }
+                config = argv[2];
+                first = 3;
+            } else if (!std::filesystem::exists(std::filesystem::symlink_status(config))) {
+                const char * xdg = std::getenv("XDG_CONFIG_HOME");
+                const char * home = std::getenv("HOME");
+                if (xdg && *xdg) config = std::filesystem::path(xdg) / "moeshift/config.json";
+                else if (home && *home) config = std::filesystem::path(home) / ".config/moeshift/config.json";
+                else throw std::runtime_error("Set HOME or pass --config FILE.");
+                user_file = true;
+            }
+
+            bool repair = false;
+            if (!user_file || std::filesystem::exists(std::filesystem::symlink_status(config))) {
+                const int result = run_les_router(config.c_str(), stop_requested, argc - first, argv + first);
+                if (result != invalid_router_config) return result;
+                if (!user_file) {
+                    std::cerr << "Correct " << config << " and run moeshift again.\n";
+                    return 1;
+                }
+                repair = true;
+            }
+            if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+                std::cerr << "Run moeshift in a terminal to " << (repair ? "repair" : "create")
+                          << " " << config << ", or pass --config FILE.\n";
+                return 1;
+            }
 #ifdef __APPLE__
             uint32_t size = 0;
             _NSGetExecutablePath(nullptr, &size);
             std::vector<char> path(size);
-            if (_NSGetExecutablePath(path.data(), &size) == 0) {
-                auto prefix = std::filesystem::canonical(path.data()).parent_path().parent_path();
-                auto installed = prefix / "share/moeshift/moeshift.json";
-                if ((home && *home) || (xdg && *xdg)) {
-                    std::filesystem::create_directories(user_config.parent_path());
-                    if (std::filesystem::copy_file(installed, user_config, std::filesystem::copy_options::skip_existing)) {
-                        std::cerr << "moeshift: created configuration at " << user_config
-                                  << "; set model and moe-experts paths before inference\n";
-                    }
-                    config = user_config.string();
-                } else {
-                    config = installed.string();
-                }
-            }
+            if (_NSGetExecutablePath(path.data(), &size) != 0) throw std::runtime_error("Cannot locate moeshift.");
+            auto binary = std::filesystem::canonical(path.data());
+            auto prefix = binary.parent_path().parent_path();
+            auto wizard = prefix / "share/moeshift/tools/moe/onboarding.py";
+            if (!std::filesystem::is_regular_file(wizard)) throw std::runtime_error("Install the moeshift CMake component to use the setup wizard.");
+            auto python = prefix / "libexec/bin/python";
+            std::vector<std::string> args{std::filesystem::exists(python) ? python.string() : "python3",
+                wizard.string(), config.string(), binary.string(), repair ? "repair" : "new"};
+            args.insert(args.end(), argv + first, argv + argc);
+            std::vector<char *> command;
+            for (auto & arg : args) command.push_back(arg.data());
+            command.push_back(nullptr);
+            execvp(command.front(), command.data());
+            throw std::runtime_error("Cannot start Python for setup.");
+#else
+            throw std::runtime_error("The setup wizard requires macOS.");
 #endif
-            }
+        } catch (const std::exception & e) {
+            std::cerr << "moeshift: " << e.what() << '\n';
+            return 1;
         }
-        return run_les_router(config.c_str(), stop_requested, argc - first, argv + first);
     }
     --argc;
     ++argv;
