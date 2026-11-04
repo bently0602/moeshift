@@ -62,8 +62,7 @@ These runs use different output lengths from the Flash Next comparison above.
 | Inference time ↓ | **34.25 s** | **49.45 s** |
 | Prompt processing ↑ | - | **417.24 tok/s** |
 | Text generation ↑ | **16.50 tok/s** | **14.66 tok/s** |
-
-Runtime tuning and peak process memory were not recorded in this report.
+| Peak process memory ↓ | **5.4 GB** | **5.6 GB** |
 
 ## What you need
 
