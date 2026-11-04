@@ -15,10 +15,11 @@ cmake --install build --component moeshift
 ```
 
 This installs the executable, default configuration and expert preparation
-sources. Run `~/.local/bin/moeshift` once to create your user configuration at
-`~/.config/moeshift/config.json` (or the XDG_CONFIG_HOME equivalent), then stop
-with Ctrl-C. Set the model and expert paths in that file and restart.
-Existing configuration files are preserved.
+sources. Homebrew installs the wizard's Python environment automatically.
+For a source install, activate a Python environment with the GGUF dependencies
+before the first run. Run `~/.local/bin/moeshift` to choose a model and start
+the server. Future launches use the saved configuration directly.
+
 For preparation from the source checkout:
 
 ```sh
@@ -38,6 +39,7 @@ cmake --build build --target test-les-protected-cache test-les-active-ranges \
   test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-ssd-rows -j 8
 ctest --test-dir build -R '^(test-les-protected-cache|test-les-active-ranges|test-metal-moe-phases|test-indexer-keys|test-kv-grow|test-metal-hc-fusion|test-ssd-rows)$' --output-on-failure
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test-moeshift-router.py build/bin/moeshift
+.venv/bin/python tests/test-moeshift-onboarding.py
 ```
 
 Real-model validation is separate from these focused checks. The parent-lifetime

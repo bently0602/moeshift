@@ -113,7 +113,7 @@ endif()
 
 install(TARGETS moeshift RUNTIME DESTINATION bin COMPONENT moeshift)
 install(FILES ${CMAKE_SOURCE_DIR}/configs/moeshift.json DESTINATION share/moeshift COMPONENT moeshift)
-install(FILES ${CMAKE_SOURCE_DIR}/tools/moe/experts.py
+install(FILES ${CMAKE_SOURCE_DIR}/tools/moe/experts.py ${CMAKE_SOURCE_DIR}/tools/moe/onboarding.py
     DESTINATION share/moeshift/tools/moe COMPONENT moeshift)
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/gguf-py/gguf
     DESTINATION share/moeshift/gguf-py COMPONENT moeshift

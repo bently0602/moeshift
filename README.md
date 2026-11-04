@@ -69,108 +69,22 @@ These runs use different output lengths from the Flash Next comparison above.
 - A **Mac with Apple Silicon** (M-series).
 - At least **10 GB of RAM**.
 - A fast SSD with space for both the GGUF and prepared expert files: at least
-  **120 GB** for the Flash Next setup below, or about **60 GB** for Qwen3.6 UD Q6_K XL.
+  **120 GB** for the Flash Next setup below, or **61 GB** for Qwen3.6 UD Q6_K XL.
 - [Homebrew](https://brew.sh/), the package manager for macOS. If you have never
   used it, follow its installation instructions, then return here.
 
-## 1. Install MoEShift
+## Quick install
 
-Open **Terminal** and run:
+Open Terminal and run:
 
 ```sh
 brew install davide-troiani/moeshift/moeshift
-```
-
-The installation includes model preparation tools. MoEShift creates
-`~/.config/moeshift/config.json` automatically on first launch and preserves
-your settings on subsequent launches and upgrades.
-
-## 2. Download the model
-
-Choose a model and quantization from its download page:
-
-| Model | Download |
-|---|---|
-| Qwen 3.8 Flash Next | [ISTA-DASLab GGUF files](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main) |
-| Qwen3.6-35B-A3B | [Unsloth GGUF files](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) |
-
-Quantization is your choice: smaller files reduce storage and expert-cache memory;
-higher precision requires more space and memory. The benchmarks above apply only
-to the tested quantizations listed above.
-
-Download all shards of your chosen quantization into the same folder, keeping
-their names. Both models use the same preparation steps and the same
-`~/.config/moeshift/config.json`; each has its own entry under `models`.
-
-The commands below use Flash Next **GSQ-RCO IQ3_XXS** as an example:
-
-- [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf?download=true)
-- [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf?download=true)
-
-These two files total about **76 GB**. Reuse them if already downloaded.
-MoEShift does not distribute or requantize models.
-
-## 3. Get the downloaded model ready to use
-
-Run this once to copy the model's specialized parts (“experts”) into files
-MoEShift can read directly from SSD. Keep all original GGUF files.
-Set `MODEL` to your GGUF (the first shard for split files) and `EXPERTS` to a
-separate output folder for that model and quantization:
-
-```sh
-MODEL="$HOME/Downloads/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
-EXPERTS="$HOME/Models/moeshift/qwen-iq3-experts"
-MOESHIFT_PREFIX="$(brew --prefix moeshift)"
-"$MOESHIFT_PREFIX/libexec/bin/python" \
-  "$MOESHIFT_PREFIX/share/moeshift/tools/moe/experts.py" \
-  extract --model "$MODEL" --out-dir "$EXPERTS"
-```
-
-Then check that the new files match the downloaded model:
-
-```sh
-"$MOESHIFT_PREFIX/libexec/bin/python" \
-  "$MOESHIFT_PREFIX/share/moeshift/tools/moe/experts.py" \
-  verify --model "$MODEL" --experts "$EXPERTS"
-```
-
-Wait for both commands to finish successfully. Verification compares the copied
-weights with the originals. Keep the output folder intact (about **43 GB** for
-the Flash Next IQ3_XXS example).
-If interrupted, retry into a new empty folder and verify again.
-
-## 4. Set the model paths in the configuration file
-
-Run `moeshift` once to create the configuration, then stop it with Ctrl-C.
-Open the configuration:
-
-```sh
-open -e "$HOME/.config/moeshift/config.json"
-```
-
-Inside `models` → your chosen model ID → `args`, replace these two values:
-
-| Setting | What to enter |
-|---|---|
-| `model` | The full path to the **first** downloaded `.gguf` file. |
-| `moe-experts` | The full path to the folder created in step 3. |
-
-Use full paths in JSON (not `~` or `$HOME`), keep the quotes and commas, and save.
-Both model profiles are included in the template. Existing user configurations
-are preserved; copy the desired profile from [the template](configs/moeshift.json)
-if it is missing. Use its model ID in API requests and clients. Leave the other
-settings at their defaults for your first run.
-
-
-## 5. Start MoEShift
-
-```sh
 moeshift
 ```
 
-Leave this Terminal open. MoEShift starts a local server at
-`http://127.0.0.1:8080`. Stop it with **Ctrl-C**. Next time, just run the same
-command; you do not need to repeat the model preparation.
+The first launch opens the setup wizard. You just choose the model: it will download it from HuggingFace (uses `hf` for faster download) and configure MoEShift automatically.
+
+**Prefer to configure it yourself or try your own model?** Choose **Manual configuration**. See the [configuration reference](configs/README.md).
 
 ### Try a message from Terminal
 
