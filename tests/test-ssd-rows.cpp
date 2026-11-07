@@ -41,10 +41,26 @@ int main() {
         auto read=reader.bytes_read();
         reader.read_rows(ids+7,1,out.data());
         assert(reader.bytes_read()==read);
+        // More pages than the cache holds in one call: rows are loaded in concurrent passes.
+        std::vector<int32_t> many(3000);
+        for (size_t i=0;i<many.size();++i) many[i]=int32_t((i*2654435761u)%rows);
+        std::vector<float> wide(cols*many.size());
+        reader.read_rows(many.data(),many.size(),wide.data());
+        for(size_t n=0;n<many.size();++n) for(int j=0;j<cols;++j) assert(wide[n*cols+j]==src[many[n]*cols+j]);
+        assert(reader.cached_bytes()<=32768);
         for(int32_t bad:{-1,rows}) {
             bool threw=false;try{reader.read_rows(&bad,1,out.data());}catch(const std::out_of_range&){threw=true;}
             assert(threw);
         }
+    }
+    {
+        // A one-page cache cannot hold a row that crosses a page seam; it is read sequentially.
+        llama_ssd_rows reader(fd,offset,GGML_TYPE_F32,cols,rows,16384);
+        int32_t ids[]={25,24,25,26};
+        std::vector<float> out(cols*4);
+        reader.read_rows(ids,4,out.data());
+        for(int n=0;n<4;++n) for(int j=0;j<cols;++j) assert(out[n*cols+j]==src[ids[n]*cols+j]);
+        assert(reader.cached_bytes()<=16384);
     }
     // Reject declared payload past EOF; an early EOF after opening must also be detected.
     bool threw=false;
@@ -82,5 +98,5 @@ int main() {
         assert(reader.cached_bytes()<=32768);
     }
     close(fd);unlink(path);ggml_free(ctx);
-    puts("SSD row bounds, page crossings, eviction, repeated reads, truncated files and Q2_0 values: PASS");
+    puts("SSD row bounds, page crossings, eviction, concurrent passes, repeated reads, truncated files and Q2_0 values: PASS");
 }

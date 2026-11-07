@@ -14,6 +14,12 @@ cmake --build build --target moeshift -j 8
 cmake --install build --component moeshift
 ```
 
+`scripts/build-moeshift.sh` runs the same configuration and build. Add
+`--test` to run the focused checks below, `--install [PREFIX]` to install
+(default `$HOME/.local`), or `--run [ARGS...]` to start `build/bin/moeshift`
+afterwards with the remaining arguments. The router check uses `PYTHON` when set, otherwise
+the first Python 3.10+ on `PATH`.
+
 This installs the executable, default configuration and expert preparation
 sources. Homebrew installs the wizard's Python environment automatically.
 For a source install, activate a Python environment with the GGUF dependencies

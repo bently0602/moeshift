@@ -53,6 +53,10 @@ namespace {
 // LLAMA_MOE_IO_THREADS. Defaults to 4, the value all earlier measurements used.
 constexpr int kMoeSsdIoThreadsDefault = 4;
 
+// Threads copying a prefetched layer into its slots. A synthetic copy of one Flash Next
+// layer on M5 Max took 11.1 ms with one thread and 6.9 ms with eight.
+constexpr int kPrefillCopyThreads = 8;
+
 static int moe_ssd_io_threads() {
     static const int n = []() {
         const char * s = std::getenv("LLAMA_MOE_IO_THREADS");
@@ -1785,17 +1789,33 @@ install_timing start_demand(
         if (!prefill_error.empty()) {
             throw std::runtime_error(prefill_error);
         }
-        for (const auto & item : pending) {
-            for (const auto & binding : state.bindings) {
-                const auto & entry = *binding.entry;
-                std::memcpy((uint8_t *) binding.tensor->data + (size_t) item.slot * entry.bytes_per_expert,
-                            prefill_data + (size_t) item.expert * state.pack_stride +
-                                entry.offset - state.pack_base, entry.bytes_per_expert);
+        // The GPU waits for this copy at every layer; one thread does not saturate memory bandwidth.
+        const int n_th = std::max(1, std::min(kPrefillCopyThreads, (int) pending.size()));
+        std::atomic<size_t> next{0};
+        auto copy = [&]() {
+            for (size_t k = next.fetch_add(1, std::memory_order_relaxed); k < pending.size();
+                 k = next.fetch_add(1, std::memory_order_relaxed)) {
+                const auto & item = pending[k];
+                for (const auto & binding : state.bindings) {
+                    const auto & entry = *binding.entry;
+                    std::memcpy((uint8_t *) binding.tensor->data + (size_t) item.slot * entry.bytes_per_expert,
+                                prefill_data + (size_t) item.expert * state.pack_stride +
+                                    entry.offset - state.pack_base, entry.bytes_per_expert);
+                }
             }
+        };
+        std::vector<std::thread> helpers;
+        helpers.reserve((size_t) n_th - 1);
+        for (int i = 1; i < n_th; ++i) {
+            helpers.emplace_back(copy);
+        }
+        copy();
+        for (auto & h : helpers) {
+            h.join();
         }
         install_timing t;
         t.n = (int) pending.size();
-        t.n_th = 1;
+        t.n_th = n_th;
         t.pack = true;
         t.bytes = (size_t) n_expert * state.pack_stride;
         t.pread_sum_ns = t.pread_max_ns = prefill_read_ns;
