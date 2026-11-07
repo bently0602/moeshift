@@ -278,6 +278,14 @@ typedef struct {
 } ggml_metal_kargs_repeat;
 
 typedef struct {
+    int32_t n4;    // values per stream, in float4
+    int32_t hc;    // streams
+    int32_t nt;    // tokens
+    float   scale;
+    float   bias;
+} ggml_metal_kargs_hc_mix_tail;
+
+typedef struct {
     int64_t  nk0;
     int64_t  ne00;
     int64_t  ne01;

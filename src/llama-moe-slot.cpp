@@ -57,6 +57,10 @@ constexpr int kMoeSsdIoThreadsDefault = 4;
 // layer on M5 Max took 11.1 ms with one thread and 6.9 ms with eight.
 constexpr int kPrefillCopyThreads = 8;
 
+// Persistent threads for decode-time demand reads. Each missing expert's matrices are read
+// separately, about ten reads per layer with Flash Next, so more threads than experts help.
+constexpr int kDemandReadThreads = 12;
+
 static int moe_ssd_io_threads() {
     static const int n = []() {
         const char * s = std::getenv("LLAMA_MOE_IO_THREADS");
@@ -189,6 +193,10 @@ struct lookahead_expert_prefetch {
     std::atomic<uint64_t> n_used_from_pf{0};  // 主路径用到的专家里，落在**预读区**的次数
                                               // （用完不保留，本层结束就被重填冲掉）
     std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
+    // Window mode publishes prefetched experts as ordinary cache entries; these count the
+    // ones a later step used and the ones evicted before any use.
+    std::atomic<uint64_t> n_pf_used{0};
+    std::atomic<uint64_t> n_pf_unused{0};
     std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
     bool ready = false;
 
@@ -308,6 +316,13 @@ struct lookahead_expert_prefetch {
             (unsigned long long) armed,
             (unsigned long long) hits,
             preds ? 100.0 * (double) hits / (double) preds : 0.0);
+        const uint64_t published = n_pred_published.load(std::memory_order_relaxed);
+        const uint64_t used = n_pf_used.load(std::memory_order_relaxed);
+        moe_log("lookahead-prefetch window: published=%llu used=%llu (%.1f%%) evicted-unused=%llu",
+            (unsigned long long) published,
+            (unsigned long long) used,
+            published ? 100.0 * (double) used / (double) published : 0.0,
+            (unsigned long long) n_pf_unused.load(std::memory_order_relaxed));
     }
 
     void reset() {
@@ -526,6 +541,7 @@ struct llama_moe_slot_runtime::impl {
         std::vector<int32_t> slot_to_expert;
         std::vector<int32_t> expert_to_slot;
         std::vector<uint64_t> slot_age;
+        std::vector<uint8_t> slot_prefetched;   // prefetched and not yet used by the router
         uint64_t age = 0;
         les_protected_cache protected_cache;
         std::mutex mutex;
@@ -621,13 +637,76 @@ struct llama_moe_slot_runtime::impl {
     uint64_t last_pf_pub = 0;
 
     std::vector<void *> demand_tickets;
-std::vector<std::thread> demand_threads;
+
+// Reads queued by start_demand run on persistent threads. The last read of a layer's batch
+// signals its ticket, so the GPU's missing-expert phase can start.
+struct demand_batch {
+    // reads still running, plus one held until the last read has finished the batch
+    std::atomic<int> left{0};
+    int64_t t0 = 0;
+    uint64_t epoch = 0;
+    void * ticket = nullptr;
+    int next_layer = -1;
+    std::vector<int32_t> next;
+};
+std::vector<demand_batch> demand_batches;
+std::mutex demand_mutex;
+std::condition_variable demand_queued;
+std::condition_variable demand_done;
+std::vector<std::function<void()>> demand_queue;
+std::vector<std::thread> demand_readers;
+bool demand_stop = false;
 
 int demand_next_layer = -1;
 std::vector<int32_t> demand_next;
 
 void join_demand() {
-    for (auto & thread : demand_threads) if (thread.joinable()) thread.join();
+    std::unique_lock<std::mutex> lock(demand_mutex);
+    demand_done.wait(lock, [&] {
+        for (const auto & batch : demand_batches) if (batch.left.load(std::memory_order_acquire) > 0) return false;
+        return true;
+    });
+}
+
+void stop_demand_readers() {
+    join_demand();
+    {
+        std::lock_guard<std::mutex> lock(demand_mutex);
+        demand_stop = true;
+    }
+    demand_queued.notify_all();
+    for (auto & thread : demand_readers) thread.join();
+    demand_readers.clear();
+}
+
+void demand_reader() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    for (;;) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(demand_mutex);
+            demand_queued.wait(lock, [&] { return demand_stop || !demand_queue.empty(); });
+            if (demand_queue.empty()) return;
+            task = std::move(demand_queue.back());
+            demand_queue.pop_back();
+        }
+        task();
+    }
+}
+
+void finish_demand_read(size_t layer_index) {
+    auto & batch = demand_batches[layer_index];
+    if (batch.left.fetch_sub(1, std::memory_order_acq_rel) != 2) return;
+    install_ns.fetch_add(now_ns() - batch.t0, std::memory_order_relaxed);
+    les_io_signal(batch.ticket, batch.epoch);
+    if (!batch.next.empty()) lookahead.arm(batch.next_layer, batch.next);
+    {
+        std::lock_guard<std::mutex> lock(demand_mutex);
+        batch.left.store(0, std::memory_order_release);
+    }
+    demand_done.notify_all();
 }
 
 install_timing start_demand(
@@ -643,53 +722,53 @@ install_timing start_demand(
     const size_t layer_index = size_t(&state - layers.data());
     if (demand_tickets.empty()) {
         demand_tickets.resize(layers.size(), nullptr);
-        demand_threads.resize(layers.size());
+        demand_batches = std::vector<demand_batch>(layers.size());
         for (size_t il = 0; il < layers.size(); ++il) {
             demand_tickets[il] = les_io_create();
             for (auto & binding : layers[il].dec_bindings)
                 les_io_register(demand_tickets[il], binding.tensor->data);
         }
+        for (int i = 0; i < kDemandReadThreads; ++i) demand_readers.emplace_back([this] { demand_reader(); });
     }
-    auto & demand_thread = demand_threads[layer_index];
-    if (demand_thread.joinable()) demand_thread.join();
-    void * demand_ticket = demand_tickets[layer_index];
+    auto & batch = demand_batches[layer_index];
+    {
+        // the previous batch of this layer writes the same window
+        std::unique_lock<std::mutex> lock(demand_mutex);
+        demand_done.wait(lock, [&] { return batch.left.load(std::memory_order_acquire) == 0; });
+    }
 
-    const uint64_t epoch = les_io_begin(demand_ticket);
+    const int n_parts = (int) state.dec_pack_order.size();
+    if (n_parts <= 0 || n_parts > 8) throw std::runtime_error("invalid MoE packed family count for demand reads");
+    batch.t0 = now_ns();
+    batch.ticket = demand_tickets[layer_index];
+    batch.epoch = les_io_begin(batch.ticket);
+    batch.next_layer = demand_next_layer;
+    batch.next = std::move(demand_next);
+    demand_next.clear();
+    batch.left.store((int) pending.size() * n_parts + 1, std::memory_order_release);
 
     install_timing queued;
     queued.n = (int) pending.size();
     queued.bytes = pending.size() * state.pack_bytes;
     queued.pack = true;
-    queued.n_th = std::max(
-        1, std::min(moe_ssd_io_threads(), queued.n)
-    );
+    queued.n_th = std::min(kDemandReadThreads, queued.n * n_parts);
 
-    demand_thread = std::thread([
-        this, &state, pending, epoch, demand_ticket,
-        next_layer = demand_next_layer,
-        next = std::move(demand_next)
-    ] {
-        try {
-            const auto timing =
-                install_pending(state, pending, true);
-
-            install_ns.fetch_add(
-                timing.wall_ns,
-                std::memory_order_relaxed
-            );
-
-            les_io_signal(demand_ticket, epoch);
-
-            if (!next.empty())
-                lookahead.arm(next_layer, next);
-
-        } catch (const std::exception & e) {
-            GGML_ABORT(
-                "demand expert read failed: %s",
-                e.what()
-            );
+    {
+        std::lock_guard<std::mutex> lock(demand_mutex);
+        for (const auto & item : pending) {
+            for (int part = 0; part < n_parts; ++part) {
+                demand_queue.push_back([this, &state, item, part, layer_index] {
+                    try {
+                        read_expert_directv(state, item.expert, item.slot, true, part);
+                    } catch (const std::exception & e) {
+                        GGML_ABORT("demand expert read failed: %s", e.what());
+                    }
+                    finish_demand_read(layer_index);
+                });
+            }
         }
-    });
+    }
+    demand_queued.notify_all();
 
     return queued;
 }
@@ -729,6 +808,7 @@ install_timing start_demand(
             state.slot_to_expert.assign(n_slots, kSlotFree);
             state.expert_to_slot.assign(n_expert, kSlotFree);
             state.slot_age.assign(n_slots, 0);
+            state.slot_prefetched.assign(n_slots, 0);
             // window_start 不在这里算 —— decode_window 要到 resolve_decode_window()
             // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
             // 层间互相覆盖（曾经的实际 bug）。
@@ -840,8 +920,10 @@ install_timing start_demand(
                     finalize_pack(state.dec_bindings, state.dec_pack_order, state.dec_pack_ok,
                                   state.dec_pack_base, state.dec_pack_stride, state.dec_pack_path);
                     if (llm_arch_supports_les(model.arch) && std::getenv("LLAMA_LES_DECODE_BANK") &&
-                        prefetch_unified && layer_width[il] == 15 && state.window_width > 15) {
-                        state.protected_cache.configure(15, state.window_width, n_expert);
+                        prefetch_unified && decode_window == 12 && prefetch_slots > 0 &&
+                        layer_width[il] == decode_window + prefetch_slots && state.window_width > layer_width[il]) {
+                        // recent slots: the decode window plus one per predicted expert
+                        state.protected_cache.configure(layer_width[il], state.window_width, n_expert);
                     }
                     n_dec++;
                 }
@@ -887,7 +969,16 @@ install_timing start_demand(
         }
         // expert_to_slot 不能整体清：pending 的专家此时还没登记，所以直接全清是安全的。
         std::fill(st.expert_to_slot.begin(), st.expert_to_slot.end(), kSlotFree);
+        std::fill(st.slot_prefetched.begin(), st.slot_prefetched.end(), 0);
         st.protected_cache.reset(st.slot_to_expert);
+    }
+
+    /// Counts a prefetched entry that is replaced before any use. Caller holds st.mutex.
+    void reuse_slot(layer_state & st, int32_t slot) {
+        if (st.slot_prefetched[(size_t) slot]) {
+            st.slot_prefetched[(size_t) slot] = 0;
+            lookahead.n_pf_unused.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     /// 预读：把一个预测专家读进**目标层自己的窗口**，与缓存共用同一片 slot 池。
@@ -954,6 +1045,7 @@ install_timing start_demand(
         if (evicted >= 0) {
             st.expert_to_slot[(size_t) evicted] = kSlotFree;
         }
+        reuse_slot(st, slot);
         st.slot_to_expert[(size_t) slot] = kSlotPending;   // 认领，内容尚未写入
         return slot;
     }
@@ -1001,7 +1093,9 @@ install_timing start_demand(
         read_expert_directv(st, expert, slot, true);
 
         std::lock_guard<std::mutex> lock(st.mutex);
-        publish_slot_in_window(st, expert, slot);
+        if (publish_slot_in_window(st, expert, slot)) {
+            st.slot_prefetched[(size_t) slot] = 1;
+        }
     }
 
     /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
@@ -1264,7 +1358,7 @@ install_timing start_demand(
     }
 
     ~impl() {
-        join_demand();
+        stop_demand_readers();
         for (void * ticket : demand_tickets) les_io_destroy(ticket);
         stop_prefill_read();
         if (cur.n_layers > 0) {
@@ -1490,8 +1584,9 @@ install_timing start_demand(
     // Reads the packed gate|up|down span (one contiguous run in the experts) with a single preadv,
     // writing each family straight into its own slot. One syscall, one write per byte: no staging
     // buffer and no second copy into the device buffer.
+    // part >= 0 reads only the part-th family in file order (one matrix of the expert).
     int64_t read_expert_directv(const layer_state & state, int32_t expert, int32_t slot,
-                                bool window_mode = false) {
+                                bool window_mode = false, int part = -1) {
         // 诊断：LLAMA_MOE_SKIP_READ=1 时走完所有记账但不真读盘。
         //
         // 目的是把「CPU 段 + 每层往返」的成本和「真读盘」的成本分开：
@@ -1552,11 +1647,25 @@ install_timing start_demand(
             }
         }
         const int fd = fd_for(path);
-        const size_t offset = base + (size_t) expert * stride;
+        size_t offset = base + (size_t) expert * stride;
+        struct iovec * span = iov;
+        int n_span = n;
+        if (part >= 0) {
+            // the families are packed back to back in file order, so one is a sub-range
+            if (part >= n) {
+                throw std::runtime_error("invalid MoE packed family index");
+            }
+            offset += bindings[order[(size_t) part]].entry->offset - base;
+            span = iov + part;
+            n_span = 1;
+            nbytes = span->iov_len;
+        }
+        // a split expert counts as one miss
+        const uint64_t n_miss = part <= 0 ? 1 : 0;
 
         if (mode == 2) {
             // 记账照做（让上层以为读成功了），但不落盘 —— 用于隔离 I/O 与结构开销。
-            stats.n_miss.fetch_add(1, std::memory_order_relaxed);
+            stats.n_miss.fetch_add(n_miss, std::memory_order_relaxed);
             return 0;
         }
 
@@ -1572,11 +1681,11 @@ install_timing start_demand(
         }
 
         const int64_t t0 = now_ns();
-        readv_span(fd, offset, iov, n);
+        readv_span(fd, offset, span, n_span);
         const int64_t dt = now_ns() - t0;
         stats.pread_ns.fetch_add(dt, std::memory_order_relaxed);
         stats.n_bytes.fetch_add(nbytes, std::memory_order_relaxed);
-        stats.n_miss.fetch_add(1, std::memory_order_relaxed);
+        stats.n_miss.fetch_add(n_miss, std::memory_order_relaxed);
         return dt;
     }
 
@@ -1692,28 +1801,46 @@ install_timing start_demand(
         dst.scatter_ex += src.scatter_ex;
     }
 
-    // A single host buffer streams the next layer while Metal consumes the shared banks.
-    // It contains immutable packed weights only, never model state or routing decisions.
-    std::thread prefill_reader;
-    uint8_t * prefill_data = nullptr;
+    // Two host buffers let one reader stream layers back to back while the previous layer is
+    // copied into the shared banks. They contain immutable packed weights only, never model
+    // state or routing decisions.
+    struct prefill_buffer {
+        uint8_t * data = nullptr;
+        int layer = -1;      // layer being read or held; -1 when free
+        bool ready = false;  // read finished, successfully unless error is set
+        std::string error;
+        int64_t read_ns = 0;
+    };
+    prefill_buffer prefill_buf[2];
     size_t prefill_capacity = 0;
-    int prefill_layer = -1;
-    std::string prefill_error;
-    int64_t prefill_read_ns = 0;
+    std::thread prefill_reader;
+    std::mutex prefill_mutex;
+    std::condition_variable prefill_cv;
+    bool prefill_stop = false;
+    bool prefill_done = false;
+    int prefill_first = -1;
+    int prefill_expect = -1;
 
     void stop_prefill_read() {
         if (prefill_reader.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(prefill_mutex);
+                prefill_stop = true;
+            }
+            prefill_cv.notify_all();
             prefill_reader.join();
         }
-        prefill_layer = -1;
-        if (prefill_data) {
+        prefill_expect = -1;
+        if (prefill_buf[0].data) {
 #ifdef __APPLE__
-            munmap(prefill_data, prefill_capacity);
+            munmap(prefill_buf[0].data, 2 * prefill_capacity);
 #else
-            std::free(prefill_data);
+            std::free(prefill_buf[0].data);
 #endif
-            prefill_data = nullptr;
             prefill_capacity = 0;
+        }
+        for (auto & buf : prefill_buf) {
+            buf = prefill_buffer();
         }
     }
 
@@ -1739,55 +1866,96 @@ install_timing start_demand(
 #endif
     }
 
-    void start_prefill_read(int layer) {
+    // Reads enabled layers from `first` onwards, alternating buffers; waits while both are held.
+    void start_prefill_read(int first) {
         GGML_ASSERT(!prefill_reader.joinable());
-        const auto & state = layers[layer];
-        const size_t bytes = (size_t) n_expert * state.pack_stride;
-        if (!prefill_data) {
+        if (!prefill_buf[0].data) {
             size_t capacity = 0;
             for (const auto & candidate : layers) {
                 capacity = std::max(capacity, (size_t) n_expert * candidate.pack_stride);
             }
             // munmap releases the prefill budget before Metal allocates its decode graph.
 #ifdef __APPLE__
-            void * data = mmap(nullptr, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            void * data = mmap(nullptr, 2 * capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
             if (data == MAP_FAILED) {
-                throw std::runtime_error("failed to allocate MoE prefill read buffer");
+                throw std::runtime_error("failed to allocate MoE prefill read buffers");
             }
-            prefill_data = (uint8_t *) data;
 #else
-            prefill_data = (uint8_t *) std::malloc(capacity);
-            if (!prefill_data) {
+            void * data = std::malloc(2 * capacity);
+            if (!data) {
                 throw std::bad_alloc();
             }
 #endif
+            prefill_buf[0].data = (uint8_t *) data;
+            prefill_buf[1].data = (uint8_t *) data + capacity;
             prefill_capacity = capacity;
         }
-        prefill_layer = layer;
-        prefill_error.clear();
-        const int fd = fd_for(state.pack_path);
-        prefill_reader = std::thread([this, layer, fd, bytes]() {
-            const int64_t start = now_ns();
-            try {
-                struct iovec span = { prefill_data, bytes };
-                readv_span(fd, layers[layer].pack_base, &span, 1);
-            } catch (const std::exception & e) {
-                prefill_error = e.what();
+        std::vector<int> fds;
+        for (int layer = first; layer < (int) layers.size() && layers[layer].enabled; ++layer) {
+            fds.push_back(fd_for(layers[layer].pack_path));
+        }
+        prefill_stop = false;
+        prefill_done = false;
+        prefill_first = first;
+        prefill_expect = first;
+        prefill_reader = std::thread([this, first, fds = std::move(fds)]() {
+            for (size_t i = 0; i < fds.size(); ++i) {
+                const int layer = first + (int) i;
+                auto & buf = prefill_buf[i & 1];
+                {
+                    std::unique_lock<std::mutex> lk(prefill_mutex);
+                    prefill_cv.wait(lk, [&] { return prefill_stop || buf.layer < 0; });
+                    if (prefill_stop) {
+                        break;
+                    }
+                    buf.layer = layer;
+                    buf.ready = false;
+                    buf.error.clear();
+                }
+                const int64_t start = now_ns();
+                std::string error;
+                try {
+                    struct iovec span = { buf.data, (size_t) n_expert * layers[layer].pack_stride };
+                    readv_span(fds[i], layers[layer].pack_base, &span, 1);
+                } catch (const std::exception & e) {
+                    error = e.what();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(prefill_mutex);
+                    buf.read_ns = now_ns() - start;
+                    buf.error = error;
+                    buf.ready = true;
+                }
+                prefill_cv.notify_all();
+                if (!error.empty()) {
+                    break;
+                }
             }
-            prefill_read_ns = now_ns() - start;
+            {
+                std::lock_guard<std::mutex> lk(prefill_mutex);
+                prefill_done = true;
+            }
+            prefill_cv.notify_all();
         });
     }
 
     install_timing install_prefill_pipeline(int layer, const std::vector<pending_install> & pending) {
         const auto & state = layers[layer];
         const int64_t start = now_ns();
-        if (prefill_layer != layer) {
+        if (prefill_expect != layer) {
             stop_prefill_read();
             start_prefill_read(layer);
         }
-        prefill_reader.join();
-        if (!prefill_error.empty()) {
-            throw std::runtime_error(prefill_error);
+        auto & buf = prefill_buf[(layer - prefill_first) & 1];
+        {
+            std::unique_lock<std::mutex> lk(prefill_mutex);
+            prefill_cv.wait(lk, [&] { return (buf.layer == layer && buf.ready) || prefill_done; });
+        }
+        if (buf.layer != layer || !buf.ready) {
+            throw std::runtime_error(format("MoE prefill reader stopped before layer %d", layer));
+        }
+        if (!buf.error.empty()) {
+            throw std::runtime_error(buf.error);
         }
         // The GPU waits for this copy at every layer; one thread does not saturate memory bandwidth.
         const int n_th = std::max(1, std::min(kPrefillCopyThreads, (int) pending.size()));
@@ -1799,7 +1967,7 @@ install_timing start_demand(
                 for (const auto & binding : state.bindings) {
                     const auto & entry = *binding.entry;
                     std::memcpy((uint8_t *) binding.tensor->data + (size_t) item.slot * entry.bytes_per_expert,
-                                prefill_data + (size_t) item.expert * state.pack_stride +
+                                buf.data + (size_t) item.expert * state.pack_stride +
                                     entry.offset - state.pack_base, entry.bytes_per_expert);
                 }
             }
@@ -1813,18 +1981,24 @@ install_timing start_demand(
         for (auto & h : helpers) {
             h.join();
         }
+        const int64_t read_ns = buf.read_ns;
+        {
+            std::lock_guard<std::mutex> lk(prefill_mutex);
+            buf.layer = -1;
+            buf.ready = false;
+        }
+        prefill_cv.notify_all();
         install_timing t;
         t.n = (int) pending.size();
         t.n_th = n_th;
         t.pack = true;
         t.bytes = (size_t) n_expert * state.pack_stride;
-        t.pread_sum_ns = t.pread_max_ns = prefill_read_ns;
+        t.pread_sum_ns = t.pread_max_ns = read_ns;
         stats.n_bytes.fetch_add(t.bytes, std::memory_order_relaxed);
-        stats.pread_ns.fetch_add(prefill_read_ns, std::memory_order_relaxed);
+        stats.pread_ns.fetch_add(read_ns, std::memory_order_relaxed);
         stats.n_miss.fetch_add(pending.size(), std::memory_order_relaxed);
-        prefill_layer = -1;
         if (layer + 1 < (int) layers.size() && layers[layer + 1].enabled) {
-            start_prefill_read(layer + 1);
+            prefill_expect = layer + 1;
         } else {
             stop_prefill_read();
         }
@@ -2543,7 +2717,7 @@ void llama_moe_slot_runtime::process(
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
 
     const bool pipelined_prefill = pimpl->prefill_pipeline_enabled(n_rows);
-    if (!pipelined_prefill && pimpl->prefill_data != nullptr) {
+    if (!pipelined_prefill && pimpl->prefill_buf[0].data != nullptr) {
         pimpl->stop_prefill_read();
     }
     const bool decode = n_rows == 1;
@@ -2729,6 +2903,10 @@ void llama_moe_slot_runtime::process(
                 state.protected_cache.hit(state.expert_to_slot[expert],
                     state.slot_to_expert, state.slot_age, requested, keep);
             slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
+            if (state.slot_prefetched[(size_t) slots[pos]]) {
+                state.slot_prefetched[(size_t) slots[pos]] = 0;
+                pimpl->lookahead.n_pf_used.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
 
@@ -2785,6 +2963,7 @@ void llama_moe_slot_runtime::process(
         if (evicted >= 0) {
             state.expert_to_slot[evicted] = kSlotFree;
         }
+        pimpl->reuse_slot(state, slot);
         state.slot_age[slot] = ++state.age;
         slots[pos] = slot;
         state.slot_to_expert[slot] = expert;

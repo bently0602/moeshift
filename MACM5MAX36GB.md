@@ -19,19 +19,34 @@ are not general benchmarks.
   norms and copies took the most time: 2.10 s (30%).
 - A CPU profile found that each long prompt starts with about 2.1 s of serial,
   uncached 16 KiB reads from the 27 GB per-layer embedding table. The GPU has no
-  work during that time. An uncommitted change to `src/llama-ssd-rows.cpp`
-  reads these pages up to 16 at a time. It made prompt processing 12.8% faster
+  work during that time. A change to `src/llama-ssd-rows.cpp` (commit
+  `d38cb01`) reads these pages up to 16 at a time. It made prompt processing 12.8% faster
   (10.29 s → 8.97 s), with identical output.
 - An `f16` KV cache made prompt processing 3.2% faster at a cost of about
   0.7 GiB more memory at full context. Turning off the GPU keepalive made
   generation 22% slower.
 - MoEShift wrote nothing measurable to disk while running: the internal SSD wrote
   54–92 MB in total during each 4-request run, for the whole system.
-- Copying each layer's experts with 8 threads instead of one (uncommitted)
+- Copying each layer's experts with 8 threads instead of one (`d38cb01`)
   saved another 0.37 s (4.1%).
-- Combined, with `f16` KV, the long prompt takes 8.29 s, against 10.29 s on the
-  original build: 19% faster. It took 15.47 s with the original 3,072-token
-  batches.
+- Double-buffered prefill reads (uncommitted) let one reader stream layers
+  back to back. The wait for expert reads fell from 0.55 s to 0.13 s per
+  prompt, saving another 0.37 s (4.5%).
+- Five graph changes in `src/models/qwen4exp.cpp` (uncommitted) avoid full
+  passes over the 4-stream hyper-connection state. They saved another 0.32 s
+  (4.0%), with identical output. Generation after a short prompt was 3.0%
+  faster in an interleaved benchmark.
+- A fused Metal kernel for the end of the hyper-connection mix (uncommitted,
+  based on Strata's `gr_epi_up`) saved another 0.16 s (2.1%). Generation was 2.0%
+  faster, with identical output.
+- Persistent reader threads for decode-time expert misses, with each expert's
+  matrices read in parallel (uncommitted), made generation 4.3% faster.
+- Combined, with `f16` KV, the long prompt takes 7.44 s, against 10.29 s on the
+  original build: 28% faster. It took 15.47 s with the original 3,072-token
+  batches. A 12,121-token prompt (two batches) took 16.6 s, against 21.8 s on
+  the Homebrew build, with identical output.
+- Tool calling works through the OpenAI-compatible API, including with
+  streaming.
 - The user configuration now uses `prefill-max-tokens: 6144` and an `f16` KV
   cache.
 
@@ -100,11 +115,11 @@ values on this Mac. See `configs/README.md` for the full reference.
 | `env.LLAMA_MOE_LOOKAHEAD_PREFETCH`, `…_DEPTH`, `env.LLAMA_MOE_PREFETCH_READ` | `1`, `3`, `2` | same | Not tested. Predictive expert reads during generation. |
 
 With this configuration on the original build, the long prompt takes about
-9.96 s. Two uncommitted code changes bring it to 8.29 s (see
-[Combined result](#combined-result)). Neither change adds a setting, and the
+9.96 s. The code changes bring it to 7.44 s (see
+[Combined result](#combined-result)). None of them adds a setting, and the
 Homebrew build does not include them.
 
-Memory on this 36 GB Mac: peak process footprint was 9.4 GB with this
+Memory on this 36 GB Mac: peak process footprint was 9.6 GB with this
 configuration, and swap did not grow during inference. The main risk to SSD
 life is macOS swapping under memory pressure. Leave headroom before raising
 `prefill-max-tokens`, `ctx-size` or the slot counts.
@@ -292,7 +307,7 @@ parallel (16–32 at a time) would take roughly 0.15–0.25 s instead of about
 2.1 s. That would save about 1.9 s, roughly 18% of a 10.3 s prompt. Reads stay
 uncached, so memory use and SSD writes would not change.
 
-### Parallel PLE reads (uncommitted change)
+### Parallel PLE reads (commit `d38cb01`)
 
 `llama_ssd_rows::read_rows` now gathers the pages for as many of the batch's
 rows as fit in the 32 MiB cache, reads the missing pages with up to 16 threads,
@@ -328,7 +343,7 @@ per-layer GPU gap is time the thread spends waiting, which sampling cannot
 show. Comparing it with the `pmgmt` total suggests about 12 ms per layer of
 waiting for the next layer's read to finish.
 
-### Threaded expert copy (uncommitted change)
+### Threaded expert copy (commit `d38cb01`)
 
 `install_prefill_pipeline` (`src/llama-moe-slot.cpp`) now copies the layer's
 experts from the staging buffer into their slots with 8 threads instead of one
@@ -470,27 +485,448 @@ Later, the KV cache was switched to `f16`:
 The file from before this change is saved as
 `~/.config/moeshift/config.json.bak-q8_0-kv`.
 
+### Source-build configuration
+
+`~/.config/moeshift/config-source.json` is a copy of the main configuration
+with prefetch depth 8 and read 8 (see [Prefetch depth](#prefetch-depth-n1)):
+
+```diff
+-        "LLAMA_MOE_PREFETCH_READ": 2,
+-        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 3,
++        "LLAMA_MOE_PREFETCH_READ": 8,
++        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 8,
+```
+
+The Homebrew build rejects this file, because its validator still requires
+depth 3 when protected slots are on. The main `config.json` stays compatible
+with Homebrew, for comparisons. To run the source build with the faster
+settings:
+
+```sh
+scripts/build-moeshift.sh --run --config ~/.config/moeshift/config-source.json
+```
+
+Both files started successfully with their builds on 2026-11-07.
+
 Restart MoEShift after changing the configuration.
+
+## Double-buffered prefill reads (uncommitted change)
+
+Temporary timers in `install_prefill_pipeline` (removed afterwards) split the
+per-layer expert stall, summed over one long prompt with the threaded copy:
+
+| Part | Time per prompt |
+|---|---:|
+| Waiting for the layer's read to finish | 0.55 s |
+| Copying into the bank (8 threads) | 0.27 s |
+| Reading, mostly hidden behind GPU work | 6.0 s (about 125 ms per layer) |
+
+A synthetic test read whole expert-layer files at about 7.2 GB/s with 1, 2, 4
+or 8 threads, so the SSD's sequential read speed is the limit. Reading 40 GB
+takes at least about 5.7 s, against about 7 s of GPU work per prompt.
+
+Two GPU-side expert banks, the change first proposed, would remove only the
+0.27 s copy. They would also hold about 1 GB more memory during generation and
+change the model loader. Instead, the prefill pipeline
+(`src/llama-moe-slot.cpp`) now has two host staging buffers and one reader
+thread per batch. The reader reads enabled layers back to back into
+alternating buffers and waits only while both buffers are held. Each layer's
+install waits for its buffer, copies it into the bank, and frees it. Before,
+the next read could start only after the current layer's copy. Both buffers
+are still released before generation.
+
+With the same temporary timers, the read wait fell from 0.55 s to 0.13 s per
+prompt. Most of what remains is the first layer's read, which nothing
+overlaps. The copy time did not change.
+
+## Hyper-connection graph changes (uncommitted)
+
+The model keeps its residual as 4 parallel streams (`dsv4_hc_mult`). For a
+6,056-token batch that is a 248 MB f32 tensor. Each element-wise pass over it
+reads and writes the whole tensor, taking 1.3–2 ms, close to memory bandwidth.
+Element-wise kernels took 2.1 s of the GPU's 7.07 s. About 0.85 s of that came
+from `build_hc_mix` (twice per layer), about 0.36 s extra from the 12 PLE
+layers, and the rest from the expert-output sum and the hyper-connection merges.
+The only gain available is running fewer passes.
+
+Five changes in `src/models/qwen4exp.cpp` keep the same arithmetic in the same
+order:
+
+| # | Change | Where |
+|---|---|---|
+| D1 | Add the four stream views directly instead of copying stream 0 first (`ggml_cont`). Metal's binary kernels accept strided rows, and the three adds still fuse. | `build_hc_mix` |
+| D2 | Multiply by the norm weight before the reshape, with the weight viewed as `[n_embd, hc]`, so Metal's fused RMS norm + multiply kernel applies. The reshape had kept the fusion from matching. | `build_hc_mix` |
+| D3 | The same for the three grouped norms. | `build_ple` |
+| D4 | Transpose the padded convolution history once and take each of the 4 taps as a row range of it, instead of a transposed copy per tap. | `build_ple` |
+| D5 | Drop a `ggml_cont` of a tensor that is already contiguous. | `build_ple` |
+
+The estimate was about 0.4 s; the measured saving was 0.32 s (4.0%, table
+below). All three long-prompt responses matched the previous build exactly,
+and both two-batch responses matched the Homebrew build. The seven focused
+native checks passed.
+
+Not done: a faster expert-output sum (3.5 ms per layer, in the MoE code shared
+with Qwen3.6).
+
+## Fused hyper-connection mix tail (F1, uncommitted)
+
+Strata's prompt path (`metal/kernels/prompt.metal`, `gr_epi_up`, MIT license)
+computes the end of the hyper-connection read in one pass:
+`mixed = mean_c xn[c] * sigmoid(G[c])`. MoEShift ran this as separate kernels
+for the sigmoid, the multiply, the stream adds and the scale. Each one wrote
+and re-read a 248 MB intermediate.
+
+MoEShift already fuses `REPEAT + MUL + ADD` inside the Metal backend, without a
+new ggml operation. F1 does the same in `ggml/src/ggml-metal/ggml-metal-ops.cpp`:
+
+- When a `SIGMOID` is followed by `MUL(xn, sigmoid)`, an `ADD` chain over the
+  stream views and a `SCALE` with zero bias, Metal runs
+  `kernel_hc_mix_tail_f32` instead. That is the node sequence
+  `build_hc_mix` produces after D1. The intermediates must have no other users
+  and must not be outputs.
+- The kernel (`ggml-metal.metal`) reads `G` and `xn` once and writes only
+  `mixed`. It uses the separate kernels' float4 expressions in the same order,
+  with contraction and reassociation off, so the result is bitwise identical.
+- No ggml operation was added, the graph code is unchanged, and other
+  backends are unaffected. Without a match, the separate kernels run as before.
+- The kernel is new MoEShift code: the idea comes from Strata, not its source.
+
+`tests/test-metal-hc-fusion.cpp` now compares the fused result with the
+separate kernels bit for bit, at widths 2560, 40 and 37 and 1 to 1,536 tokens.
+Exposing the intermediate as an output prevents the fusion, which gives the
+separate kernels' result. All cases matched. At 2560 × 1,536 tokens, a graph of
+just these operations took 0.69 ms fused, against 1.39 ms separate.
+
+| Measurement | D1–D5 | + F1 |
+|---|---:|---:|
+| Long prompt (median of 3) | 7.60 s | **7.44 s** |
+| Prompt throughput | 796.9 tok/s | **815.0 tok/s** |
+| Generation, `short.json`, 6 interleaved runs | 20.75–20.98 tok/s (median 20.88) | 21.20–21.37 tok/s (median **21.29**) |
+| Two-batch prompt, 12,121 tokens | 17.1 s | **16.6 s** |
+
+- **Prompt:** 0.16 s faster (2.1%), about half of the 0.3 s estimated.
+- **Generation:** 2.0% faster. The ranges do not overlap.
+- **Output:** every response matched the previous build exactly: three long
+  prompts, two two-batch prompts and 18 generation runs. The generation output
+  was also the same as before D1–D5.
+- **Checks:** the seven focused native checks passed.
+
+## Generation profile (G1)
+
+Measured with the F1 build and the user configuration, with diagnostics on
+(`LLAMA_MOE_QUIET: 0`). One server: a warmup, two `short.json` requests and
+one `long.json` request, each generating 512 tokens. SSD bytes are the
+internal disk's read counter around each request.
+
+| Request | Generation | Time per token | SSD read during the request |
+|---|---:|---:|---:|
+| Short prompt (72 tokens) + 512 tokens | 21.2–21.4 tok/s | 47 ms | 29.6 GB (58 MB per token) |
+| Long prompt (6,060 tokens) + 512 tokens | 18.8 tok/s | 53 ms | 74.9 GB (about 40 GB for the prompt) |
+
+**Expert cache.** Each token uses 10 experts in each of 48 layers: 480 uses.
+In steady state, 96 to 240 of them missed the per-layer cache (12 recent +
+3 prefetch + 24 protected slots), a hit rate of about 50–80%. That is about
+150 misses and 250 MB of expert reads per token. Only about 58 MB per token
+came from the SSD; macOS's file cache served the rest, because expert reads do
+not bypass it by default. Bypassing the file cache (`LLAMA_MOE_F_NOCACHE`)
+would therefore slow generation.
+
+**Prefetch accounting.** The final log reports `lookahead-prefetch: hits=0`.
+That counter is only updated outside window mode, and generation always runs in
+window mode. The prefetcher writes predictions straight into the layer's cache
+window, where a correct prediction later counts as an ordinary cache hit. It
+read about 44 experts per token (about 70 MB), and nothing currently measures
+how many of them were used.
+
+**GPU timeline.** A Metal System Trace of 10 s of steady generation, with the
+Time Profiler (tracing slowed generation from 21 to 15.7 tok/s, so absolute
+times are high):
+
+- 19,450 inference command buffers, about 124 per token (about 2.6 per
+  layer), each with one encoder. Median encoder time was 131 µs.
+- The GPU was busy 5.14 s of 10.34 s (50%). Most idle time was 16,313 gaps of
+  0.1–1 ms (4.2 s in total), between consecutive command buffers. There were
+  also 562 gaps of 1–5 ms (0.8 s in total), consistent with waiting for missed
+  experts.
+- The CPU side of each gap is the graph split at every MoE layer: the CPU
+  waits for the GPU, reads the router's choice, finds or loads the experts,
+  then encodes and submits the next part. The main thread spent most of its
+  samples encoding (inflated by the trace's own instrumentation). Three
+  threads submitted command buffers, and the expert reader spent its samples
+  in `preadv`.
+
+**Conclusion.** Generation is limited mainly by per-layer CPU–GPU round trips,
+about 124 per token, rather than by SSD bandwidth. Waiting for missed experts
+comes second. Strata's Metal work points the same way: its docs describe "a
+fixed hand-shake per layer" as the cost of streaming experts. Its probes test
+two replacements for per-layer command-buffer round trips: a GPU kernel that
+polls a host-written flag, and `MTLSharedEvent` waits inside one committed
+command buffer (`metal/probe/mtl_doorbell.cpp`, `busy_flag_probe.mm`).
+
+## Prefetch use, cache size and handshake cost (G1a, G2, G5 probe)
+
+**Prefetch use (G1a, uncommitted).** Window mode now counts prefetched experts
+that the router later used, and those evicted unused
+(`lookahead-prefetch window:` in the final diagnostics). For each layer slot,
+`src/llama-moe-slot.cpp` records whether a prefetched entry has been used yet.
+Over one server run (a warmup, two short requests and one long request):
+
+| Protected slots | Prefetched experts published | Used | Evicted unused |
+|---:|---:|---:|---:|
+| 24 | 88,488 | 69,528 (78.6%) | 17,850 |
+| 48 | 65,179 | 48,222 (74.0%) | 15,376 |
+| 96 | 37,751 | 23,743 (62.9%) | 11,340 |
+
+With the shipped 24 slots, about four in five prefetched experts are used, so
+the prefetch reads pay off.
+
+**Cache size (G2).** The same requests with 24, 48 and 96 protected slots per
+layer, each on a fresh server with diagnostics on:
+
+| Protected slots | Short prompt, generation | Long prompt, generation | SSD read per short request | Peak process memory |
+|---:|---:|---:|---:|---:|
+| 24 (shipped) | 22.20–22.33 tok/s | 19.28 tok/s | 16.8 GB | 9.2 GB |
+| 48 | 22.02–22.35 tok/s | 19.90 tok/s | 22.9 GB | 11 GB |
+| 96 | 22.42–22.58 tok/s | 19.91 tok/s | 37.3 GB | 16 GB |
+
+- More protected slots gave at most 1.5% after a short prompt and 3% after the
+  long one, for 2–7 GB more memory. Not worth it; the configuration keeps 24.
+- SSD reads rose with the cache size. macOS's file cache is already a large
+  second-level expert cache, and a bigger in-process cache takes that memory
+  away, so more misses reach the SSD.
+- The 72-token prompt also got slower (1.13 s → 1.85 s).
+- All responses were identical to the 24-slot run.
+
+**Handshake cost (G5 probe).** A standalone Metal program
+(`handshake.mm`, not in the repository) timed 2,000 tiny GPU stages, each
+followed by a CPU response:
+
+| Handshake | Idle GPU | With a keepalive-style kernel on a second queue |
+|---|---:|---:|
+| A: one command buffer per stage, `waitUntilCompleted` (as ggml's graph splits) | 128 µs | **54 µs** |
+| D: as A, the host polls the status | — | 50 µs |
+| C: one command buffer, `MTLSharedEvent` signal/wait, host notified | 141 µs | 55 µs |
+| B: one command buffer, `MTLSharedEvent` signal/wait, host spins | 88 µs | **27 µs** |
+
+- The handshake itself costs about 54 µs with the GPU kept awake. Event
+  ping-pong inside one command buffer, with a spinning host, halves that.
+  About 124 handshakes per token puts the saving at about 3.4 ms per token,
+  around 7%.
+- Without tracing, a token takes about 47 ms, and the GPU is busy for an
+  estimated 31–33 ms of it. That leaves about 130 µs of idle GPU per split,
+  so most of each split is CPU work rather than the handshake: reading the
+  router output, assigning slots, and encoding and submitting the next part.
+- A single pre-encoded command buffer per token would take the encoding off
+  the critical path as well. The split timing below measures how much more
+  that could save.
+
+**Per-split timing.** Temporary timers in `ggml_backend_sched_compute_splits`
+(`ggml/src/ggml-backend.cpp`), removed afterwards, during `short.json`
+generation without tracing (22.1–22.4 tok/s, 44.6–45.2 ms per token).
+Averages per token:
+
+| Part | Per token | Per layer |
+|---|---:|---:|
+| Splits | 49 Metal + 49 CPU | — |
+| Metal split: encode and commit (asynchronous) | 6.7 ms | about 137 µs |
+| CPU split: waiting for the GPU before reading its inputs | 33.5 ms | about 684 µs |
+| CPU split: compute (router output, slot assignment, starting reads) | 1.4 ms | about 29 µs |
+| Scheduler total | 41.5 ms | — |
+| Outside the scheduler (graph setup, inputs, sampling, final sync) | about 3.2 ms | — |
+
+At every layer, the GPU idles while the CPU encodes the next Metal split
+(about 137 µs), during the CPU split itself (about 29 µs) and during the
+wake-up handshake (about 54 µs). That is about 220 µs per layer, or about
+10.8 ms per token, so the GPU is busy about 31 ms of each 45 ms token. This
+agrees with the trace.
+
+Encoding is the largest part, and it does not depend on the CPU split's
+result: the router's choice reaches the GPU as data, not as graph structure.
+A scheduler could encode and commit the next Metal split before running the
+CPU split, with the split waiting on an `MTLSharedEvent` that the CPU signals
+when it finishes. That would hide the encoding, and with a spinning host it
+would also halve the handshake. Per layer, the idle time would fall from about
+220 µs to about 60 µs, saving an estimated 8 ms per token: about 45 → 37 ms,
+or roughly +20% generation speed. This is an estimate and is not implemented.
+
+**Pre-encoding tried and reverted (G5).** An implementation encoded the next
+Metal split while the GPU was still busy:
+
+- A `graph_prepare` hook in the backend interface, called by
+  `ggml_backend_sched_compute_splits` before a CPU split.
+- Metal command buffers built without being enqueued.
+- The second command buffer gated on a shared event, opened by the host or by
+  a small command buffer that waits for the expert reads, with the read waits
+  looked up at commit time.
+
+Encoding moved off the critical path, as intended: the commit took 0.4 ms per
+token instead of 6.7 ms. But the time spent waiting for the GPU did not shrink
+(33.5 → 34.0 ms per token), and generation was 1.5% slower:
+
+| Build | Generation, `short.json`, 6 interleaved runs |
+|---|---|
+| F1 | 21.43–21.72 tok/s (median 21.61) |
+| F1 + pre-encoding | 21.12–21.35 tok/s (median 21.28) |
+
+Output was identical everywhere, and the long prompt was unchanged (7.41 s).
+The change was reverted.
+
+**The real limit: missing-expert reads.** Temporary timers showed why. In
+about 90% of layers, about 3.5 experts miss the cache. Their reads take about
+0.36 ms from the CPU split to the shared-event signal. The second Metal
+command buffer of each layer waits for that signal. Encoding (about 0.14 ms)
+was already hidden inside the read time.
+
+Skipping the reads (`LLAMA_MOE_SKIP_READ=1`, timing only, output invalid,
+`ignore_eos` to keep 512 tokens) measured the cost:
+
+| Generation, `short.json` with `ignore_eos` | tok/s | ms per token |
+|---|---:|---:|
+| Normal | 21.70–21.80 | 45.9–46.1 |
+| Expert reads skipped | 29.20–29.29 | 34.1–34.3 |
+
+Missing-expert reads put about 12 ms per token on the critical path. Faster
+reads could raise generation by up to about 35%.
+
+How the reads are issued today:
+
+- Each layer with misses creates a new coordinator thread (`start_demand`),
+  which creates up to four reader threads (`install_packed_wave`). That is
+  about 220 thread creations per token.
+- Each expert (about 1.7 MB) is read by one thread in one `preadv`.
+
+Reusing persistent threads, and splitting each expert's three matrices across
+threads, are the next things to try.
+
+**Persistent split demand reads (R1, uncommitted).** In `src/llama-moe-slot.cpp`,
+`start_demand` now queues one read per matrix of each missing expert, about ten
+reads per layer, to a pool of 12 persistent reader threads
+(`kDemandReadThreads`, QoS user-interactive). It no longer creates a
+coordinator thread and up to four reader threads per layer.
+
+- `read_expert_directv` takes an optional family index and reads that
+  matrix's sub-range of the packed expert. A split expert still counts as one
+  miss.
+- The last read of a layer's batch adds the time, signals the layer's shared
+  event and arms the next layer's prefetch, as the coordinator thread did. A
+  new batch for the same layer waits until the previous batch has finished.
+
+| Build | Generation, `short.json`, 6 interleaved runs | Generation after the long prompt (median of 3) |
+|---|---|---:|
+| F1 | 21.36–21.87 tok/s (median 21.47) | 19.08 tok/s |
+| F1 + R1 | 22.24–23.03 tok/s (median **22.39**) | **19.90 tok/s** |
+
+- **Generation:** 4.3% faster after a short prompt, and 4.3% after the long
+  one. The ranges do not overlap. That is less than the 10–15% estimated.
+- **Thread count:** 6, 12 and 24 reader threads gave about the same speed in a
+  quick check (about 22.7–23.1 tok/s each).
+- **Unchanged:** prompt time (7.41 s), peak memory (9,563 MB) and swap.
+- **Output:** every response was identical to the previous build: 18
+  generation runs, three long prompts and both two-batch prompts.
+- **Checks:** the seven focused native checks passed.
+
+## Prefetch depth (N1)
+
+During generation, the lookahead predicts the next layer's experts from the
+current layer's hidden state and reads them in the background. The shipped
+profile predicts 3 (`LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`) and reads 2
+(`LLAMA_MOE_PREFETCH_READ`). Positive protected slots used to require depth 3.
+That rule now accepts depths 1–16. The protected cache's recent group is the
+decode window plus the depth (uncommitted: `src/llama-moe-tensor-loader.h`,
+`src/llama-moe-slot.cpp`, `tools/server/server-les-router.cpp`,
+`configs/README.md`, `docs/les/protected-decode-cache.md`).
+
+Each setting ran on a fresh server with diagnostics on and the R1 build: a
+warmup, two `short.json` requests and one `long.json` request, each generating
+512 tokens.
+
+| Depth / read | Short prompt, generation | Long prompt, generation | Predictions used | SSD read per short request | Peak process memory |
+|---|---:|---:|---:|---:|---:|
+| 3 / 2 (shipped) | 22.23–22.44 tok/s | 19.82 tok/s | 78.2% | 24.0 GB | 9,186 MB |
+| 3 / 3 | 22.33–22.47 tok/s | 19.87 tok/s | 77.3% | 24.3 GB | 9,186 MB |
+| 5 / 5 | 23.80–23.91 tok/s | 20.90 tok/s | 69.9% | 26.8 GB | 9,346 MB |
+| **8 / 8** | **24.94–25.03 tok/s** | **21.76 tok/s** | 58.9% | 33.0 GB | 9,446 MB |
+| 12 / 12 | 24.82–24.86 tok/s | 20.82 tok/s | 45.2% | 45.3 GB | 10 GB |
+| 16 / 16 | 23.79–23.82 tok/s | 20.20 tok/s | 35.1% | 59.9 GB | 12 GB |
+
+- **Best setting:** depth 8 was fastest. It made generation 12% faster after a
+  short prompt and 10% faster after the long one, for 260 MB more peak memory.
+- **Deeper than 8:** more predictions go unused, and the extra reads and
+  memory cost more than they save.
+- **SSD:** depth 8 reads about 38% more from the SSD per request. These are
+  reads, not writes, so they do not wear the SSD. Swap did not change.
+- **Output:** identical at every depth: the routing and weights are the same,
+  and only which experts are already loaded changes.
+- **Prompt time:** grew slightly with depth (1.30 → 1.39 s for the short
+  prompt, 7.40 → 7.48 s for the long one).
 
 ## Combined result
 
-User configuration (`prefill-max-tokens: 6144`, `f16` KV) with both
-uncommitted changes, compared with the `q8_0` baseline on the original build.
-Medians of three measured requests:
+User configuration (`prefill-max-tokens: 6144`, `f16` KV) with all three code
+changes, compared with the `q8_0` baseline on the original build. Medians of
+three measured requests:
 
 | Setup | Prompt time | Prompt throughput | Generation | Peak process memory |
 |---|---:|---:|---:|---:|
 | Original build, `q8_0` KV | 10.29 s | 589.0 tok/s | 14.71 tok/s | 9,211 MB |
-| Parallel PLE reads + threaded copy, `f16` KV | **8.29 s** | **730.9 tok/s** | 15.29 tok/s | 9,362 MB |
+| Parallel PLE reads + threaded copy, `f16` KV | 8.29 s | 730.9 tok/s | 15.29 tok/s | 9,362 MB |
+| + double-buffered prefill reads | 7.92 s | 764.7 tok/s | 16.08 tok/s | 9,587 MB |
+| + hyper-connection graph changes (D1–D5) | 7.60 s | 796.9 tok/s | 18.87 tok/s | 9,591 MB |
+| + fused hyper-connection mix tail (F1) | **7.44 s** | **815.0 tok/s** | 19.08 tok/s | 9,591 MB |
 
-Prompt processing was 19.4% faster (2.00 s less), and throughput 24% higher.
-Before any of these changes, at `prefill-max-tokens: 3072`, the same prompt
-took 15.47 s. All three measured responses matched the `f16` run on the
-original build exactly.
+Prompt processing was 28% faster than the original build (2.85 s less), and
+throughput 38% higher. Before any of these changes, at
+`prefill-max-tokens: 3072`, the same prompt took 15.47 s. All measured
+responses matched the corresponding earlier runs exactly. Peak process memory
+rose by 225 MB with double buffering, less than the size of the second buffer
+(about 0.9 GiB). The peak may come from a different point in the request. The
+cause was not investigated.
+
+A 12,121-token prompt (`benchmarks/long.json` content twice, 64 output tokens)
+is split into two batches. That exercises the reader restarting between
+batches. It took 17.5 s with the source build before the hyper-connection
+changes, 17.1 s after them and 16.6 s with F1, against 21.8 s with the Homebrew build (same
+configuration, none of the code changes). Every run gave the same output as the
+Homebrew build.
+
+Generation measured 18.7–19.3 tok/s in this run, higher than in any earlier
+run (14.5–17.0 tok/s). Most of that difference is run-to-run variation, as the
+dedicated benchmark below shows.
+
+**Generation benchmark.** Two builds that differ only in D1–D5, with
+`benchmarks/short.json` (512 generated tokens, greedy). They were interleaved
+over three rounds; each round used a fresh server, one warmup and two measured
+requests.
+
+| Build | Generation, 6 measured runs | Median |
+|---|---|---:|
+| Before D1–D5 | 20.13–20.57 tok/s | 20.33 tok/s |
+| With D1–D5 | 20.80–21.05 tok/s | **20.94 tok/s** |
+
+Generation was 3.0% faster with D1–D5; the two ranges do not overlap. All 18
+responses, warmups included, were identical. The larger differences between the
+long-prompt runs above came from variation between runs, not from these
+changes.
 
 During every benchmark run, the internal SSD wrote 18–139 MB in total, for
 the whole system, and swap use did not grow. Swap grew between runs, while
 Instruments recorded and exported traces.
+
+## Tool calling
+
+MoEShift forwards `/v1/chat/completions` request bodies unchanged to the
+llama.cpp server worker. That worker uses Jinja chat templates by default, and
+the Flash Next template supports tools. A test with one `get_weather` function
+(`temperature: 0`, thinking off) found:
+
+- The model returned a `tool_calls` entry with arguments
+  `{"city":"Paris","unit":"celsius"}` and `finish_reason: tool_calls`.
+- After a `tool` message with the result, it answered "The current weather in
+  Paris is **14°C** with **light rain**." (`finish_reason: stop`).
+- With `stream: true`, the function name and arguments arrived in streamed
+  `tool_calls` deltas, ending with `finish_reason: tool_calls`.
+
+Multiple tools, parallel calls and `tool_choice` were not tested.
 
 ## Not tested
 

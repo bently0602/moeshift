@@ -1464,6 +1464,29 @@ kernel void kernel_repeat_mul_add_f32(
     dst[i] = residual[i] + product;
 }
 
+// SIGMOID, MUL, the ADD chain over the streams and SCALE of a hyper-connection mix, in one pass:
+//   dst = scale * ((xn_0 * sigmoid(g_0) + xn_1 * sigmoid(g_1)) + ...) + bias
+// Each step keeps the expression and the F32 rounding of the separate float4 kernels.
+kernel void kernel_hc_mix_tail_f32(
+        constant ggml_metal_kargs_hc_mix_tail & args,
+        device const float4 * g,
+        device const float4 * xn,
+        device       float4 * dst,
+        uint i [[thread_position_in_grid]]) {
+    #pragma clang fp contract(off) reassociate(off)
+    if (i >= uint(args.n4*args.nt)) {
+        return;
+    }
+    const uint t = i/args.n4;
+    const uint base = t*args.hc*args.n4 + (i - t*args.n4);
+    float4 m = xn[base] * (1 / (1 + exp(-g[base])));
+    for (int c = 1; c < args.hc; ++c) {
+        const uint j = base + c*args.n4;
+        m = m + xn[j] * (1 / (1 + exp(-g[j])));
+    }
+    dst[i] = args.scale * m + args.bias;
+}
+
 template<typename T>
 kernel void kernel_repeat(
         constant ggml_metal_kargs_repeat & args,

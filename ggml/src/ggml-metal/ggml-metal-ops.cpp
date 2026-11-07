@@ -77,6 +77,12 @@ struct ggml_metal_op {
         return ggml_graph_node(gf, idxs[i]);
     }
 
+    // number of graph nodes that read t, including views
+    int32_t use_count(const ggml_tensor * t) const {
+        const size_t pos = ggml_hash_find(&gf->visited_hash_set, t);
+        return ggml_bitset_get(gf->visited_hash_set.used, pos) ? gf->use_counts[pos] : 0;
+    }
+
     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
         assert(use_fusion);
         assert(i0 >= 0 && i0 < n_nodes());
@@ -781,8 +787,110 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// The end of a hyper-connection mix (qwen4exp build_hc_mix):
+//   gated = MUL(xn, SIGMOID(g)); mixed = SCALE(ADD(...ADD(stream 0, stream 1)..., stream hc-1))
+// where stream c is an [n, nt] view of gated with row stride hc*n. Only mixed is written, so the
+// sigmoid, gated and partial sums must have no other users. Returns the nodes fused, or 0.
+static int ggml_metal_op_hc_mix_tail(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * sig = ctx->node(idx);
+    const ggml_tensor * g = sig->src[0];
+    if (idx + 4 > ctx->n_nodes() || sig->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(g) || !ggml_is_contiguous(sig) || sig->ne[2] != 1 || sig->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_tensor * mul = ctx->node(idx + 1);
+    const ggml_tensor * add = ctx->node(idx + 2);
+    if (mul->op != GGML_OP_MUL || mul->src[1] != sig || mul->type != GGML_TYPE_F32 ||
+            mul->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul->src[0], sig) ||
+            !ggml_is_contiguous(mul->src[0]) || !ggml_is_contiguous(mul) || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const int64_t n = add->ne[0];
+    const int64_t nt = add->ne[1];
+    const int64_t hc = n > 0 ? sig->ne[0]/n : 0;
+    if (hc < 2 || hc*n != sig->ne[0] || nt != sig->ne[1] || n % 4 != 0 || idx + hc + 2 > ctx->n_nodes() ||
+            ggml_nelements(sig) > INT32_MAX) {
+        return 0;
+    }
+    // stream c reads gated directly or through one reshape of it
+    const ggml_tensor * base = add->src[0]->src[0];
+    auto is_stream = [&](const ggml_tensor * t, int64_t c) {
+        return t->op == GGML_OP_VIEW && t->src[0] == base && t->view_src == mul &&
+            t->view_offs == size_t(c*n)*sizeof(float) && t->type == GGML_TYPE_F32 &&
+            t->ne[0] == n && t->ne[1] == nt && t->ne[2] == 1 && t->ne[3] == 1 &&
+            t->nb[0] == sizeof(float) && t->nb[1] == size_t(hc*n)*sizeof(float) &&
+            ctx->use_count(t) == 1;
+    };
+    if (base != mul && (base->op != GGML_OP_RESHAPE || base->src[0] != mul ||
+            ctx->use_count(mul) != 1 || ctx->use_count(base) != hc)) {
+        return 0;
+    }
+    if (base == mul && ctx->use_count(mul) != hc) {
+        return 0;
+    }
+    if (ctx->use_count(sig) != 1 || !is_stream(add->src[0], 0) || !is_stream(add->src[1], 1)) {
+        return 0;
+    }
+    const ggml_tensor * last = add;
+    for (int64_t c = 2; c < hc; ++c) {
+        const ggml_tensor * next = ctx->node(idx + 1 + c);
+        if (next->op != GGML_OP_ADD || next->src[0] != last || !is_stream(next->src[1], c) ||
+                ctx->use_count(last) != 1) {
+            return 0;
+        }
+        last = next;
+    }
+    const ggml_tensor * scale = ctx->node(idx + 1 + hc);
+    if (scale->op != GGML_OP_SCALE || scale->src[0] != last || scale->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(last) || !ggml_is_contiguous(scale) || ctx->use_count(last) != 1 ||
+            ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return 0;
+    }
+    const int n_fuse = int(hc) + 2;
+    for (int i = 0; i < n_fuse - 1; ++i) {
+        const ggml_tensor * t = ctx->node(idx + i);
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    for (int i = 1; i < n_fuse; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_hc_mix_tail args = {
+        /*.n4    =*/ int32_t(n/4),
+        /*.hc    =*/ int32_t(hc),
+        /*.nt    =*/ int32_t(nt),
+        /*.scale =*/ ggml_get_op_params_f32(scale, 0),
+        /*.bias  =*/ ggml_get_op_params_f32(scale, 1),
+    };
+    auto pipeline = ggml_metal_library_get_pipeline_hc_mix_tail(ctx->lib);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(g),           1);
+    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(mul->src[0]), 2);
+    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(scale),       3);
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int64_t n_thr = n/4*nt;
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_thr + nth - 1)/nth, 1, 1, nth, 1, 1);
+    if (ctx->debug_fusion > 0) {
+        GGML_LOG_INFO("%s: fuse SIGMOID + MUL + ADD x %d + SCALE\n", __func__, int(hc - 1));
+    }
+    return n_fuse;
+}
+
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (ctx->use_fusion && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID) {
+        const int n_fuse = ggml_metal_op_hc_mix_tail(ctx, idx);
+        if (n_fuse > 0) {
+            return n_fuse;
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

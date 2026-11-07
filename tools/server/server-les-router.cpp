@@ -240,10 +240,12 @@ void validate_config(const json & config, const std::filesystem::path & base, st
         }
         for (const auto & value : env.items()) { scalar(value.value()); }
         if (env.contains("LLAMA_MOE_PROTECTED_SLOTS") && scalar(env.at("LLAMA_MOE_PROTECTED_SLOTS")) != "0") {
+            const auto depth = env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")
+                ? std::atoi(scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")).c_str()) : 0;
             require(env.contains("LLAMA_MOE_DECODE_WINDOW") && scalar(env.at("LLAMA_MOE_DECODE_WINDOW")) == "12" &&
-                    env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")) == "3" &&
+                    depth >= 1 && depth <= 16 &&
                     env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH") && scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH")) == "1",
-                    "Protected LRFU cache requires decode window 12 and enabled prefetch depth 3; set protected slots to 0 to disable it");
+                    "Protected LRFU cache requires decode window 12 and enabled prefetch depth 1-16; set protected slots to 0 to disable it");
         }
         aliases.insert(alias);
     }
