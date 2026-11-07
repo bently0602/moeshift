@@ -43,7 +43,10 @@ Set `env.LLAMA_MOE_QUIET` to `0` for diagnostics such as `adaptive-batch`,
 `adaptive phase=prefill/decode`, `phase-scratch`, and `protected-cache`.
 
 The pipeline stages at most 1,200 MiB of expert data per layer; larger layers
-use bounded slot reads instead.
+use bounded slot reads instead. One reader thread reads layers in order into two
+host staging buffers, so the next layer's read does not wait for the current
+layer's copy into the shared bank. Both buffers hold the largest layer and are
+released before decoding.
 
 ## Code and verification
 

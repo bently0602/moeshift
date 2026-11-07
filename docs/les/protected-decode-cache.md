@@ -16,12 +16,12 @@ Configure it inside the model profile's `env` object in
 
 These are profile entries, not shell exports. The router isolates workers from
 inherited tuning variables. Positive protected slots require window 12,
-prefetch enabled and depth 3. Set protected slots to `0` to disable the
+prefetch enabled and a depth of 1–16. Set protected slots to `0` to disable the
 protected tier. The CLI override is `--moe-protected-slots N`.
 
 ## Slot ownership
 
-Each enabled layer has **15 recent slots** (12 decode + 3 prefetch) and
+With the shipped depth 3, each enabled layer has **15 recent slots** (12 decode + 3 prefetch) and
 **24 protected slots** by default: 39 physical slots in total. Recent and
 protected are logical groups; promotion and demotion change metadata without
 moving expert weights or tensor addresses.
@@ -59,8 +59,8 @@ weights or precision. The half-life is not a measured optimum for every workload
 
 ## Capacity and memory
 
-The protected-slot limit is `min(prefill bank, expert count, 1024) - 15`.
-With the shipped prefill banks, valid values are 0–497 for Flash Next and
+The protected-slot limit is `min(prefill bank, expert count, 1024) - 12 - depth`.
+With the shipped prefill banks and depth 3, valid values are 0–497 for Flash Next and
 0–241 for Qwen3.6. Invalid capacities are rejected.
 
 | Tested quantization | Expert layers | Extra memory per protected slot across layers |

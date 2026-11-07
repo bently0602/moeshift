@@ -59,8 +59,8 @@ single source of runtime tuning: shell variables starting with `LLAMA_`, `GGML_`
 1; external hosts and speculative-decoding options are rejected.
 
 Both shipped LRFU profiles use a 12-slot decode window, prediction depth 3 and
-24 protected slots per layer. Positive protected slots require that combination
-and enabled prefetch. The policy scores actual router demand with a 32-step
+24 protected slots per layer. Positive protected slots require window 12,
+enabled prefetch and a prediction depth of 1–16. The policy scores actual router demand with a 32-step
 half-life; it does not change routing top-k, expert weights or precision.
 
 | Profile setting | Default and purpose |

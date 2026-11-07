@@ -247,9 +247,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    // scaling before the reshape lets Metal fuse the norm and the multiply
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, w_norm, n_embd, hc));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -260,15 +261,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+    // collapse the streams by their mean; adding the strided views directly avoids copying stream 0
+    auto stream = [&](int64_t c) {
+        return ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
                 ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+    };
+    ggml_tensor * mixed = hc > 1 ? ggml_add(ctx0, stream(0), stream(1)) : ggml_cont(ctx0, stream(0));
+    for (int64_t c = 2; c < hc; ++c) {
+        mixed = ggml_add(ctx0, mixed, stream(c));
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
@@ -1121,12 +1122,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
 
     // both norms group over one hc stream, with a weight over the whole hc*n_embd layout
+    // the weight is applied per stream so that Metal fuses the norm and the multiply
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
         ggml_tensor * t = ggml_reshape_3d(ctx0, x, n_embd, hc, n_tokens);
         t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, n_tokens);
-        t = ggml_mul(ctx0, t, w);
-        return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
+        return ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, n_embd, hc));
     };
 
     key = grouped_norm(key, model.layers[il].ple_norm_key);
@@ -1169,16 +1169,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 
+    // one transposed copy, [hc_dim, hist + n_seq_tokens, n_seqs]; each tap is a row range of it
+    ggml_tensor * padded_t = ggml_cont(ctx0, ggml_transpose(ctx0, padded));
+
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
         const int64_t start = hist - (kern - 1 - k) * dil;
 
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
+        ggml_tensor * shifted = ggml_view_3d(ctx0, padded_t, hc_dim, n_seq_tokens, n_seqs,
+                padded_t->nb[1], padded_t->nb[2], start * padded_t->nb[1]);
 
         // column k of the [kern, hc_dim] kernel is one weight per channel
         ggml_tensor * wk = ggml_cont(ctx0,
@@ -1196,7 +1196,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     }
 
     conv_out = ggml_silu(ctx0, conv_out);
-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
+    conv_out = ggml_reshape_3d(ctx0, conv_out, n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
