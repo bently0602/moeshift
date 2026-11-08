@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -137,6 +138,114 @@ static int check_gdn_state_copy(ggml_backend_t backend) {
     return 0;
 }
 
+// The decode pattern: the state is gathered from a cache row (GET_ROWS through reshapes), and the
+// new state is copied into row 1. With one sequence and one token the kernel reads the row itself and
+// the gather is skipped. Row 1 read in place, and row 0 (as after a rollback), must both match the
+// separate gather bit for bit; exposing the gathered state as an output keeps them separate.
+static int check_gdn_state_rows(ggml_backend_t backend) {
+    const int S = 128, H = 48, H_k = 16;
+    for (int32_t row : {1, 0}) {
+        std::vector<float> results[2][2];
+        for (int separate = 0; separate < 2; ++separate) {
+            auto ctx = ggml_init({4*1024*1024, nullptr, true});
+            auto q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+            auto k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+            auto v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+            auto g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+            auto b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+            auto cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H, 2);
+            auto ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            auto gathered = ggml_get_rows(ctx, cache, ids);
+            if (separate) {
+                ggml_set_output(gathered);
+            }
+            auto s0 = ggml_reshape_3d(ctx, ggml_reshape_4d(ctx, gathered, S, S, H, 1), S*S*H, 1, 1);
+            auto result = ggml_gated_delta_net(ctx, q, k, v, g, b, s0);
+            auto output = ggml_view_4d(ctx, result, S, H, 1, 1, ggml_row_size(GGML_TYPE_F32, S),
+                ggml_row_size(GGML_TYPE_F32, S*H), ggml_row_size(GGML_TYPE_F32, S*H), 0);
+            auto state = ggml_view_4d(ctx, result, S, S, H, 1, ggml_row_size(GGML_TYPE_F32, S),
+                ggml_row_size(GGML_TYPE_F32, S*S), ggml_row_size(GGML_TYPE_F32, S*S*H), ggml_row_size(GGML_TYPE_F32, S*H));
+            auto graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, ggml_cpy(ctx, state, ggml_view_2d(ctx, cache, S*S*H, 1, cache->nb[1], cache->nb[1])));
+            auto out = ggml_scale(ctx, output, 1.0f);
+            ggml_build_forward_expand(graph, out);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            uint32_t seed = 23;
+            for (auto * t : {q, k, v, g, b, cache}) {
+                std::vector<float> data(ggml_nelements(t));
+                for (auto & x : data) { x = 0.25f*sample(seed); }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            }
+            ggml_backend_tensor_set(ids, &row, 0, sizeof(row));
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) { return 2; }
+            results[separate][0].resize(ggml_nelements(cache));
+            results[separate][1].resize(ggml_nelements(out));
+            ggml_backend_tensor_get(cache, results[separate][0].data(), 0, ggml_nbytes(cache));
+            ggml_backend_tensor_get(out, results[separate][1].data(), 0, ggml_nbytes(out));
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+        for (int r = 0; r < 2; ++r) {
+            if (std::memcmp(results[0][r].data(), results[1][r].data(), results[0][r].size()*sizeof(float)) != 0) {
+                std::fprintf(stderr, "FAIL gated delta net from cache row %d: %s differs from the separate gather\n", row, r ? "output" : "state");
+                return 3;
+            }
+        }
+    }
+    std::printf("PASS exact gated delta net state read from the cache row\n");
+    return 0;
+}
+
+// MoE routing after the softmax: argsort, the top 10 probabilities, their sum, clamp and division
+// run as one kernel. Exposing the sum keeps the separate kernels. Ids and weights must match bit for
+// bit, including rows with tied probabilities.
+static int check_routing_topk_norm(ggml_backend_t backend) {
+    const int n_expert = 512, k = 10;
+    for (int nt : {1, 4, 2048}) {
+        std::vector<int32_t> ids[2];
+        std::vector<float> weights[2];
+        for (int separate = 0; separate < 2; ++separate) {
+            auto ctx = ggml_init({4*1024*1024, nullptr, true});
+            auto logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, nt);
+            auto probs = ggml_soft_max(ctx, logits);
+            auto selected = ggml_argsort_top_k(ctx, probs, k);
+            auto w = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, nt), selected);
+            w = ggml_reshape_2d(ctx, w, k, nt);
+            auto sum = ggml_sum_rows(ctx, w);
+            if (separate) {
+                ggml_set_output(sum);
+            }
+            auto norm = ggml_div(ctx, w, ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY));
+            auto graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, norm);
+            ggml_build_forward_expand(graph, ggml_cont(ctx, selected));
+            auto out_ids = ggml_graph_node(graph, -1);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            uint32_t seed = 5;
+            std::vector<float> data(ggml_nelements(logits));
+            for (size_t i = 0; i < data.size(); ++i) {
+                // every fourth row is coarse, so many probabilities tie
+                const bool coarse = (i / n_expert) % 4 == 3;
+                data[i] = coarse ? float(int(4.0f*sample(seed))) : 4.0f*sample(seed);
+            }
+            ggml_backend_tensor_set(logits, data.data(), 0, ggml_nbytes(logits));
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) { return 2; }
+            ids[separate].resize(ggml_nelements(out_ids));
+            weights[separate].resize(ggml_nelements(norm));
+            ggml_backend_tensor_get(out_ids, ids[separate].data(), 0, ggml_nbytes(out_ids));
+            ggml_backend_tensor_get(norm, weights[separate].data(), 0, ggml_nbytes(norm));
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+        if (ids[0] != ids[1] || std::memcmp(weights[0].data(), weights[1].data(), weights[0].size()*sizeof(float)) != 0) {
+            std::fprintf(stderr, "FAIL routing top-k tokens=%d: %s differ from the separate kernels\n", nt, ids[0] != ids[1] ? "ids" : "weights");
+            return 3;
+        }
+        std::printf("PASS exact routing top-k tokens=%d\n", nt);
+    }
+    return 0;
+}
+
 int main() {
     ggml_backend_load_all();
     auto backend = ggml_backend_init_by_name("MTL0", nullptr);
@@ -148,6 +257,12 @@ int main() {
         return rc;
     }
     if (const int rc = check_gdn_state_copy(backend)) {
+        return rc;
+    }
+    if (const int rc = check_gdn_state_rows(backend)) {
+        return rc;
+    }
+    if (const int rc = check_routing_topk_norm(backend)) {
         return rc;
     }
     for (int nt : {1, 7, 1536}) {

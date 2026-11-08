@@ -178,6 +178,8 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+static bool ggml_metal_op_get_rows_skipped(ggml_metal_op_t ctx, int idx);
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -210,6 +212,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return 1;
+    }
+
+    // nothing is encoded, so no ranges are tracked; the delta net tracks its own reads
+    if (ggml_metal_op_get_rows_skipped(ctx, idx)) {
         return 1;
     }
 
@@ -1285,6 +1292,67 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// A one-token GATED_DELTA_NET of one sequence normally reads its state from a GET_ROWS copy of the
+// recurrent cache. The kernel can read the cache row itself through the same row index instead, and
+// the GET_ROWS is skipped. Both ops call this, so they agree. Returns the GET_ROWS index, or -1.
+static int ggml_metal_op_gdn_state_rows(ggml_metal_op_t ctx, int idx) {
+    constexpr int MAX_DIST = 64;
+
+    const ggml_tensor * op = ctx->node(idx);
+    if (!ctx->use_fusion || op->op != GGML_OP_GATED_DELTA_NET || op->src[5]->ne[1] != 1 || op->src[5]->ne[2] != 1 ||
+            op->src[2]->ne[2] != 1) {
+        return -1;
+    }
+
+    const ggml_tensor * rows = op->src[5];
+    while (rows->op == GGML_OP_RESHAPE) {
+        if (ctx->use_count(rows) != 1 || (rows->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return -1;
+        }
+        rows = rows->src[0];
+    }
+    const ggml_tensor * src = rows->src[0];
+    if (rows->op != GGML_OP_GET_ROWS || ctx->use_count(rows) != 1 || (rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            rows->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || rows->src[1]->type != GGML_TYPE_I32 ||
+            ggml_nrows(rows) != 1 || src->ne[0] != rows->ne[0] || src->nb[0] != sizeof(float) ||
+            src->ne[2] != 1 || src->ne[3] != 1 || !ggml_is_contiguous(rows->src[1])) {
+        return -1;
+    }
+
+    // reading the cache later than the GET_ROWS would is safe only if nothing in between writes it or the index
+    const ggml_tensor * cache = src->view_src ? src->view_src : src;
+    const ggml_tensor * ids   = rows->src[1]->view_src ? rows->src[1]->view_src : rows->src[1];
+    for (int j = idx - 1; j >= 0 && j >= idx - MAX_DIST; --j) {
+        const ggml_tensor * t = ctx->node(j);
+        if (t == rows) {
+            return j;
+        }
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        if (base == cache || base == ids) {
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
+// true when a later gated delta net reads this GET_ROWS's row itself (ggml_metal_op_gdn_state_rows)
+static bool ggml_metal_op_get_rows_skipped(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * op = ctx->node(idx);
+    if (!ctx->use_fusion || op->op != GGML_OP_GET_ROWS || op->type != GGML_TYPE_F32 || ggml_nrows(op) != 1) {
+        return false;
+    }
+    for (int j = idx + 1; j < ctx->n_nodes() && j <= idx + 64; ++j) {
+        if (ctx->node(j)->op == GGML_OP_GATED_DELTA_NET && ggml_metal_op_gdn_state_rows(ctx, j) == idx) {
+            if (ctx->debug_fusion > 0) {
+                GGML_LOG_DEBUG("%s: fuse: GET_ROWS into GATED_DELTA_NET (%s)\n", __func__, op->name);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1792,7 +1860,28 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.nb_s_rows =*/ 0,
     };
+
+    // read the state from its cache row and skip the GET_ROWS copy (see ggml_metal_op_gdn_state_rows)
+    ggml_metal_buffer_id bid_s      = ggml_metal_get_buffer_id(op->src[5]);
+    ggml_metal_buffer_id bid_s_rows = bid_s;
+    const int idx_rows = ggml_metal_op_gdn_state_rows(ctx, idx);
+    if (idx_rows >= 0) {
+        const ggml_tensor * rows = ctx->node(idx_rows);
+        // the kernel reads the cache row and the index in place of the gathered copy
+        if (ctx->mem_ranges && (!ggml_mem_ranges_check_src(ctx->mem_ranges, rows->src[0]) ||
+                                !ggml_mem_ranges_check_src(ctx->mem_ranges, rows->src[1]))) {
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+        if (ctx->mem_ranges) {
+            ggml_mem_ranges_add_src(ctx->mem_ranges, rows->src[0]);
+            ggml_mem_ranges_add_src(ctx->mem_ranges, rows->src[1]);
+        }
+        bid_s      = ggml_metal_get_buffer_id(rows->src[0]);
+        bid_s_rows = ggml_metal_get_buffer_id(rows->src[1]);
+        args.nb_s_rows = rows->src[0]->nb[1];
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++);
@@ -1801,7 +1890,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+    ggml_metal_encoder_set_buffer  (enc, bid_s,                                ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
 
     // Without snapshots the new state normally follows the attention output in dst and is then
@@ -1830,6 +1919,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         }
     }
     ggml_metal_encoder_set_buffer  (enc, bid_state,                            ida++); // new state
+    ggml_metal_encoder_set_buffer  (enc, bid_s_rows,                           ida++); // state row index
 
     const int nsg = pipeline.nsg;
 
@@ -4394,7 +4484,103 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// MoE routing (build_moe_ffn): ARGSORT of the expert probabilities, GET_ROWS of the top k, SUM_ROWS,
+// CLAMP and DIV to normalize them. ggml_graph_optimize keeps the five together, and one kernel
+// computes them, in the same order. Returns the number of nodes encoded, or 0.
+static int ggml_metal_op_argsort_topk_norm(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * sort = ctx->node(idx);
+    if (!ctx->use_fusion || idx + 4 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    const ggml_tensor * rows  = ctx->node(idx + 1);
+    const ggml_tensor * sum   = ctx->node(idx + 2);
+    const ggml_tensor * clamp = ctx->node(idx + 3);
+    const ggml_tensor * div   = ctx->node(idx + 4);
+    const ggml_tensor * probs = sort->src[0];
+    const ggml_tensor * ids   = rows->src[1];
+    const ggml_tensor * w2d   = sum->src[0];
+
+    const auto reshaped = [](const ggml_tensor * t, const ggml_tensor * of) {
+        while (t && t->op == GGML_OP_RESHAPE) {
+            t = t->src[0];
+        }
+        return t == of;
+    };
+
+    const int64_t n = probs->ne[0];
+    const int64_t k = ids ? ids->ne[0] : 0;
+
+    // sum_rows sums k < 32 values (not a multiple of 4) with one simd_sum over k threads; the kernel
+    // does the same with the other lanes zero
+    if ((sort->op_params[0] != GGML_SORT_ORDER_DESC) || probs->type != GGML_TYPE_F32 || sort->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(probs) || !ggml_is_contiguous(sort) || probs->ne[2] != 1 || probs->ne[3] != 1 ||
+            rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 ||
+            ids->op != GGML_OP_VIEW || ids->view_src != sort || ids->view_offs != 0 || ids->nb[1] != sort->nb[1] ||
+            !reshaped(rows->src[0], probs) || rows->src[0]->ne[0] != 1 || rows->src[0]->ne[1] != n ||
+            k < 1 || k >= 32 || k % 4 == 0 ||
+            sum->op != GGML_OP_SUM_ROWS || !reshaped(w2d, rows) || w2d->ne[0] != k ||
+            clamp->op != GGML_OP_CLAMP || clamp->src[0] != sum ||
+            div->op != GGML_OP_DIV || div->src[0] != w2d || div->src[1] != clamp || !ggml_is_contiguous(div) ||
+            ctx->use_count(rows) != 1 || ctx->use_count(w2d) != 2 || ctx->use_count(sum) != 1 || ctx->use_count(clamp) != 1 ||
+            ((rows->flags | w2d->flags | sum->flags | clamp->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_argsort_topk_norm(lib);
+
+    // the argsort's single block: the bitonic sort needs a power of 2
+    int nth = 1;
+    while (nth < n) {
+        nth *= 2;
+    }
+    if (nth > ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) ||
+            nth > ggml_metal_pipeline_max_theads_per_threadgroup(ggml_metal_library_get_pipeline_argsort(lib, sort))) {
+        return 0;
+    }
+
+    for (int i = 1; i < 5; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_argsort_topk_norm args = {
+        /*.ne00  =*/ (int32_t) n,
+        /*.top_k =*/ (int32_t) k,
+        /*.nb01  =*/ probs->nb[1],
+        /*.nb1   =*/ sort->nb[1],
+        /*.nbw1  =*/ div->nb[1],
+        /*.min   =*/ ggml_get_op_params_f32(clamp, 0),
+        /*.max   =*/ ggml_get_op_params_f32(clamp, 1),
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(probs), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sort),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(div),   3);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(nth*sizeof(int32_t), 16), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, probs->ne[1], 1, 1, nth, 1, 1);
+
+    if (ctx->debug_fusion > 0) {
+        GGML_LOG_DEBUG("%s: fuse: ARGSORT + GET_ROWS + SUM_ROWS + CLAMP + DIV (%s)\n", __func__, div->name);
+    }
+
+    return 5;
+}
+
 int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
+    if (const int n_fuse = ggml_metal_op_argsort_topk_norm(ctx, idx)) {
+        return n_fuse;
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

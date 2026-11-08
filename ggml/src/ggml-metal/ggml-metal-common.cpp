@@ -87,7 +87,7 @@ static ggml_mem_range ggml_mem_range_from_tensor_dst(const ggml_tensor * tensor)
     return ggml_mem_range_from_tensor(tensor, MEM_RANGE_TYPE_DST);
 }
 
-static bool ggml_mem_ranges_add_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+bool ggml_mem_ranges_add_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
 
     ggml_mem_range mr = ggml_mem_range_from_tensor_src(tensor);
@@ -152,7 +152,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
     return true;
 }
 
-static bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
 
     ggml_mem_range mr = ggml_mem_range_from_tensor_src(tensor);
@@ -441,6 +441,37 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                 break;
             }
             if (taken[i + 1]) {
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
+
+        // keep the MoE routing chain ARGSORT, GET_ROWS, SUM_ROWS, CLAMP, DIV together (with the views between
+        // them), so one kernel can compute it (ggml_metal_op_argsort_topk_norm)
+        if (node.op() == GGML_OP_ARGSORT) {
+            static const ggml_op chain[] = { GGML_OP_GET_ROWS, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV };
+            int next = 0;
+            int end  = -1;
+            for (int j = i + 1; j < n && j < i + MAX_FUSE && end < 0; j++) {
+                const ggml_tensor * t = gf->nodes[j];
+                if (taken[j]) {
+                    break;
+                }
+                if (ggml_op_is_empty(t->op)) {
+                    continue;
+                }
+                if (t->op != chain[next]) {
+                    break;
+                }
+                if (++next == 4) {
+                    end = j;
+                }
+            }
+            if (end >= 0) {
+                for (int j = i + 1; j <= end; j++) {
+                    node.add_fused(gf->nodes[j]);
+                    taken[j] = true;
+                }
                 nodes.push_back(std::move(node));
                 continue;
             }

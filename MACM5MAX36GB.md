@@ -1318,9 +1318,22 @@ Interleaved A/B against C1a, same setup as above (three rounds, fresh server eac
 | **C1a and C1c** | **25.20 tok/s (+1.7%)** | **22.35 tok/s (+4.1%)** | 7.48 s |
 
 The ranges did not overlap: after the long prompt 21.42–21.49 against 22.35–22.36 tok/s, after a
-short one 24.50–24.90 against 25.01–25.34 tok/s. The larger gain after the long prompt fits the
-indexer copies growing with the context; not traced separately. The long prompt took 0.05 s longer
-(7.43–7.46 against 7.45–7.48 s); that may be noise and was not resolved.
+short one 24.50–24.90 against 25.01–25.34 tok/s. The long prompt took 0.05 s longer (7.43–7.46
+against 7.45–7.48 s); that may be noise and was not resolved.
+
+The larger gain after the long prompt comes partly from the indexer copies, which grow with the
+context. A microbenchmark of the pooling chain for one token, 12 layers
+(`/Volumes/Data/moeshift-scratch/i1/i1_bench.cpp`):
+
+| Cells in the indexer cache | With the copies | Without (C1c) |
+|---:|---:|---:|
+| 6,656 (the long prompt) | 1.55 ms | 0.61 ms |
+| 16,384 | 3.13 ms | 1.38 ms |
+| 32,768 | 6.61 ms | 2.54 ms |
+| 65,536 (the configured context) | 13.60 ms | 5.10 ms |
+
+At the long prompt, that is 0.94 ms of the 1.9 ms per token gained; the other copies make up the
+rest.
 
 - Every response matched C1a and the earlier references.
 - With n-gram speculation (4-row steps; the code edit accepted 47 of 48 drafted tokens), all four
@@ -1329,8 +1342,83 @@ indexer copies growing with the context; not traced separately. The long prompt 
   reserved compute buffer shrank from 6,696 to 6,120 MiB. It is reserved, not resident, so the
   peak does not change.
 
-The indexer still pools, normalizes and rotates every cached block's key on every token; caching
-the pooled keys is I1 in `TODO.md`.
+The indexer still pools, normalizes and rotates every cached block's key on every token. In the
+same microbenchmark, pooling only the newest block (as a cache of pooled keys, I1 in `TODO.md`,
+would) saves 0.26 ms per token at 6,656 cells, 1.0 ms at 16,384, 2.1 ms at 32,768 and 4.5 ms at
+65,536. That cache (I1) was not built: under 1% below about 10k tokens of context, for persistent
+state that every rollback, removal, shift and state load must invalidate, and about 96 MB at 64k.
+
+## Delta-net state read from the cache (C1b, uncommitted)
+
+Each delta-net layer gathered its 3.1 MB recurrent state from the cache with `get_rows` before the
+kernel (`build_rs`; 113 MB per token over 36 layers). For a one-token step of one sequence, the
+Metal kernel now reads the cache row itself, through the same row index, and the `get_rows` is
+skipped:
+
+- Both ops use one test (`ggml_metal_op_gdn_state_rows`): the state comes from a single-use
+  `get_rows` of one row through reshapes, and no node in between writes the cache or the index.
+- The index stays in use, so a rollback (which reads a snapshot row) is handled too. With C1a, the
+  kernel then reads and writes the same row. Each thread reads its state values before it writes
+  them.
+- The kernel's reads of the cache and index are tracked for barriers in place of the skipped copy.
+
+`tests/test-metal-hc-fusion` compares the row read in place and a different row (as after a
+rollback) against the separate gather, bit for bit.
+
+Applied to prompt batches as well, it made the long prompt about 1% slower (7.51 against 7.44 s,
+also with the build order reversed; tracking only the real reads did not help). The cause was not
+found, so the skip is limited to one-token steps; prompt time is then unchanged.
+
+Interleaved A/B against commit `0731c56` (C1a and C1c), same setup as above. Medians:
+
+| Build | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| `0731c56` | 25.09 tok/s | 22.15 tok/s | 7.45 s |
+| **With C1b** | **25.79 tok/s (+2.8%)** | **22.41 tok/s (+1.2%)** | 7.46 s |
+
+After a short prompt the ranges did not overlap (25.01–25.30 against 25.62–26.15). After the long
+prompt they did (21.68–22.99 against 22.38–23.01), but C1b was ahead in each round. An earlier run
+of the version that also covered prompt batches measured +2.0% and +1.1%. Every response matched,
+and so did the four n-gram speculation requests; the peak with speculation was about 10 GB, as
+before.
+
+A note on C1a's grouping: `ggml_graph_optimize` records only a group's last node as written, so for
+the delta net plus its state copy, the kernel's own output is not recorded. Its consumers stay
+after it only because they read it through a separate view node, whose range blocks the reorder.
+A probe with that pattern (`/Volumes/Data/moeshift-scratch/c1b/reorder_test.cpp`) kept the order.
+
+## Routing top-k in one kernel (P4, uncommitted)
+
+After the router's softmax, `build_moe_ffn` ran five kernels per layer: argsort of the 512 expert
+probabilities, `get_rows` of the top 10, `sum_rows`, `clamp` and `div`. One Metal kernel
+(`kernel_argsort_topk_norm_f32`) now computes all five:
+
+- `ggml_graph_optimize` keeps the five nodes (and the views between them) together, so the
+  reorder cannot separate them; `ggml_metal_op_argsort` checks the pattern and encodes the kernel.
+- The sort is the argsort kernel's bitonic network in one 512-thread threadgroup, so ties are ordered
+  the same. The full index row is still written, for the expert runtime and the expert kernels.
+- The 10 weights are summed with one `simd_sum`, as `sum_rows` does with 10 threads, then clamped
+  and divided.
+- The softmax stays a separate kernel: merging it would mean reproducing its reduction order.
+
+`tests/test-metal-hc-fusion` compares ids and weights against the five kernels, bit for bit, for 1,
+4 and 2,048 rows, including rows with many tied probabilities. A counter in the real decode graph
+found the merge in all 48 layers (the other 47 argsorts per token are prefetch guesses).
+
+Interleaved A/B against the C1b build, same setup as above. Medians:
+
+| Build | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| C1b | 25.56 tok/s | 22.34 tok/s | 7.46 s |
+| **With P4** | **25.79 tok/s (+0.9%)** | **22.50 tok/s (+0.7%)** | 7.48 s |
+
+After the long prompt the ranges did not overlap (22.31–22.35 against 22.41–22.54); after a short
+one they did (25.45–25.62 against 25.58–26.02). With the build order reversed, prompt times
+matched run for run within 0.05 s, except one cold first run. Every response matched; peak memory
+was 9,446 MB for both.
+
+That is about 0.3 ms per token for 192 fewer kernels, about 1.5 µs each: less than estimated. C1a
+and C1c gained more per kernel because they also removed copies of megabytes.
 
 ## Tool calling
 

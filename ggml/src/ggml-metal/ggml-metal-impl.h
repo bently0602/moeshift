@@ -910,6 +910,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    uint64_t nb_s_rows; // > 0: one-token state read from row s_rows[seq] of s, rows nb_s_rows apart
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1116,6 +1117,16 @@ typedef struct {
     int32_t  ne3;
     int32_t  top_k;
 } ggml_metal_kargs_argsort;
+
+typedef struct {
+    int32_t  ne00;  // row length; the indices are sorted in one threadgroup
+    int32_t  top_k; // weights per row
+    uint64_t nb01;  // src0 row stride
+    uint64_t nb1;   // index row stride
+    uint64_t nbw1;  // weight row stride
+    float    min;   // clamp of the weight sum
+    float    max;
+} ggml_metal_kargs_argsort_topk_norm;
 
 typedef struct {
     int64_t  ne00;
