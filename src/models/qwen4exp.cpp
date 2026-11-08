@@ -381,7 +381,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 &inject, il);
 
         ggml_tensor * lookahead_next = nullptr;
-        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && moe_decode_phase &&
+        // the late guess (below) replaces this one for one-token steps
+        const bool late = moe_slots && moe_slots->late_prefetch() > 0 && n_tokens == 1;
+        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && moe_decode_phase && !late &&
             il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
             ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
             cb(prefetch_router_logits, "prefetch_router_logits", il);
@@ -406,6 +408,37 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+        }
+
+        // Late prefetch: route the next layer on this layer's output, which names its experts far
+        // better than this layer's FFN input does. The Metal encoder signals the CPU after the
+        // argsort ("les_late-"), so the reads overlap the next layer's attention.
+        if (moe_slots && moe_slots->late_prefetch() > 0 && moe_decode_phase && n_tokens == 1 &&
+                il + 1 < n_layer && moe_slots->uses_layer(il + 1) && model.layers[il + 1].ffn_gate_inp) {
+            const auto & nl = model.layers[il + 1];
+            ggml_tensor * x = nullptr;
+            if (moe_slots->late_prefetch_mix()) {
+                x = build_hc_mix(res_hc, nl.hc_ffn_norm, nl.hc_ffn_down, nl.hc_ffn_up, nl.hc_ffn_inject, nullptr, il + 1);
+            }
+            ggml_tensor * logits = nullptr;
+            if (x) {
+                logits = build_lora_mm(nl.ffn_gate_inp, x);
+            } else {
+                // the next layer's grouped norm, routed per stream and summed: the same ranking as
+                // routing the stream mean (the router is linear), in fewer, cheaper kernels
+                ggml_tensor * xn = ggml_rms_norm(ctx0, res_hc, hparams.f_norm_rms_eps);
+                xn = ggml_mul(ctx0, xn, ggml_reshape_2d(ctx0, nl.hc_ffn_norm, n_embd, hc));
+                ggml_tensor * per_stream = build_lora_mm(nl.ffn_gate_inp, ggml_reshape_2d(ctx0, xn, n_embd, hc));
+                for (int64_t c = 0; c < hc; ++c) {
+                    ggml_tensor * col = ggml_view_1d(ctx0, per_stream, per_stream->ne[0], c*per_stream->nb[1]);
+                    logits = logits ? ggml_add(ctx0, logits, col) : col;
+                }
+            }
+            // kept as an output, so its memory is not reused while the CPU reads it
+            ggml_tensor * guess = ggml_argsort(ctx0, logits, GGML_SORT_ORDER_DESC);
+            ggml_format_name(guess, "les_late-%d", il + 1);
+            ggml_set_output(guess);
+            ggml_build_forward_expand(gf, guess);
         }
 
         // "l_last" is the layer output name that build_cvec and imatrix look for

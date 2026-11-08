@@ -215,7 +215,8 @@ void validate_config(const json & config, const std::filesystem::path & base, st
     const auto & models = config.at("models");
     require(models.is_object() && !models.empty(), "models must be a nonempty object");
     const std::set<std::string> allowed_env{
-        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_ROWS", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
+        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_ROWS", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LATE_MIX",
+        "LLAMA_MOE_LATE_PREFETCH", "LLAMA_MOE_LATE_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
         "LLAMA_MOE_PREFETCH_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH",
         "LLAMA_MOE_PREFILL_PIPELINE", "LLAMA_MOE_PROTECTED_SLOTS", "LLAMA_MOE_QUIET"};
     for (const auto & entry : models.items()) {

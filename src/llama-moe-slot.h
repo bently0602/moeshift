@@ -14,6 +14,11 @@ public:
     bool uses_layer(int layer) const;
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
+    // Late prefetch (LLAMA_MOE_LATE_PREFETCH): guesses per layer made from the previous layer's
+    // output and read while the layer's attention runs; 0 = off. With late_prefetch_mix, the guess
+    // uses the layer's full hyper-connection mix instead of only its norm.
+    int  late_prefetch() const;
+    bool late_prefetch_mix() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
     int  decode_window() const;
     // Shared phase boundary for graph construction and expert installation.
