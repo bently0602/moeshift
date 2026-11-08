@@ -29,22 +29,29 @@ are not general benchmarks.
   54–92 MB in total during each 4-request run, for the whole system.
 - Copying each layer's experts with 8 threads instead of one (`d38cb01`)
   saved another 0.37 s (4.1%).
-- Double-buffered prefill reads (uncommitted) let one reader stream layers
+- Double-buffered prefill reads (`6de789b`) let one reader stream layers
   back to back. The wait for expert reads fell from 0.55 s to 0.13 s per
   prompt, saving another 0.37 s (4.5%).
-- Five graph changes in `src/models/qwen4exp.cpp` (uncommitted) avoid full
+- Five graph changes in `src/models/qwen4exp.cpp` (`6de789b`) avoid full
   passes over the 4-stream hyper-connection state. They saved another 0.32 s
   (4.0%), with identical output. Generation after a short prompt was 3.0%
   faster in an interleaved benchmark.
-- A fused Metal kernel for the end of the hyper-connection mix (uncommitted,
+- A fused Metal kernel for the end of the hyper-connection mix (`6de789b`,
   based on Strata's `gr_epi_up`) saved another 0.16 s (2.1%). Generation was 2.0%
   faster, with identical output.
 - Persistent reader threads for decode-time expert misses, with each expert's
-  matrices read in parallel (uncommitted), made generation 4.3% faster.
+  matrices read in parallel (`6de789b`), made generation 4.3% faster.
 - Combined, with `f16` KV, the long prompt takes 7.44 s, against 10.29 s on the
   original build: 28% faster. It took 15.47 s with the original 3,072-token
   batches. A 12,121-token prompt (two batches) took 16.6 s, against 21.8 s on
   the Homebrew build, with identical output.
+- Reading only predicted experts during prefill (P1) and starting the first
+  layer's read earlier (P2) were measured and not kept. Prompts of 1–4k tokens
+  are limited by the SSD's read speed.
+- A long prompt sent after a generation peaked at 12 GB, because macOS
+  compressed released decode windows instead of discarding them. Replacing
+  released ranges with fresh memory (uncommitted) brings the peak to 9.4 GB,
+  with identical output, prompts 2–15% faster and generation 1.5–2.5% faster.
 - Tool calling works through the OpenAI-compatible API, including with
   streaming.
 - The user configuration now uses `prefill-max-tokens: 6144` and an `f16` KV
@@ -119,8 +126,10 @@ With this configuration on the original build, the long prompt takes about
 [Combined result](#combined-result)). None of them adds a setting, and the
 Homebrew build does not include them.
 
-Memory on this 36 GB Mac: peak process footprint was 9.6 GB with this
-configuration, and swap did not grow during inference. The main risk to SSD
+Memory on this 36 GB Mac: peak process footprint is about 9.4 GB with this
+configuration, and swap did not grow during inference. Before the phase-switch
+memory fix, a long prompt sent after a generation could peak at 12 GB (see
+[Phase-switch memory release](#phase-switch-memory-release-uncommitted)). The main risk to SSD
 life is macOS swapping under memory pressure. Leave headroom before raising
 `prefill-max-tokens`, `ctx-size` or the slot counts.
 
@@ -510,7 +519,7 @@ Both files started successfully with their builds on 2026-11-07.
 
 Restart MoEShift after changing the configuration.
 
-## Double-buffered prefill reads (uncommitted change)
+## Double-buffered prefill reads (commit `6de789b`)
 
 Temporary timers in `install_prefill_pipeline` (removed afterwards) split the
 per-layer expert stall, summed over one long prompt with the threaded copy:
@@ -539,7 +548,7 @@ With the same temporary timers, the read wait fell from 0.55 s to 0.13 s per
 prompt. Most of what remains is the first layer's read, which nothing
 overlaps. The copy time did not change.
 
-## Hyper-connection graph changes (uncommitted)
+## Hyper-connection graph changes (commit `6de789b`)
 
 The model keeps its residual as 4 parallel streams (`dsv4_hc_mult`). For a
 6,056-token batch that is a 248 MB f32 tensor. Each element-wise pass over it
@@ -568,7 +577,7 @@ native checks passed.
 Not done: a faster expert-output sum (3.5 ms per layer, in the MoE code shared
 with Qwen3.6).
 
-## Fused hyper-connection mix tail (F1, uncommitted)
+## Fused hyper-connection mix tail (F1, commit `6de789b`)
 
 Strata's prompt path (`metal/kernels/prompt.metal`, `gr_epi_up`, MIT license)
 computes the end of the hyper-connection read in one pass:
@@ -665,7 +674,7 @@ command buffer (`metal/probe/mtl_doorbell.cpp`, `busy_flag_probe.mm`).
 
 ## Prefetch use, cache size and handshake cost (G1a, G2, G5 probe)
 
-**Prefetch use (G1a, uncommitted).** Window mode now counts prefetched experts
+**Prefetch use (G1a, commit `6de789b`).** Window mode now counts prefetched experts
 that the router later used, and those evicted unused
 (`lookahead-prefetch window:` in the final diagnostics). For each layer slot,
 `src/llama-moe-slot.cpp` records whether a prefetched entry has been used yet.
@@ -798,7 +807,7 @@ How the reads are issued today:
 Reusing persistent threads, and splitting each expert's three matrices across
 threads, are the next things to try.
 
-**Persistent split demand reads (R1, uncommitted).** In `src/llama-moe-slot.cpp`,
+**Persistent split demand reads (R1, commit `6de789b`).** In `src/llama-moe-slot.cpp`,
 `start_demand` now queues one read per matrix of each missing expert, about ten
 reads per layer, to a pool of 12 persistent reader threads
 (`kDemandReadThreads`, QoS user-interactive). It no longer creates a
@@ -832,7 +841,7 @@ current layer's hidden state and reads them in the background. The shipped
 profile predicts 3 (`LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`) and reads 2
 (`LLAMA_MOE_PREFETCH_READ`). Positive protected slots used to require depth 3.
 That rule now accepts depths 1–16. The protected cache's recent group is the
-decode window plus the depth (uncommitted: `src/llama-moe-tensor-loader.h`,
+decode window plus the depth (commit `6de789b`: `src/llama-moe-tensor-loader.h`,
 `src/llama-moe-slot.cpp`, `tools/server/server-les-router.cpp`,
 `configs/README.md`, `docs/les/protected-decode-cache.md`).
 
@@ -912,6 +921,166 @@ During every benchmark run, the internal SSD wrote 18–139 MB in total, for
 the whole system, and swap use did not grow. Swap grew between runs, while
 Instruments recorded and exported traces.
 
+## Prompt-read ideas measured and not kept (P1, P2)
+
+Prompts of 1,209–3,996 tokens all took 6.4–6.6 s. Each batch of 1,024 tokens or
+more reads all 40.9 GB of experts with the pipelined reader, so these prompts are
+limited by the SSD's sequential read speed (about 6.2 s per prompt here). Below
+1,024 tokens the batch reads only the experts it uses, but after routing, without
+overlap.
+
+| Prompt | Prompt time | Experts used per layer (of 512) | Expert data read |
+|---:|---:|---:|---:|
+| 313 tokens | 3.94 s | 279 | 22.6 GB, not overlapped |
+| 711 tokens | 4.94 s | 331 | 26.5 GB, not overlapped |
+| 1,209 tokens | 6.41 s | 361 | 40.9 GB, pipelined |
+| 2,499 tokens | 6.45 s | 397 | 40.9 GB, pipelined |
+| 3,996 tokens | 6.56 s | 427 | 40.9 GB, pipelined |
+
+**P1: read only predicted experts.** The idea was to predict each layer's experts
+during prefill from the previous layer's FFN input, using the next layer's router
+(the method decode prefetch uses), and read only those. A temporary probe
+compared the union of each token's top-k predictions with the experts the layer
+actually used (47 layers per prompt, 10 experts per token):
+
+| Prompt | Top 10 per token: predicted / missed | Top 20: predicted / missed | Top 40: predicted / missed |
+|---:|---:|---:|---:|
+| 313 tokens | 276 / 43 (85% covered) | 361 / 14 (95%) | 436 / 4 (98.5%) |
+| 711 tokens | 323 / 46 (86%) | 403 / 14 (96%) | 461 / 4 (98.9%) |
+| 1,209 tokens | 350 / 47 (87%) | 425 / 14 (96%) | 475 / 4 (98.9%) |
+| 2,499 tokens | 386 / 43 (89%) | 449 / 13 (97%) | 486 / 3 (99.1%) |
+| 3,996 tokens | 414 / 40 (91%) | 466 / 12 (97%) | 494 / 3 (99.3%) |
+| 6,056 tokens | 429 / 38 (91%) | 475 / 11 (97.5%) | 498 / 2 (99.5%) |
+
+The predictions are accurate, but 95% coverage needs a predicted set 20–30%
+larger than the set used. Estimated from read volume at 6.3 GB/s (not measured),
+reading the top-20 set plus the misses would save about 0.9 s at 1.2k tokens,
+0.6 s at 2.5k and 0.4 s at 4k. Below 1,000 tokens it would save nothing or be
+slower, because those prompts already read only the experts they use. The
+6k-token prompt is limited by the GPU. P1 was not implemented. The probe patch
+and output are in `/Volumes/Data/moeshift-scratch/p1probe`.
+
+**P2: start the first layer's read earlier.** Before, the reader started at the
+first layer's expert step, after the PLE lookups and the first layer's attention.
+In the change, `process_ubatch` started it before the batch's inputs were set.
+Timestamps confirmed the first layer's read was complete when the GPU reached it
+(no wait there), but the times did not change. Interleaved A/B, fresh server per
+round, medians of three rounds:
+
+| Prompt | Before | P2 |
+|---|---:|---:|
+| 1,209 tokens | 6.43 s | 6.37 s |
+| 2,499 tokens | 6.47 s | 6.45 s |
+| 3,996 tokens | 6.54 s | 6.53 s |
+| 6,060 tokens | 7.40 s | 7.42 s |
+| 12,121 tokens (two batches) | 16.58 s | 16.57 s |
+
+Outputs were identical, and the 12k-token output matched the Homebrew build.
+Peak process memory was the same (9.6 GB). With two staging buffers, the reader
+can run only two layers ahead. It filled both during the PLE lookups, then lost
+the lead later in the prompt, where reads are about as slow as the GPU's work
+per layer (about 130 ms). Up to 4k tokens, the prompt is limited by the SSD from
+start to finish. A third buffer might keep the lead on the 6k-token prompt
+(estimated 0.1–0.2 s, not measured), but would hold 0.85 GB more during prefill.
+P2 was reverted.
+
+## Generation reader ideas measured and not kept (N3, R2)
+
+During generation, the lookahead guesses the next layer's experts and reads them in the
+background (depth 8, read 8 in `config-source.json`). A prefetch that is not ready in time
+does not block anything: the expert counts as a miss and is read on demand.
+
+**N3: prefetch two layers ahead.** A temporary probe compared, for every expert a layer used
+during two 512-token generations, whether it was already loaded, whether the one-layer-ahead
+guess picked it, and whether a guess made two layers ahead (layer L's FFN input through
+layer L+2's router) would have:
+
+| Guess | Covers of used experts | Covers of misses | Covers of misses the 1-ahead guess missed |
+|---|---:|---:|---:|
+| 1 layer ahead, 8 guesses (shipped) | 58.4% | 14% | — |
+| 2 layers ahead, 3 guesses | 23.5% | 7.7% | 3.5% |
+| 2 layers ahead, 8 guesses | 50.1% | 25% | 18% |
+| 2 layers ahead, 16 guesses | 69.4% | 48% | 42% |
+
+There were about 2.05 misses per layer at 23.4 tok/s. Only 14% of misses were guessed but not
+loaded in time; the other 86% were never guessed, so read timing is not the main limit.
+Guessing two layers ahead is less accurate, and catching a useful share of misses would need
+about 16 guesses per layer. Raising the one-layer-ahead depth past 8 already made generation
+flat or slower (see the N1 section). N3 was not implemented. The probe ran after short
+prompts only.
+
+**R2: reader threads and prefetch timing.** Two changes in `src/llama-moe-slot.cpp`, measured
+with interleaved runs (fresh server each, `config-source.json`, 512 generated tokens):
+
+- **(a)** The prefetch worker kept its read helpers alive instead of starting and joining up
+  to 4 threads per job, about 150–180 per token.
+- **(b)** An option armed the next layer's prefetch as soon as the current layer's demand
+  reads were queued, instead of after they finished, with at most 2 or 4 prefetch read
+  threads while demand reads ran.
+
+| Build | After a short prompt | After the long prompt |
+|---|---:|---:|
+| Base | 24.01 tok/s | 20.67 tok/s |
+| (a) | 24.00 tok/s | 20.60 tok/s |
+| (a) + (b), 2 threads | 22.49 tok/s | 19.31 tok/s |
+| (a) + (b), 4 threads | 21.93 tok/s | 18.99 tok/s |
+
+Short-prompt values are medians of six runs per build. Long-prompt values for the base build
+and (a) are medians of a separate four-round A/B, because a first three-round run measured
+the base build low (19.79 tok/s). Long-prompt values for (b) are medians of three runs.
+Outputs were identical in every run.
+
+- (a) made no difference. The thread starts run on the background worker, not on the GPU's
+  path. A persistent pool for PLE page reads, estimated at 1% or less, was not built.
+- (b) was 6–9% slower. Prefetch reads take SSD bandwidth from the demand reads the GPU is
+  waiting for, so the shipped behavior, waiting for demand reads first, is kept.
+
+Both were reverted. The patch is in `/Volumes/Data/moeshift-scratch/r2`.
+
+## Phase-switch memory release (uncommitted)
+
+A long prompt sent after a generation peaked at 12 GB (`phys_footprint_peak`), against
+9.1–9.7 GB when the previous request only processed a prompt. Every build tested showed it,
+including builds from before D1–D5, so it was not caused by the changes above. Earlier peak
+measurements in this document (9.2–9.6 GB) came from request orders that missed it.
+
+Temporary counters in the worker (`task_info`, and `mincore` over the expert bank) traced it.
+The expert bank holds the 512-slot prefill bank (1.19 GB) and the per-layer decode windows
+and protected cache (3.27 GB). At each phase switch,
+`ggml_metal_buffer_active_ranges` (`ggml/src/ggml-metal/ggml-metal-device.m`) marked the
+whole bank `MADV_FREE_REUSABLE` and reclaimed only the new phase's ranges. The footprint fell
+from 8.4 to 5.8 GB at the switch to prefill. During the prompt, the 40 GB of expert reads
+filled the file cache, and macOS compressed the reusable decode windows instead of discarding
+them. Compressed memory counts in the footprint:
+
+| Point in a 6,056-token prompt after a generation | Footprint | Reusable | Compressed |
+|---|---:|---:|---:|
+| Switch to prefill | 5.9 GB | 3.1 GB | 0.9 GB |
+| Layer 8 | 9.9 GB | 1.4 GB | 2.8 GB |
+| Layer 24 | 10.9 GB | 0.9 GB | 3.3 GB |
+| Layer 40 | 12.2 GB | 0.1 GB | 4.1 GB |
+
+How much was compressed varied between runs (peaks of 9.7–12.3 GB for the same requests).
+Every switch already invalidates the expert mappings in the inactive ranges. The change
+therefore replaces those ranges with fresh zero-fill memory (`vm_allocate` with
+`VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`) instead of marking them reusable. Their pages leave the
+process at once, and the active ranges are left as they are. With the change, compressed
+memory stayed at 0.58 GB through the same prompt, and the peak was 9.2 GB.
+
+Interleaved A/B, `config-source.json`, fresh server per round, three rounds. Each round was a
+warmup and two `short.json` requests, then `long.json`, each generating 512 tokens. Medians:
+
+| Build | Short prompt (72 tokens) | Generation after it | Long prompt | Generation after it | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| Base | 1.55 s | 24.08 tok/s | 7.56 s | 20.66 tok/s | 12 GB |
+| Fresh-memory release | **1.32 s** | **24.45 tok/s** | **7.43 s** | **21.17 tok/s** | **9,445 MB** |
+
+The ranges of the two builds did not overlap on any measure. All responses matched the base
+build and earlier runs exactly. Swap stayed at 0.64 GB. The short prompt is 15% faster and
+the long prompt 1.8% faster. Generation after them is 1.5% and 2.5% faster. The speedup was
+not investigated further; less work for the memory compressor is a likely cause. Not tested:
+`config.json` (depth 3) in the A/B, though the traces used it, and prompts of other lengths.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the
@@ -930,8 +1099,9 @@ Multiple tools, parallel calls and `tool_choice` were not tested.
 
 ## Not tested
 
-- Prompts of other lengths. Prompts under 3,072 tokens fit in one batch either
-  way; prompts over 6,144 tokens still split, into half as many batches.
+- Prompt lengths other than 313–6,060 and 12,121 tokens (see the P1 and P2
+  section). Prompts under 3,072 tokens fit in one batch either way; prompts over
+  6,144 tokens still split, into half as many batches.
 - Long conversations or contexts near the 65,536-token limit.
 - Output agreement between the two settings.
 - The Homebrew build (the source build at the same commit was used).

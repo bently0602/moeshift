@@ -1803,8 +1803,20 @@ bool ggml_metal_buffer_active_ranges(ggml_metal_buffer_t buf,
     for (int i = 0; i < count; ++i)
         if (ends[i] - starts[i] > ggml_metal_device_get_props(buf->dev)->max_buffer_size) return false;
     if (!ggml_metal_buffer_park(buf)) return false;
-    // Every expert mapping is invalidated by the caller before these pages can be reused.
-    if (madvise(buf->all_data, buf->all_size, MADV_FREE_REUSABLE) != 0) return false;
+    // Every expert mapping is invalidated by the caller before these pages can be reused, so
+    // the pages outside the active ranges are replaced with fresh zero-fill memory. Marking them
+    // MADV_FREE_REUSABLE instead let macOS compress them under file-cache pressure during the
+    // next prefill, which counted up to 3 GB of discarded decode windows in the footprint again.
+    size_t gap = 0;
+    for (int i = 0; i <= count; ++i) {
+        const size_t end = i < count ? starts[i] : buf->all_size;
+        if (end > gap) {
+            vm_address_t addr = (vm_address_t) buf->all_data + gap;
+            if (vm_allocate(mach_task_self(), &addr, end - gap, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS)
+                return false;
+        }
+        if (i < count) gap = ends[i];
+    }
     buf->n_buffers = count;
     size_t active = 0;
     for (int i = 0; i < count; ++i) {
@@ -1812,7 +1824,6 @@ bool ggml_metal_buffer_active_ranges(ggml_metal_buffer_t buf,
         buf->buffers[i].data = (char *) buf->all_data + starts[i];
         buf->buffers[i].size = buf->buffers[i].metal_size = len;
         buf->buffers[i].metal = nil;
-        if (madvise(buf->buffers[i].data, len, MADV_FREE_REUSE) != 0) return false;
         active += len;
     }
     if (!ggml_metal_buffer_unpark(buf)) return false;

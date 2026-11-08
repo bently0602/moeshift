@@ -30,9 +30,13 @@ layers: 512 slots cover Flash Next's 512 experts;
 Before switching phases, the runtime synchronizes GPU work and drains expert
 readers. It invalidates cached mappings and sets the active Metal buffer ranges
 for the new phase. During decode, the unused shared-bank ranges are released;
-the per-layer decode windows and protected cache remain available. Virtual
-addresses stay reserved while discarded host pages become reusable by macOS.
-The next prefill restores the shared-bank ranges before using them.
+the per-layer decode windows and protected cache remain available. During
+prefill, the decode windows are released the same way. Each switch replaces the
+inactive ranges with fresh zero-fill memory, so their pages leave the process at
+once while the virtual addresses stay reserved. (Marking them
+`MADV_FREE_REUSABLE` instead let macOS compress them under file-cache pressure,
+which counted them in the footprint again.) The next phase's ranges are
+zero-filled on first use, and nothing relies on their earlier contents.
 
 Expert execution uses the common Metal phase identifiers in
 `ggml/src/ggml-metal/ggml-metal-impl.h`: `ALL` (0), `RESIDENT` (1), and
