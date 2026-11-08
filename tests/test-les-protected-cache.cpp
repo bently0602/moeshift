@@ -62,6 +62,40 @@ static void test_capacity(int protected_slots) {
     assert(std::abs(cache.frequency[0] - 4) < 0.0001f && cache.steps == 160);
 }
 
+// A multi-row decode step pins up to rows * 10 experts; every one must get a slot.
+static void test_multi_row(int rows) {
+    les_protected_cache cache;
+    cache.configure(20, 44, 512);
+    std::vector<int32_t> ids(44, -1), slots(512, -1);
+    std::vector<uint64_t> ages(44, 0);
+    std::mt19937 random(7);
+    uint64_t age = 0;
+    for (int step = 0; step < 2000; ++step) {
+        std::set<int> used;
+        const size_t want = 10 + random() % (10 * rows - 9);
+        while (used.size() < want) used.insert(random() % 160);
+        std::vector<uint8_t> requested(512, 0);
+        for (int expert : used) requested[expert] = 1;
+        cache.begin_step(requested);
+        for (int expert : used) {
+            int slot = slots[expert];
+            if (slot >= 0) {
+                cache.hit(slot, ids, ages, requested, {});
+            } else {
+                slot = cache.miss(ids, ages, requested, {});
+                assert(slot >= 0);
+                assert(ids[slot] < 0 || !requested[ids[slot]]);
+                if (ids[slot] >= 0) slots[ids[slot]] = -1;
+                ids[slot] = expert;
+                slots[expert] = slot;
+            }
+            ages[slot] = ++age;
+        }
+        for (int expert : used) assert(slots[expert] >= 0 && ids[slots[expert]] == expert);
+        assert(cache.count(1) <= 20 && cache.count(2) <= 24);
+    }
+}
+
 static void test_demand_lrfu() {
     les_protected_cache cache;
     cache.configure(2, 4, 6);
@@ -74,7 +108,9 @@ static void test_demand_lrfu() {
     assert((scores == std::vector<float>{1, 0, 1, 0, 1, 0}));
     cache.hit(0, ids, ages, requested, {}); // Recent hit.
     cache.hit(2, ids, ages, requested, {}); // Protected hit.
-    assert(cache.miss(ids, ages, requested, {}) == -1); // Both recent slots are pinned.
+    // Both recent slots are pinned, as only a multi-row step can do: the coldest protected
+    // slot (expert 1, older than expert 3 at equal frequency) is used and stays protected.
+    assert(cache.miss(ids, ages, requested, {}) == 1 && cache.group[1] == 2);
     assert(cache.frequency == scores); // Count the entire router set once, before allocation.
     for (int i = 0; i < 200; ++i) {
         const int prefetched = cache.miss(ids, ages, {}, {});
@@ -119,5 +155,6 @@ int main() {
     }
     for (int slots : {1, 23, 32, 64}) test_capacity(slots);
     test_demand_lrfu();
-    std::cout << "Protected cache invariants passed at 1, 23, 32 and 64 slots; demand LRFU accounting and phase change passed\n";
+    for (int rows : {1, 2, 4}) test_multi_row(rows);
+    std::cout << "Protected cache invariants passed at 1, 23, 32 and 64 slots; demand LRFU accounting, phase change and 1-4 row steps passed\n";
 }

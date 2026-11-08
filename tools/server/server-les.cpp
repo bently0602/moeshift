@@ -11,6 +11,7 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -149,7 +150,22 @@ int main(int argc, char ** argv) {
     params.hostname = "127.0.0.1";
     setenv("LLAMA_MOE_F_NOCACHE", "0", 1);
 
-    params.speculative = {};
+    // A speculative check of n drafted tokens is one decode step of n + 1 rows. Wider steps would
+    // leave the decode phase, so drafts are capped to the decode rows the expert windows allow.
+    {
+        const char * rows_env = std::getenv("LLAMA_MOE_DECODE_ROWS");
+        const int rows = rows_env && *rows_env ? std::atoi(rows_env) : 1;
+        const bool speculative = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+                [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (speculative && rows < 2) {
+            std::cerr << "moeshift: speculative decoding needs LLAMA_MOE_DECODE_ROWS of 2 or more; disabled\n";
+            params.speculative = {};
+        } else if (speculative) {
+            params.speculative.draft.n_max = std::min(params.speculative.draft.n_max, rows - 1);
+            params.speculative.draft.n_min = std::min(params.speculative.draft.n_min, params.speculative.draft.n_max);
+            setenv("LLAMA_SPEC_DRAFT_CAP", std::to_string(rows - 1).c_str(), 1);
+        }
+    }
     if (params.moe_experts.empty() || params.les_decode_bank >= params.les_prefill_bank) {
         std::cerr << "moeshift: adaptive expert streaming requires MoE experts and decode bank < prefill bank\n";
         return 1;

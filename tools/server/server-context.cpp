@@ -333,6 +333,15 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        // set by the MoEShift worker: a longer check would not fit one decode step
+        static const int draft_cap = [] {
+            const char * cap = std::getenv("LLAMA_SPEC_DRAFT_CAP");
+            return cap && *cap ? std::atoi(cap) : 0;
+        }();
+        if (draft_cap > 0) {
+            n_draft_max = std::min(n_draft_max, draft_cap);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -964,9 +973,10 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
-            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-            //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq = 0;
+            // A recurrent draft model processes each check batch with the target, so after a partial
+            // acceptance it rolls back from snapshots like the target. Its own drafted tokens are
+            // single-token steps, which snapshots cannot undo; the drafting checkpoint does (below).
+            cparams.n_rs_seq = params_base.speculative.need_n_rs_seq();
             // a DFlash/DSpark draft ships no token embedding or lm head of its own and reads both
             // from the target model through this link
             cparams.ctx_other = ctx_tgt;
@@ -2641,7 +2651,9 @@ private:
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                // drafting decodes one token at a time, so a snapshot context also needs the checkpoint
+                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                          ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
 
                 const int n_draft_max = slot.get_n_draft_max();
 
@@ -2694,10 +2706,17 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            // n-gram drafts ignore n_max; keep every draft within the slot's limit
+            const int n_draft_max = slot.get_n_draft_max();
+            if ((int) draft.size() > n_draft_max) {
+                draft.resize(std::max(0, n_draft_max));
+            }
+
             slot.n_draft_total += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                      ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {

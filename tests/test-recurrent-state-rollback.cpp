@@ -115,6 +115,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // A single-token ubatch writes no snapshots, so it cannot be rolled back.
+    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, last_pos, -1)) {
+        fprintf(stderr, "%s : rollback after a single-token ubatch was accepted\n", __func__);
+        return 1;
+    }
+
     const float * logits_src = llama_get_logits_ith(ctx_src, 0);
     const float * logits_dst = llama_get_logits_ith(ctx_dst, 0);
     if (logits_src == nullptr || logits_dst == nullptr) {

@@ -501,10 +501,16 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         //       inside the same ubatch. currently with `split_equal()` this is not correct
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_new = conv_input->ne[0] - conv_states->ne[0];
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
+            // slot s holds the state before the last s tokens of this ubatch; a single token
+            // writes only slot 0 (see llama_memory_recurrent::rs_valid)
+            if (s_slot > (n_new > 1 ? n_new : 0)) {
+                continue;
+            }
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
@@ -546,7 +552,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    if (!keep) {
+    // A one-token step carries no draft and writes no snapshots; the memory then refuses to roll
+    // it back (llama_memory_recurrent::rs_valid), so it costs the same as without rollback.
+    if (!keep || n_seq_tokens == 1) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;

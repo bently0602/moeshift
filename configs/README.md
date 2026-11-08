@@ -79,6 +79,8 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `env.LLAMA_MOE_PROTECTED_SLOTS` | `24` additional protected slots; larger values use more RAM and can reduce SSD reads; `0` disables the protected tier |
 | `env.LLAMA_MOE_LOOKAHEAD_PREFETCH` | `1`; enable predictive expert reads |
 | `env.LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`, `env.LLAMA_MOE_PREFETCH_READ` | Predict `3` experts, read `2` |
+| `env.LLAMA_MOE_DECODE_ROWS` | `1` token per decode step; up to the narrowest window / 10 (`4` with the 44-slot source profile) lets batches of a few tokens, such as speculative checks, stay in the decode phase |
+| `args.spec-type`, `args.spec-draft-model`, `args.spec-draft-n-max`, `args.spec-draft-n-min`, `args.spec-draft-ngl` | Unset; speculative decoding needs `LLAMA_MOE_DECODE_ROWS` of 2 or more, and drafts are capped at rows − 1 tokens (see [speculative decoding](../docs/les/speculative-decoding.md)) |
 | `env.LLAMA_MOE_PREFILL_PIPELINE` | `1`; overlap prefill reads with computation |
 | `env.LLAMA_GPU_KEEPALIVE` | `1`; keep the GPU active while the worker exists; `0` disables it |
 | `env.LLAMA_MOE_QUIET` | `1`; suppress expert diagnostics; `0` enables them |

@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_valid.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -156,6 +157,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_valid.begin(), rs_valid.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -192,8 +194,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq &&
+                        (size_t) seq_id < rs_valid.size() && rollback <= (llama_pos) rs_valid[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    rs_valid[seq_id] = 0; // rs_idx is absolute, so a second rollback is not supported
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -477,6 +481,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    auto org_rs_valid = rs_valid;
 
     bool success = true;
 
@@ -491,6 +496,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_valid = std::move(org_rs_valid);
 
     return success;
 }
@@ -661,6 +667,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
             cell.seq_id.insert(seq_id);
             cells[seq_id].tail = cell_id;
+            if ((size_t) seq_id < rs_valid.size()) {
+                rs_valid[seq_id] = n_seq_tokens > 1 ? std::min(n_seq_tokens, n_rs_seq) : 0;
+            }
         }
     }
 
@@ -859,8 +868,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         if (seq_id == -1) {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(rs_valid.begin(), rs_valid.end(), 0);
         } else {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < rs_valid.size()) {
+                rs_valid[seq_id] = 0;
+            }
         }
     }
 }

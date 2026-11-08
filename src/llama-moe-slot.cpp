@@ -943,6 +943,7 @@ install_timing start_demand(
                 moe_log("decode-cache: %d 层绑定 decode 张量（每层 %d = cache %d + prefetch %d slot，pack %s）",
                         n_dec, (int) (decode_window + prefetch_slots), (int) decode_window,
                         (int) prefetch_slots, layers[0].dec_pack_ok ? "ok" : "off");
+                resolve_decode_rows();
             }
         }
         sweep_init();
@@ -1276,6 +1277,24 @@ install_timing start_demand(
     /// 为什么 prefill 用不了窗口：实测 prefill 一层要用 105~215 个专家（`unique/l`），
     /// 而窗口只有 bank/40 个 slot，根本装不下。所以 prefill 必须保持「整块 bank + 逐层清空」，
     /// decode 才切窗口 —— 两者是天然分离的阶段，在 `process()` 里按 `n_tokens == 1` 切换。
+    void resolve_decode_rows() {
+        const char * s = std::getenv("LLAMA_MOE_DECODE_ROWS");
+        const int want = s && *s ? std::atoi(s) : 1;
+        if (want < 1 || want > 16) {
+            throw std::invalid_argument("LLAMA_MOE_DECODE_ROWS must be 1-16");
+        }
+        int32_t width = INT32_MAX;
+        for (const auto & st : layers) {
+            if (st.enabled) width = std::min(width, st.window_width);
+        }
+        const int fit = std::max(1, (int) (width / (int32_t) model.hparams.n_expert_used));
+        window_max_rows = std::min(want, fit);
+        if (window_max_rows != 1 || want != 1) {
+            moe_log("decode-rows: %d (requested %d, narrowest window %d slots, %u experts per row)",
+                    (int) window_max_rows, want, (int) width, model.hparams.n_expert_used);
+        }
+    }
+
     void resolve_decode_window() {
         const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
         if (!s || !*s) {
@@ -2260,7 +2279,15 @@ install_timing start_demand(
     //
     // W = 0 表示关闭（退回原行为：所有层共享全部 slot、每层清空）。
     int32_t decode_window = 0;
-    static constexpr int32_t window_max_rows = 1;
+    // Rows one decode-window step may carry, for example a speculative check of drafted tokens.
+    // Set by LLAMA_MOE_DECODE_ROWS (default 1) and bounded by the narrowest window, because every
+    // expert of every row must be resident at once.
+    int32_t window_max_rows = 1;
+    // A batch of several tokens stays in the decode phase only when that phase is already active,
+    // so speculative checks keep the windows while the last tokens of a prompt still use prefill.
+    bool decode_rows(int32_t n_rows) const {
+        return n_rows == 1 || (n_rows <= window_max_rows && adaptive_decode);
+    }
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。
     ///
     /// 为什么单列一块：预读的条目是「下一步可能用到」，与「跨 token 复用」是两种
@@ -2574,6 +2601,10 @@ int llama_moe_slot_runtime::window_max_rows() const {
     return (int) pimpl->window_max_rows;
 }
 
+bool llama_moe_slot_runtime::decode_step(int n_rows) const {
+    return pimpl->decode_rows(n_rows);
+}
+
 void llama_moe_slot_runtime::park_expert_memory() {
     pimpl->park_expert_memory();
 }
@@ -2692,7 +2723,7 @@ void llama_moe_slot_runtime::process(
         ggml_tensor * slot_ids,
         const ggml_tensor * lookahead_pred) {
     // A layer owns its read job. The previous layer is synchronized by its GPU dependency.
-    if (expert_ids->ne[1] > pimpl->window_max_rows) pimpl->join_demand();
+    if (!pimpl->decode_rows((int32_t) expert_ids->ne[1])) pimpl->join_demand();
     pimpl->demand_next_layer = -1;
     pimpl->demand_next.clear();
     pimpl->ensure_unparked();
@@ -2722,7 +2753,7 @@ void llama_moe_slot_runtime::process(
     }
     const bool decode = n_rows == 1;
     // Per-layer windows are used only for single-token decoding.
-    const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
+    const bool window_mode = pimpl->decode_window > 0 && pimpl->decode_rows(n_rows);
     const bool lookahead_step = pimpl->lookahead.enabled && window_mode;
     // Prefill overwrites the same storage: finish all previous prefetch reads first.
     if (!window_mode && pimpl->was_window) pimpl->lookahead.drain();
@@ -2733,7 +2764,7 @@ void llama_moe_slot_runtime::process(
     // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
     // moe_decode_phase 同源。默认（非 auto）下这段不生效。
     if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
-        const bool want = n_rows > pimpl->window_max_rows;
+        const bool want = !pimpl->decode_rows(n_rows);
         if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
             pimpl->want_nocache.store(want, std::memory_order_relaxed);
             pimpl->apply_experts_nocache(want);
@@ -2748,6 +2779,12 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
+        // A multi-row step pins up to rows*n_used experts at once. Slots the prefetch worker
+        // still holds as pending would not be available, so wait for its job first; the lock
+        // is not held yet, so this cannot invert the lock order described above.
+        if (n_rows > 1) {
+            pimpl->lookahead.drain();
+        }
     }
 
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -2982,6 +3019,24 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && lookahead_pred) {
         std::vector<int32_t> pred;
         pimpl->read_i32_ids(lookahead_pred, pred);
+        if (n_rows > 1) {
+            // Rows are [depth] each; read them rank by rank and drop repeats, so the read limit
+            // covers every row's best guesses rather than only the first row's.
+            const size_t depth = pred.size() / (size_t) n_rows;
+            std::vector<int32_t> merged;
+            merged.reserve(pred.size());
+            std::vector<uint8_t> seen((size_t) pimpl->n_expert, 0);
+            for (size_t k = 0; k < depth; ++k) {
+                for (int32_t r = 0; r < n_rows; ++r) {
+                    const int32_t e = pred[(size_t) r * depth + k];
+                    if (e >= 0 && e < pimpl->n_expert && !seen[(size_t) e]) {
+                        seen[(size_t) e] = 1;
+                        merged.push_back(e);
+                    }
+                }
+            }
+            pred.swap(merged);
+        }
         // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
         // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
         {
@@ -3065,10 +3120,10 @@ void llama_moe_slot_runtime::process(
 
     if (layer == 0) {
         if (pimpl->cur.n_layers > 0) {
-            pimpl->flush_ubatch(pimpl->cur.n_tokens <= 1 ? "decode" : "prefill",
-                pimpl->cur.n_tokens <= 1 ? pimpl->n_decode_step : pimpl->n_prefill_ubatch);
+            pimpl->flush_ubatch(pimpl->cur.n_tokens <= pimpl->window_max_rows ? "decode" : "prefill",
+                pimpl->cur.n_tokens <= pimpl->window_max_rows ? pimpl->n_decode_step : pimpl->n_prefill_ubatch);
         }
-        if (n_tokens <= 1) {
+        if (window_mode) {
             pimpl->n_decode_step++;
             pimpl->miss_per_layer_steps++;   // 每 decode 步一次（不是每层）
         } else {
@@ -3086,11 +3141,11 @@ void llama_moe_slot_runtime::process(
     pimpl->cur.wall_ns += timing.wall_ns;
     pimpl->cur.pread_sum_ns += timing.pread_sum_ns;
     pimpl->cur.bytes += timing.bytes;
-    if (window_mode && n_tokens <= 1 && layer < (int) pimpl->miss_per_layer.size()) {
+    if (window_mode && layer < (int) pimpl->miss_per_layer.size()) {
         pimpl->miss_per_layer[(size_t) layer] += (uint64_t) n_miss;
     }
 
-    const uint64_t ubatch_idx = n_tokens <= 1 ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
+    const uint64_t ubatch_idx = window_mode ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
     const bool sample_layer = (layer == 0 || layer == 1 ||
         layer == pimpl->last_moe_layer / 2 || layer == pimpl->last_moe_layer);
     if (ubatch_idx <= 2 && sample_layer && (n_miss > 0 || layer == 0)) {
@@ -3106,8 +3161,8 @@ void llama_moe_slot_runtime::process(
     }
 
     if (layer == pimpl->last_moe_layer) {
-        const char * kind = n_tokens <= 1 ? "decode" : "prefill";
-        const uint64_t idx = n_tokens <= 1 ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
+        const char * kind = window_mode ? "decode" : "prefill";
+        const uint64_t idx = window_mode ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
         if (pimpl->should_log_ubatch(n_tokens, idx)) {
             pimpl->flush_ubatch(kind, idx);
         } else {

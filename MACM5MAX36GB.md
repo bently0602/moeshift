@@ -1081,6 +1081,138 @@ the long prompt 1.8% faster. Generation after them is 1.5% and 2.5% faster. The 
 not investigated further; less work for the memory compressor is a likely cause. Not tested:
 `config.json` (depth 3) in the A/B, though the traces used it, and prompts of other lengths.
 
+## Draft-model acceptance (N5 feasibility)
+
+Speculative decoding with a small draft model would let one pass of Flash Next, with its expert
+reads and per-layer round trips, produce several tokens. Qwen3.5-0.8B and Qwen3.5-2B (dense,
+Apache 2.0, unsloth Q8_0 GGUFs of 0.8 and 2.0 GB) use exactly Flash Next's tokenizer: the
+248,320 tokens and 247,587 merges in the GGUFs are identical. Draft models built for Flash
+Next (DFlash, DFlash2, an MTP head) need the target's hidden states and server support that
+llama.cpp does not have, so they were not tested.
+
+Method: six greedy Flash Next answers (`config-source.json`, thinking off, 400–512 tokens
+each) from `benchmarks/short.json`, `benchmarks/long.json`, and four new prompts: writing code,
+a technical explanation, a short story and editing code. A small tool linked against this
+build's `libllama` fed each prompt and answer to the draft model in one pass. At every answer
+position it compared the draft's top token with Flash Next's next token. The prompts
+tokenized to exactly the token counts Flash Next reported. With greedy checking, a draft is
+accepted up to its first mismatch, so these results give the accepted lengths exactly; one
+check also yields one token from Flash Next itself.
+
+| Sample | 0.8B agreement | Tokens per check, 3-token draft | 8-token draft | 2B agreement | Tokens per check, 3-token draft | 8-token draft |
+|---|---:|---:|---:|---:|---:|---:|
+| Story | 54.2% | 1.95 | 2.19 | 62.5% | 2.25 | 2.65 |
+| `short.json` | 59.2% | 2.19 | 2.42 | 61.1% | 2.21 | 2.55 |
+| Explanation | 70.2% | 2.44 | 3.03 | 76.0% | 2.74 | 3.60 |
+| `long.json` (summary) | 73.8% | 2.55 | 3.51 | 77.3% | 2.68 | 3.71 |
+| Writing code | 84.5% | 3.20 | 4.94 | 89.0% | 3.51 | 5.97 |
+| Editing code | 91.8% | 3.45 | 6.15 | 91.8% | 3.45 | 6.25 |
+| **All** | **71.8%** | **2.61** | **3.64** | **75.7%** | **2.77** | **4.04** |
+
+- Even free writing reaches about two tokens per check; prompt lookup (N2) would give almost
+  nothing there. Code editing does well with either.
+- The 2B model agrees about 4 points more often, at 2.5 times the drafting work and memory, so
+  the 0.8B model is the first choice.
+- The speedup depends on how much a check of 2–9 tokens costs compared with one token. That
+  cannot be measured yet: decode windows take one row (`window_max_rows = 1`), and any wider
+  batch switches the engine to the prefill phase. In earlier logs, 4-token batches used about
+  19.5 distinct experts per layer, against 10 for one token. Estimated speedup from that, not
+  measured: 1.5–1.9 times with 3-token drafts.
+
+The tool, references and results are in `/Volumes/Data/moeshift-scratch/n5`; the models are in
+`/Volumes/Data/models/n5`.
+
+## Speculative decoding (phases A and B)
+
+The server already implements speculative decoding, with draft models, n-gram drafting and
+recurrent-state rollback for Flash Next's architecture. The worker disabled it. Phases A and B
+(uncommitted) make it work under LES; see
+[speculative decoding](docs/les/speculative-decoding.md):
+
+- **Phase A:** decode steps of several tokens (`LLAMA_MOE_DECODE_ROWS`, default 1, at most 4
+  with the 44-slot windows), including the protected-cache fallback and the multi-row
+  resident/missing split.
+- **Phase B:** the worker keeps `--spec-*` options, with drafts capped at rows − 1 tokens.
+  Multi-row batches stay in decode only while decode is active, so prompt tails keep the prefill
+  path. Rollback snapshots are written only by multi-token ubatches.
+
+Validation (`config-source.json` plus `LLAMA_MOE_DECODE_ROWS: 4`, against non-speculative
+greedy references from the same build family):
+
+| Request | Reference | Default (1 row), no speculation | 4 rows, `spec-type: ngram-simple` | Accepted drafts |
+|---|---:|---:|---:|---:|
+| `short.json` | 24.37 tok/s | 24.24 tok/s | 23.99 tok/s | none made |
+| Writing code | 22.61 tok/s | — | 22.60 tok/s | none made |
+| Editing code | 20.00 tok/s | — | **21.70 tok/s** | 47 of 48 |
+| `long.json` | 21.18 tok/s | 21.09 tok/s | 20.55 tok/s | none made |
+
+- Every response, with and without speculation and with 1 or 4 rows, matched the reference
+  exactly, including the editing run, which rolled back one rejected draft. The multi-row
+  expert kernels run one mat-vec per row and expert, like single-token decode.
+- With 1 row, output, speed and peak memory (9,445 MB) are unchanged. With speculation, the peak
+  was about 10 GB: snapshot rows widen the recurrent state.
+- Writing all four rollback snapshots on every step, as the code did first, made generation
+  about 15% slower (20.5 against 24.2 tok/s). Writing two cost 11%. Single tokens now write
+  none; a temporary build with rollback disabled showed the same speed as the reference.
+- n-gram drafting (`size_n` 12) proposed drafts only on the editing prompt: 16 checks in 400
+  tokens. The long-prompt request was 3% slower, possibly from the n-gram search over the 6k
+  context at every step. Not investigated.
+
+**Cost of a check.** Per-step GPU and CPU timings (`LES_BLOCK_DIAG`-style counters, temporary)
+during the editing request:
+
+| Step | Steps | Time per step |
+|---|---:|---:|
+| 1 token | 336 | 46.7–47.0 ms |
+| 4 tokens (3 drafted) | 17 | 113.7–115.9 ms |
+
+A 4-token check costs about 2.45 single steps. Its rows used about 22 distinct experts per layer
+and missed about 14 per layer, roughly four times a single token's misses. Drafted tokens need
+experts that are no more likely to be cached than the next tokens of ordinary decode, so batching
+saves the fixed per-step work but not the reads. Waiting for the prefetch worker before a check
+was not the cause (113.7 ms without the wait). With a 3-token draft, a check pays off only above
+about 2.45 accepted tokens per check: the editing prompt (3.9) clears it, while the draft-model
+average measured in N5 (2.6) barely does, before the cost of drafting.
+
+## Draft-model speculation (phase D, parked)
+
+`spec-type: draft-simple` with Qwen3.5-0.8B Q8_0 (all layers on the GPU), 3-token drafts and
+`LLAMA_MOE_DECODE_ROWS: 4`, on the six N5 prompts. One run each:
+
+| Prompt | Reference | With the draft model | Drafted tokens accepted |
+|---|---:|---:|---:|
+| `short.json` | 24.37 tok/s | 9.57 tok/s | 279 of 696 (40%) |
+| `long.json` | 21.18 tok/s | 10.11 tok/s | 292 of 654 (45%) |
+| Explanation | 23.27 tok/s | 16.82 tok/s | 238 of 480 (50%) |
+| Story | 25.67 tok/s | 13.85 tok/s | 193 of 612 (32%) |
+| Writing code | 22.61 tok/s | 21.48 tok/s | 276 of 369 (75%) |
+| Editing code | 20.00 tok/s | 20.16 tok/s | 283 of 345 (82%) |
+
+- **Slower everywhere except editing, which broke even.** Acceptance matched the N5
+  prediction: 40% of drafted tokens on `short.json` is 1.15 per check, as expected from 59%
+  per-position agreement. But a check cycle took about 230 ms on `short.json` (53.5 s over 232
+  checks), of which drafting was 12.6 ms. A check of the target cost about 218 ms here,
+  against 115 ms for the mostly accepted n-gram checks. Every drafted row reads its own experts,
+  and rejected rows read experts and take cache slots for tokens that are thrown away.
+- **Output differed** on five of six prompts, at near-ties ("that kitchen" against "the
+  kitchen", "Key Characteristics" against "Advantages"). The text stayed coherent. Hundreds of
+  4-row checks evaluate positions with multi-row kernels, whose rounding differs slightly from
+  single-token decode; the n-gram runs made only 16 checks. Not separately verified.
+- **Prompts were slower** (`long.json` 8.30 s against 7.39 s), because the draft model also
+  processes the prompt. Peak memory was 11 GB; the server estimated 7.4 GB for the draft
+  context at the full context size and prefill batch, which was not reduced.
+- **Bug found and fixed:** with snapshot rollback on the target, the server also removed rejected
+  tokens from the draft context with a partial `seq_rm`, but created the draft context without
+  snapshots. A recurrent draft model such as Qwen3.5 then aborted on the first rejection
+  (`failed to remove sequence 0`). The draft context now gets snapshots too, and keeps the
+  drafting checkpoint for its own single-token draft steps.
+
+On this machine, speculative decoding is limited by expert streaming, not by drafting. A drafted
+token costs nearly as much SSD reading as a generated one, and a rejected token costs as much for
+nothing. This matches the report that MTP drafting was slower on a 32 GB Mac that streams
+experts (N4). n-gram drafting (N2) helps only on text that repeats its context, such as code
+edits, where almost every draft is accepted.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the

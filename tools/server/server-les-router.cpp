@@ -115,7 +115,7 @@ struct les_worker {
                 }
             } else {
                 args.push_back("--" + item.key());
-                args.push_back(item.key() == "model" || item.key() == "moe-experts"
+                args.push_back(item.key() == "model" || item.key() == "moe-experts" || item.key() == "spec-draft-model"
                         ? resolve_path(base, item.value()) : scalar(item.value()));
             }
         }
@@ -215,7 +215,7 @@ void validate_config(const json & config, const std::filesystem::path & base, st
     const auto & models = config.at("models");
     require(models.is_object() && !models.empty(), "models must be a nonempty object");
     const std::set<std::string> allowed_env{
-        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
+        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_ROWS", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
         "LLAMA_MOE_PREFETCH_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH",
         "LLAMA_MOE_PREFILL_PIPELINE", "LLAMA_MOE_PROTECTED_SLOTS", "LLAMA_MOE_QUIET"};
     for (const auto & entry : models.items()) {
@@ -227,6 +227,7 @@ void validate_config(const json & config, const std::filesystem::path & base, st
         check_keys(env, allowed_env);
         resolve_path(base, args.at("model"));
         resolve_path(base, args.at("moe-experts"));
+        if (args.contains("spec-draft-model")) resolve_path(base, args.at("spec-draft-model"));
         require(args.at("alias").is_string(), "alias must be a string");
         const auto alias = scalar(args.at("alias"));
         require(alias == entry.key(), "alias must match its models key: " + entry.key());
