@@ -18,6 +18,9 @@ public:
     int  decode_window() const;
     // Shared phase boundary for graph construction and expert installation.
     int window_max_rows() const;
+    // Whether a batch of n_rows tokens runs in the decode phase; the context, the graph and the
+    // expert runtime must all use this one decision.
+    bool decode_step(int n_rows) const;
     // 0 = off (no next-layer predict / prefetch). 1..16 = predicted experts per layer.
     // Safe between llama_decode calls; in-flight prefetch is drained first.
     void set_lookahead_prefetch_depth(int depth);

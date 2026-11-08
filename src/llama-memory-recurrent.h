@@ -76,6 +76,10 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // per-seq number of tokens the last ubatch's snapshots can roll back: min(n_rs_seq, tokens) for
+    // a multi-token ubatch, 0 for a single token, which writes no snapshots
+    std::vector<uint32_t> rs_valid;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build

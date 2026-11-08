@@ -1646,7 +1646,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
 
-    if (llm_arch_supports_les(arch) && moe_decode_phase && n_tokens == 1 &&
+    if (llm_arch_supports_les(arch) && moe_decode_phase &&
         moe_slots && !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && loras->empty()) {

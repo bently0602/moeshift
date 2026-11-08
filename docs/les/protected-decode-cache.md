@@ -36,6 +36,11 @@ moving expert weights or tensor addresses.
   retained if its score is at least as high; otherwise the recent slot is reused.
 - Protected score ties use age. Victim selection excludes requested experts and
   pending reads, and prefers avoiding predicted experts.
+- A decode step of several tokens (`LLAMA_MOE_DECODE_ROWS` above 1) can pin
+  every recent slot. Its remaining misses then take a free slot, or else the
+  lowest-scoring eligible protected slot, into the protected group. Before such a
+  step the runtime waits for the layer's pending prefetch reads, so all of the
+  window is available.
 
 Prefetch uses the same slot policy but has no current target-layer request set.
 Pending reads pin their slots until publication. Phase changes synchronize

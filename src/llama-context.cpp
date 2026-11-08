@@ -1428,7 +1428,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool quiet = !moe_quiet || std::strcmp(moe_quiet, "1") == 0;
     if (moe_slots) {
         moe_slots->ensure_unparked();
-        const bool decode = ubatch.n_tokens <= uint32_t(moe_slots->window_max_rows());
+        const bool decode = moe_slots->decode_step((int) ubatch.n_tokens);
         if (moe_slots->adaptive_phase_change(decode)) {
             ggml_backend_sched_synchronize(sched.get());
             ggml_backend_sched_reset(sched.get());
@@ -1439,7 +1439,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             fprintf(stderr, "moeshift: adaptive-batch: tokens=%u cap=%u\n", ubatch.n_tokens, cparams.n_ubatch);
     }
     if (llm_arch_supports_les(model.arch) &&
-        moe_slots && ubatch.n_tokens <= uint32_t(moe_slots->window_max_rows())) {
+        moe_slots && moe_slots->decode_step((int) ubatch.n_tokens)) {
         size_t reserved = 0;
         for (auto * backend : backend_ptrs) reserved += ggml_backend_sched_get_buffer_size(sched.get(), backend);
         if (reserved > 512ULL*1024*1024) {
@@ -2604,9 +2604,9 @@ llm_graph_params llama_context::graph_params(
         // 往哪段槽位写、以及建图用哪套张量（每层 `.dec` 视图 vs prefill 共享视图）。
         // 两处不一致 → 张量所指的槽段与实际写入的槽段错位 → 静默读错专家权重。
         // n_tokens 本身不足以判断（单 token 的 prefill 与 decode 都是 1），
-        // 所以用运行期解析出来的同一个 window_max_rows。
+        // 所以用运行期的同一个判据 decode_step()（多行批只在已处于 decode 阶段时算 decode）。
         /*.moe_decode_phase =*/ moe_slots != nullptr && moe_slots->decode_window() > 0 &&
-                                ubatch.n_tokens <= moe_slots->window_max_rows(),
+                                moe_slots->decode_step((int) ubatch.n_tokens),
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,

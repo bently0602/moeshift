@@ -1081,6 +1081,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
 
     for (uint32_t back = 0; back <= cparams.n_rs_seq; ++back) {
+        // snapshots cover the tokens of a multi-token ubatch; a single token writes only slot 0
+        // (see llama_memory_recurrent::rs_valid)
+        if (int64_t(back) > (x->ne[1] > 1 ? x->ne[1] : 0)) {
+            break;
+        }
         const int64_t end = std::max<int64_t>(0, x->ne[1] - int64_t(back));
         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,

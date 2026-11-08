@@ -94,7 +94,12 @@ struct les_protected_cache {
         for (size_t i = 0; i < group.size(); ++i) if (ids[i] == -1) { free = int(i); break; }
         if (count(1) < recent_limit && free >= 0) { group[free] = 1; return free; }
         const int old = victim(1, ids, ages, requested, predicted);
-        if (old < 0) return -1;
+        // Only a multi-row step can pin every recent slot; it takes a free slot, or else the
+        // coldest protected one, into the protected group.
+        if (old < 0) {
+            if (free >= 0) { group[free] = 2; return free; }
+            return victim(2, ids, ages, requested, predicted);
+        }
         if (free >= 0) {
             group[old] = 2; group[free] = 1; ++admissions;
             return free;
