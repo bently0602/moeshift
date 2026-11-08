@@ -1382,6 +1382,9 @@ of the version that also covered prompt batches measured +2.0% and +1.1%. Every 
 and so did the four n-gram speculation requests; the peak with speculation was about 10 GB, as
 before.
 
+A later probe found that C1b could read a clobbered row index when the graph allocator reuses the
+index's memory; it is fixed with an address check (see the N6a section).
+
 A note on C1a's grouping: `ggml_graph_optimize` records only a group's last node as written, so for
 the delta net plus its state copy, the kernel's own output is not recorded. Its consumers stay
 after it only because they read it through a separate view node, whose range blocks the reorder.
@@ -1419,6 +1422,97 @@ was 9,446 MB for both.
 
 That is about 0.3 ms per token for 192 fewer kernels, about 1.5 µs each: less than estimated. C1a
 and C1c gained more per kernel because they also removed copies of megabytes.
+
+For prompt batches, P4 now declines when the allocator gave its output the probabilities' memory
+(see the N6a section); one-token steps are unaffected.
+
+## Later expert guesses (N6a probe)
+
+Decode prefetch guesses layer L+1's experts by running L+1's router on layer L's FFN input (top 8),
+about one layer ahead. The N3 probe found 86% of the remaining misses were never guessed. N6a asked
+whether a later, closer signal guesses better. A temporary probe
+(`/Volumes/Data/moeshift-scratch/n6a/probe.patch`, reverted) computed, at the end of layer L,
+guesses for L+1 from:
+
+- **V1:** L+1's own FFN mix (`build_hc_mix` with L+1's weights) of the residual after layer L, that
+  is L+1's router input without L+1's attention output.
+- **V2:** L+1's attention input.
+- **V3:** V1 without the gate: L+1's norm and the stream mean only, no projections.
+- **V4:** V3 gated with layer L's FFN mix gate.
+
+For every expert each layer used (46 layers per step, 10 experts per token, config as in
+`config-source.json`), it recorded whether each guess named it and whether it was a miss:
+
+| Guess for layer L+1 | Covers used, short prompts | Covers used, long prompt | Misses the shipped guess missed, long |
+|---|---:|---:|---:|
+| Shipped: L+1's router on L's FFN input, top 8 | 57.8% | 55.0% | — |
+| V1, top 8 | 72.0% | 69.3% | 43% |
+| **V1, top 16** | **93.6%** | **90.8%** | **81%** |
+| V2, top 8 / 16 | 54.2% / 75.7% | — | — |
+| V3, top 8 | 64.8% | 61.3% | 34% |
+| V3, top 16 | 85.9% | 81.9% | 65% |
+| V4, top 8 / 16 | 63.3% / 84.1% | 60.1% / 80.3% | 20% / 58% |
+
+Misses per layer were 2.0 after short prompts and 2.36 after the long one. The residual after
+layer L predicts L+1's experts much better than L's FFN input does, once L+1's own mix is applied:
+V1 with 16 guesses names 91–94% of the experts used. V2 (L+1's attention input) is worse than the
+shipped guess.
+
+What it would take, not built:
+
+- **Timing.** The late guess exists only after layer L's FFN, about one attention block before
+  L+1's expert step, roughly half the shipped guess's lead. Missing-expert reads take about
+  0.36 ms per layer (G5 section), so a late read would hide part of each read, not all of it.
+- **Delivery.** The CPU sees GPU results only at each layer's expert split. Another split per
+  layer would cost about 220 µs of idle GPU (G5), more than the gain. It would need a GPU-signalled
+  `MTLSharedEvent` inside the command buffer and a spinning CPU thread (about 27 µs in the G5
+  probe) to start the reads.
+- **Cost.** V1 runs another hyper-connection mix per layer: two bf16 projections, about 12.5 MB of
+  weights, roughly 600 MB more read per token (about 1.6 ms at the B1 bandwidth). V3 needs only a
+  norm, a stream mean and the router (2.6 MB), about 0.5–1 ms per token in small kernels
+  (estimate).
+- **Reads.** 16 guesses means more reads of experts that are not used; R2b found that extra reads
+  compete with demand reads.
+
+**The probe exposed a C1b bug (fixed, uncommitted).** One probe variant changed the short-prompt
+answer, deterministically. It was not F1: F1 switched off everywhere gave the reference answer,
+and so did the probe graph with graph reordering or kernel merging off. Switching the merges off
+one at a time pointed at C1b, and only at layer 46.
+
+- C1b's kernel reads the row index (an input copy managed by the graph allocator) after the
+  skipped `get_rows`, which the graph lists as the index's last reader. `ggml-alloc` may then
+  give the index's memory to a later tensor. In the probe graph, layer 46's convolution output
+  got it, so the kernel read a convolution value as the row number and used the wrong state.
+- The shipped graph happened not to reuse that memory (counted: 0 of 420,000 checks in short and
+  long requests), so outputs so far were right, but any change in tensor sizes or graph shape
+  could trigger it.
+- The fix compares real addresses: C1b declines if any node from the `get_rows` through the
+  kernel was given memory that overlaps the index. With it, the probe graph gives the reference
+  answer.
+
+The same class of hazard (a merged kernel reading an input after its last listed reader, or
+writing a later node's output early) was checked in the other merges (`ggml_metal_op_overlap`):
+
+- **P4:** the `div` output may be given the probabilities' memory (it was, in a `ggml_gallocr`
+  test). One row is safe, since its threadgroup reads everything before writing. With several
+  rows another threadgroup may still be reading, so P4 now declines there on overlap.
+- **F1:** in the final head mix (`result_norm`), the output was given the start of `xn` in about
+  0.5% of mixes. For one token that is safe (each thread reads its own element there before
+  writing it), so it is allowed; any other overlap declines.
+- **Hyper-connection combine (REPEAT + MUL + ADD):** declines if the output overlaps `x` or `w`;
+  no overlaps were counted.
+- Upstream merges (add chains, norm chains) were not changed.
+
+`tests/test-metal-hc-fusion` now allocates two cases with `ggml_gallocr`: a computed row index
+whose memory goes to the next tensor (it fails without the fix), and the routing chain with the
+probabilities' memory reused.
+
+Interleaved A/B of the fix against commit `81d0038`, same setup as above: 26.34 and 26.33 tok/s
+after a short prompt, 23.24 and 23.26 tok/s after the long one, 7.45 s for the long prompt in
+both. Every response matched, the four n-gram speculation requests matched their references, and
+peak memory was 9,446 MB (about 10 GB with speculation). This machine ran about 3% faster than
+during the P4 measurements.
+
 
 ## Tool calling
 

@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <chrono>
@@ -198,10 +199,13 @@ static int check_gdn_state_rows(ggml_backend_t backend) {
 
 // MoE routing after the softmax: argsort, the top 10 probabilities, their sum, clamp and division
 // run as one kernel. Exposing the sum keeps the separate kernels. Ids and weights must match bit for
-// bit, including rows with tied probabilities.
+// bit, including rows with tied probabilities. With ggml_gallocr, the DIV's output may be given the
+// probabilities' memory, which the kernel still reads.
 static int check_routing_topk_norm(ggml_backend_t backend) {
     const int n_expert = 512, k = 10;
     for (int nt : {1, 4, 2048}) {
+    for (bool gallocr : {false, true}) {
+        bool reused = false;
         std::vector<int32_t> ids[2];
         std::vector<float> weights[2];
         for (int separate = 0; separate < 2; ++separate) {
@@ -216,11 +220,23 @@ static int check_routing_topk_norm(ggml_backend_t backend) {
                 ggml_set_output(sum);
             }
             auto norm = ggml_div(ctx, w, ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY));
+            ggml_set_input(logits);
+            ggml_set_output(norm);
             auto graph = ggml_new_graph(ctx);
             ggml_build_forward_expand(graph, norm);
-            ggml_build_forward_expand(graph, ggml_cont(ctx, selected));
-            auto out_ids = ggml_graph_node(graph, -1);
-            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            auto out_ids = ggml_cont(ctx, selected);
+            ggml_set_output(out_ids);
+            ggml_build_forward_expand(graph, out_ids);
+            ggml_backend_buffer_t buffer = nullptr;
+            ggml_gallocr_t galloc = nullptr;
+            if (gallocr) {
+                galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+                if (!ggml_gallocr_alloc_graph(galloc, graph)) { return 2; }
+                const char * p0 = (const char *) probs->data, * n0 = (const char *) norm->data;
+                reused = reused || (n0 < p0 + ggml_nbytes(probs) && p0 < n0 + ggml_nbytes(norm));
+            } else {
+                buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            }
             uint32_t seed = 5;
             std::vector<float> data(ggml_nelements(logits));
             for (size_t i = 0; i < data.size(); ++i) {
@@ -234,15 +250,95 @@ static int check_routing_topk_norm(ggml_backend_t backend) {
             weights[separate].resize(ggml_nelements(norm));
             ggml_backend_tensor_get(out_ids, ids[separate].data(), 0, ggml_nbytes(out_ids));
             ggml_backend_tensor_get(norm, weights[separate].data(), 0, ggml_nbytes(norm));
-            ggml_backend_buffer_free(buffer);
+            if (galloc) {
+                ggml_gallocr_free(galloc);
+            } else {
+                ggml_backend_buffer_free(buffer);
+            }
             ggml_free(ctx);
         }
         if (ids[0] != ids[1] || std::memcmp(weights[0].data(), weights[1].data(), weights[0].size()*sizeof(float)) != 0) {
-            std::fprintf(stderr, "FAIL routing top-k tokens=%d: %s differ from the separate kernels\n", nt, ids[0] != ids[1] ? "ids" : "weights");
+            std::fprintf(stderr, "FAIL routing top-k tokens=%d%s: %s differ from the separate kernels\n", nt,
+                    gallocr ? " (gallocr)" : "", ids[0] != ids[1] ? "ids" : "weights");
             return 3;
         }
-        std::printf("PASS exact routing top-k tokens=%d\n", nt);
+        std::printf("PASS exact routing top-k tokens=%d%s\n", nt, gallocr ? (reused ? " (gallocr, memory reused)" : " (gallocr)") : "");
     }
+    }
+    return 0;
+}
+
+// As above, but allocated the way real graphs are (ggml_gallocr), with a computed row index whose
+// last listed reader is the GET_ROWS. The allocator then gives its memory to the next tensor of the
+// same size, here a copy holding 1, which the kernel would read as the index (row 1 instead of 0).
+// The merged path must notice and still match the separate gather.
+static int check_gdn_state_rows_reuse(ggml_backend_t backend) {
+    const int S = 128, H = 48, H_k = 16;
+    auto ctx_cache = ggml_init({ggml_tensor_overhead()*2, nullptr, true});
+    auto cache = ggml_new_tensor_2d(ctx_cache, GGML_TYPE_F32, S*S*H, 2);
+    auto buffer_cache = ggml_backend_alloc_ctx_tensors(ctx_cache, backend);
+    std::vector<float> results[2][2];
+    bool reused = false;
+    for (int separate = 0; separate < 2; ++separate) {
+        auto ctx = ggml_init({4*1024*1024, nullptr, true});
+        auto q0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+        auto k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+        auto v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        auto g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto ids_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+        for (auto * t : {q0, k, v, g, b, ids_in}) {
+            ggml_set_input(t);
+        }
+        auto ids = ggml_cont(ctx, ggml_view_1d(ctx, ids_in, 1, sizeof(int32_t)));
+        auto gathered = ggml_get_rows(ctx, cache, ids);
+        if (separate) {
+            ggml_set_output(gathered);
+        }
+        auto graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, gathered);
+        auto other = ggml_cont(ctx, ggml_view_1d(ctx, ids_in, 1, 0));
+        ggml_set_output(other);
+        ggml_build_forward_expand(graph, other);
+        auto q = ggml_l2_norm(ctx, q0, 1e-6f);
+        auto s0 = ggml_reshape_3d(ctx, ggml_reshape_4d(ctx, gathered, S, S, H, 1), S*S*H, 1, 1);
+        auto result = ggml_gated_delta_net(ctx, q, k, v, g, b, s0);
+        auto output = ggml_view_4d(ctx, result, S, H, 1, 1, ggml_row_size(GGML_TYPE_F32, S),
+            ggml_row_size(GGML_TYPE_F32, S*H), ggml_row_size(GGML_TYPE_F32, S*H), 0);
+        auto state = ggml_view_4d(ctx, result, S, S, H, 1, ggml_row_size(GGML_TYPE_F32, S),
+            ggml_row_size(GGML_TYPE_F32, S*S), ggml_row_size(GGML_TYPE_F32, S*S*H), ggml_row_size(GGML_TYPE_F32, S*H));
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, state, ggml_view_2d(ctx, cache, S*S*H, 1, cache->nb[1], cache->nb[1])));
+        auto out = ggml_scale(ctx, output, 1.0f);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        auto galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) { return 2; }
+        reused = reused || (other->data == ids->data);
+        uint32_t seed = 31;
+        for (auto * t : {q0, k, v, g, b, cache}) {
+            std::vector<float> data(ggml_nelements(t));
+            for (auto & x : data) { x = 0.25f*sample(seed); }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+        const int32_t rows[2] = {1, 0};
+        ggml_backend_tensor_set(ids_in, rows, 0, sizeof(rows));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) { return 2; }
+        results[separate][0].resize(ggml_nelements(cache));
+        results[separate][1].resize(ggml_nelements(out));
+        ggml_backend_tensor_get(cache, results[separate][0].data(), 0, ggml_nbytes(cache));
+        ggml_backend_tensor_get(out, results[separate][1].data(), 0, ggml_nbytes(out));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+    }
+    ggml_backend_buffer_free(buffer_cache);
+    ggml_free(ctx_cache);
+    for (int r = 0; r < 2; ++r) {
+        if (std::memcmp(results[0][r].data(), results[1][r].data(), results[0][r].size()*sizeof(float)) != 0) {
+            std::fprintf(stderr, "FAIL gated delta net with a reused index: %s differs from the separate gather\n", r ? "output" : "state");
+            return 3;
+        }
+    }
+    std::printf("PASS exact gated delta net state with the index memory %s\n", reused ? "reused" : "not reused (test inconclusive)");
     return 0;
 }
 
@@ -260,6 +356,9 @@ int main() {
         return rc;
     }
     if (const int rc = check_gdn_state_rows(backend)) {
+        return rc;
+    }
+    if (const int rc = check_gdn_state_rows_reuse(backend)) {
         return rc;
     }
     if (const int rc = check_routing_topk_norm(backend)) {
