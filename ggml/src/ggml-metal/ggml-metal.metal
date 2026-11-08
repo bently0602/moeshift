@@ -2642,6 +2642,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * dst_s, // new state without snapshots (K == 1): after the attention output, or the cache
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2754,7 +2755,7 @@ kernel void kernel_gated_delta_net_impl(
     }
 
     if (K == 1) {
-        device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
+        device float * dst_state = (device float *) (dst_s) + state_out_base;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];

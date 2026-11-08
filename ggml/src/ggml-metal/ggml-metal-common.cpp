@@ -382,14 +382,69 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     std::vector<node_info> nodes;
     nodes.reserve(gf->n_nodes);
 
+    // nodes already packed with an earlier node
+    std::vector<bool> taken(n, false);
+
     // fuse nodes:
     // we don't want to make reorders that break fusing, so we first pack all fusable tensors
     //   and perform the reorder over the fused nodes. after the reorder is done, we unfuse
     for (int i = 0; i < n; i++) {
+        if (taken[i]) {
+            continue;
+        }
+
         node_info node = {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
         };
+
+        // keep a one-token gated delta net next to the copy of its new state into the cache, so the
+        // kernel can write the state there directly (ggml_metal_op_gated_delta_net)
+        if (node.op() == GGML_OP_GATED_DELTA_NET && i + 1 < n &&
+                gf->nodes[i + 1]->op == GGML_OP_VIEW && gf->nodes[i + 1]->view_src == gf->nodes[i]) {
+            ggml_tensor * view = gf->nodes[i + 1];
+            for (int j = i + 2; j < n && j < i + MAX_FUSE; j++) {
+                ggml_tensor * cpy = gf->nodes[j];
+                if (cpy->op != GGML_OP_CPY || cpy->src[0] != view) {
+                    continue;
+                }
+                // moving the copy before the nodes in between must not reorder any access to it or to its destination
+                const ggml_tensor * dst_base = cpy->src[1]->view_src ? cpy->src[1]->view_src : cpy->src[1];
+                bool clear = !taken[j];
+                int dst_view = -1; // the copy's destination view, when it is a node in between, moves with it
+                for (int k = i + 2; clear && k < j; k++) {
+                    const ggml_tensor * t = gf->nodes[k];
+                    if (t == cpy->src[1] && t->op == GGML_OP_VIEW && !taken[k]) {
+                        dst_view = k;
+                        continue;
+                    }
+                    if (t == cpy->src[1] || t == dst_base || (t->view_src && t->view_src == dst_base)) {
+                        clear = false;
+                    }
+                    for (int s = 0; clear && s < GGML_MAX_SRC && t->src[s]; s++) {
+                        const ggml_tensor * u = t->src[s];
+                        if (u == cpy || u == view || u == cpy->src[1] || u == dst_base || u->view_src == dst_base) {
+                            clear = false;
+                        }
+                    }
+                }
+                if (clear) {
+                    node.add_fused(view);
+                    taken[i + 1] = true;
+                    if (dst_view >= 0) {
+                        node.add_fused(gf->nodes[dst_view]);
+                        taken[dst_view] = true;
+                    }
+                    node.add_fused(cpy);
+                    taken[j] = true;
+                }
+                break;
+            }
+            if (taken[i + 1]) {
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
 
         // fuse only ops that start with these operations
         // can be expanded when needed

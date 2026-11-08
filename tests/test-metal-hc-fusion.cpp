@@ -77,6 +77,66 @@ static int check_hc_mix_tail(ggml_backend_t backend) {
     return 0;
 }
 
+// A one-token gated delta net and the copy of its new state into a cache row, as in
+// build_recurrent_attn. Exposing the state view as an output keeps Metal from writing the state
+// straight into the cache, which gives the separate copy's result.
+static int check_gdn_state_copy(ggml_backend_t backend) {
+    const int S = 128, H = 48, H_k = 16;
+    std::vector<float> results[2][2];
+    for (int separate = 0; separate < 2; ++separate) {
+        auto ctx = ggml_init({4*1024*1024, nullptr, true});
+        auto q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+        auto k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, 1, 1);
+        auto v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        auto g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto s0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S*S*H, 1, 1);
+        auto cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H, 2);
+        auto result = ggml_gated_delta_net(ctx, q, k, v, g, b, s0);
+        auto output = ggml_view_4d(ctx, result, S, H, 1, 1, ggml_row_size(GGML_TYPE_F32, S),
+            ggml_row_size(GGML_TYPE_F32, S*H), ggml_row_size(GGML_TYPE_F32, S*H), 0);
+        auto state = ggml_view_4d(ctx, result, S, S, H, 1, ggml_row_size(GGML_TYPE_F32, S),
+            ggml_row_size(GGML_TYPE_F32, S*S), ggml_row_size(GGML_TYPE_F32, S*S*H), ggml_row_size(GGML_TYPE_F32, S*H));
+        if (separate) {
+            ggml_set_output(state);
+        }
+        auto graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, state, ggml_view_2d(ctx, cache, S*S*H, 1, cache->nb[1], cache->nb[1])));
+        auto out = ggml_scale(ctx, output, 1.0f);
+        ggml_build_forward_expand(graph, out);
+        auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        uint32_t seed = 11;
+        for (auto * t : {q, k, v, g, b, s0}) {
+            std::vector<float> data(ggml_nelements(t));
+            for (auto & x : data) { x = 0.25f*sample(seed); }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+        std::vector<float> zero(ggml_nelements(cache), 0.0f);
+        ggml_backend_tensor_set(cache, zero.data(), 0, ggml_nbytes(cache));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) { return 2; }
+        results[separate][0].resize(ggml_nelements(cache));
+        results[separate][1].resize(ggml_nelements(out));
+        ggml_backend_tensor_get(cache, results[separate][0].data(), 0, ggml_nbytes(cache));
+        ggml_backend_tensor_get(out, results[separate][1].data(), 0, ggml_nbytes(out));
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    for (int r = 0; r < 2; ++r) {
+        if (std::memcmp(results[0][r].data(), results[1][r].data(), results[0][r].size()*sizeof(float)) != 0) {
+            std::fprintf(stderr, "FAIL gated delta net %s differs from the separate copy\n", r ? "output" : "state");
+            return 3;
+        }
+    }
+    bool written = false;
+    for (size_t i = S*S*H; i < results[0][0].size() && !written; ++i) written = results[0][0][i] != 0.0f;
+    if (!written) {
+        std::fprintf(stderr, "FAIL gated delta net state was not written to the cache row\n");
+        return 3;
+    }
+    std::printf("PASS exact gated delta net state written to the cache\n");
+    return 0;
+}
+
 int main() {
     ggml_backend_load_all();
     auto backend = ggml_backend_init_by_name("MTL0", nullptr);
@@ -85,6 +145,9 @@ int main() {
         return 1;
     }
     if (const int rc = check_hc_mix_tail(backend)) {
+        return rc;
+    }
+    if (const int rc = check_gdn_state_copy(backend)) {
         return rc;
     }
     for (int nt : {1, 7, 1536}) {
