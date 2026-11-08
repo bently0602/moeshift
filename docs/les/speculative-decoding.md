@@ -14,7 +14,8 @@ the model profile:
 - `env.LLAMA_MOE_DECODE_ROWS` sets how many tokens one decode step may carry. Every expert of
   every row must be resident at once, so the narrowest per-layer window bounds it: with a 44-slot
   window and 10 experts per token, the limit is 4. Speculation needs at least 2; with 1 it is
-  disabled with a message.
+  disabled with a message. Flash Next's profile has no protected slots (15–20-slot windows, so 1–2
+  rows); speculation needs `LLAMA_MOE_PROTECTED_SLOTS` back above 0.
 - Drafts are capped at `rows - 1` tokens (`LLAMA_SPEC_DRAFT_CAP`, set by the worker), so a check
   never leaves the decode phase. n-gram drafts, which ignore `spec-draft-n-max`, are truncated.
 - A batch of several tokens counts as decode only while the decode phase is active. The last

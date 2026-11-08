@@ -1,7 +1,11 @@
 # Protected decode cache
 
 Both [supported architectures](../architecture.md#supported-llm-architectures)
-use the same two-tier, demand-scored LRFU cache.
+use the same two-tier, demand-scored LRFU cache. The Flash Next profile turns the protected tier
+off (`LLAMA_MOE_PROTECTED_SLOTS: 0`): on the M5 Max 36 GB, macOS's file cache already held most
+protected experts, and without the tier generation was about 1% faster with 16% less SSD reading
+and 1.9 GB less memory ([measurements](../../MACM5MAX36GB.md#protected-decode-slots-p0)). The
+example below is the Qwen3.6 profile.
 Configure it inside the model profile's `env` object in
 `~/.config/moeshift/config.json`:
 

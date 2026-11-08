@@ -497,13 +497,17 @@ The file from before this change is saved as
 ### Source-build configuration
 
 `~/.config/moeshift/config-source.json` is a copy of the main configuration
-with prefetch depth 8 and read 8 (see [Prefetch depth](#prefetch-depth-n1)):
+with prefetch depth 8 and read 8 (see [Prefetch depth](#prefetch-depth-n1)) and no protected
+slots (see [Protected decode slots](#protected-decode-slots-p0); the previous file is
+`config-source.json.bak-protected24`):
 
 ```diff
 -        "LLAMA_MOE_PREFETCH_READ": 2,
 -        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 3,
 +        "LLAMA_MOE_PREFETCH_READ": 8,
 +        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 8,
+-        "LLAMA_MOE_PROTECTED_SLOTS": 24
++        "LLAMA_MOE_PROTECTED_SLOTS": 0
 ```
 
 The Homebrew build rejects this file, because its validator still requires
@@ -1663,6 +1667,144 @@ With late prefetch on, the normal run was much the same (36.25 ms per graph, 24.
   recover: at most about 5 ms (+15%). In normal runs the layers with misses already hide their
   encoding behind the reads (which is why G5's pre-encoding did not help), so a realistic gain is
   perhaps 2–4 ms per token, about +5–10%; not measured.
+
+## One command buffer per token (G6 prototype, reverted)
+
+A prototype (`LLAMA_MOE_ONE_BUFFER=1`; patch in `/Volumes/Data/moeshift-scratch/g6/g6-prototype.patch`)
+kept each layer's expert step inside the Metal graph instead of ending a graph split there:
+
+- Metal claimed the LES custom op of one-token decode graphs, so the scheduler kept the whole
+  token in one Metal graph (2 splits instead of 98).
+- For step v, the encoder ended its encoder, signalled a shared event with v and waited for a
+  second event to reach 2v − 1 (slot ids written); before each layer's missing-expert kernels it
+  waited for 2v (reads done). A spinning host thread ran the custom op on host-visible memory, and
+  the demand batch's last read signalled 2v.
+- With one command buffer per graph split (`n_cb` 1) the GPU waited for the whole token to be
+  encoded, about 5 ms, so `n_cb` was raised to 2 or 8.
+
+Output was identical everywhere. Interleaved A/B, three rounds, as above:
+
+| Configuration | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| Splits (baseline) | 26.19 tok/s | 23.14 tok/s | 7.46 s |
+| One graph, `n_cb` 2 | 26.39 tok/s (+0.8%) | 23.02 tok/s (−0.5%) | 7.46 s |
+| One graph, `n_cb` 8 | 26.51 tok/s (+1.2%) | 23.01 tok/s (−0.6%) | 7.47 s |
+
+With expert reads skipped it saved only about 0.5 ms per token (27.25 → 26.75 ms) of the 5.1 ms
+of idle GPU measured above. The host side was fast (the step took about 19 µs on the host
+thread), so most of the roughly 100 µs per layer is on the GPU side: resuming after an event wait
+and the barriers of the extra encoder splits, which one command buffer does not remove. Peak
+memory rose by about 20 MB. Reverted.
+
+## Zero-copy experts from the page cache (feasibility)
+
+[ANE Fieldfare](https://github.com/bently0602/ane-fieldfare) (Apache-2.0) serves routed experts
+without an expert cache of its own: each layer file is mapped read-only, every expert is a no-copy
+`MTLBuffer` over its page-aligned slice, `mincore` checks residency, misses are read in with
+parallel `pread`s, and each command buffer binds only the experts it uses (`useResources`).
+Replacing its own 48-slot cache with the OS file cache made its decode about 15% faster. In
+MoEShift about 75% of decode misses are already served by the page cache, so most of the 10–14 ms
+per token of reads is copying into the decode windows.
+
+Two standalone Metal tests (`/Volumes/Data/moeshift-scratch/zc/`), with a 1 GB file written
+uncached to the external drive for the cold cases:
+
+| Test | Result |
+|---|---|
+| One no-copy buffer over a whole 1 GB file, kernel reads 4 KB | **Metal paged in the whole file** (65,536 of 65,536 pages, 3.2 s from the USB drive); on the half-cached layer 0 file, 153 ms. Whole-file buffers do not work |
+| Unaligned slices through a mapping (also layer 0's experts 5 and 300) | Correct sums |
+| A page-cached slice, through the mapping and in an ordinary buffer | 0.18 ms each; copying the same 1.87 MB out of the page cache took 0.23 ms |
+| 512 no-copy buffers, one per expert over the pages that cover it (neighbours share an edge page) | Created in 0.95 ms, nothing paged in |
+| Binding one cold expert's buffer | Paged in exactly its 115 pages; its neighbour, sharing a page, read correctly |
+
+The prepared expert files are not page aligned (layer 0's stride is 1,868,800 bytes, a multiple
+of 1 KB), but per-expert buffers over the covering pages make repacking unnecessary. Cold reads in
+the tests came from the USB drive and are not representative of the internal SSD.
+
+**Prototype (reverted, `LLAMA_MOE_ZC_LAYER=all|L|a-b`; patch in
+`/Volumes/Data/moeshift-scratch/zc/zc-prototype.patch`).** The expert runtime maps each chosen
+layer's expert file and creates a no-copy buffer per expert over its covering pages, with a table
+of GPU addresses (`bridge-cpu.mm`). `kernel_mul_mv_id` takes an expert's weights from the table
+when the encoder finds the weight tensor registered, and the encoder binds the step's experts with
+`useResources`. A decode step's slot ids become expert ids; an expert counts as resident when 8
+sampled pages are (`mincore`), and a miss is read into the page cache by the demand readers, with
+the GPU's missing phase waiting for it as before. The decode windows of those layers are not used.
+
+| `short.json`, single runs | Generation | Expert uses that needed a read | Metal encode and commit per token | GPU busy per token | Peak memory |
+|---|---:|---:|---:|---:|---:|
+| Windows (baseline) | 26.0–26.4 tok/s | (about 100+ demand misses per token) | 5.45 ms | 23.72 ms | 8.6 GB |
+| Zero-copy, all layers | 17.6–17.7 tok/s | 5.7% (about 27 per token) | 11.28 ms | 22.39 ms | 5.6 GB |
+| Zero-copy, residency check off (no reads) | 21.8 tok/s | — | 3.44 ms | 22.11 ms | — |
+
+Output was identical in every run, and layer 24 alone (its file fully cached) needed no reads in
+511 steps. The page cache served far more experts than the windows do, and the process used 3 GB
+less. But generation was 32% slower:
+
+- With reads in flight, encoding the next split took twice as long: binding (`useResources`) an
+  expert whose pages are still being read appears to wait for the read, which puts the reads on
+  the encoding thread.
+- Even without reads, a token took about 8 ms longer, with neither encoding nor GPU busy time
+  higher. That points to Metal making the bound file-backed buffers resident for every command
+  buffer (about 60 buffers per layer bound in 6 encoders), between commit and GPU start; not
+  measured directly.
+
+**Binding cost, measured alone** (`zc_test4.mm`): 48 command buffers per "token", each a small
+kernel reading 10 experts through the table. Binding 10 warm file-backed buffers with
+`useResources` cost nothing measurable (5.99 ms per token, the same as a residency set holding
+them). A residency set of 2,048 experts wired 2.7 GB, so it would pin its experts like an
+app-managed cache. The test reused the same few experts every token.
+
+**Hybrid** (reverted; patch in `/Volumes/Data/moeshift-scratch/zc/zc-hybrid.patch`): only experts in the
+page cache (first, middle and last page resident) are read in place, through a flagged slot id
+(`GGML_MOE_ZC_FLAG`); every other expert goes through the decode window as before, so no
+file-backed buffer is ever bound while it is being read, and prefetch skips experts already in
+the page cache. Single runs, `short.json`:
+
+| Configuration | Generation | Peak memory | Expert uses not in the page cache | Encode and commit per token | Residency checks per token |
+|---|---:|---:|---:|---:|---:|
+| Windows, 24 protected slots (baseline) | 26.22 tok/s | 8.6 GB | — | 5.6 ms | — |
+| Hybrid, 24 protected slots | 23.49–24.30 tok/s | 8.65 GB | 3.9% | 6.62 ms | 1.80 ms |
+| Windows, protected slots 0 | 26.44 tok/s | 6.7 GB | — | 5.7 ms | — |
+| Hybrid, protected slots 0 | 23.66 tok/s | 6.7 GB | 2.9% | 8.06 ms | — |
+
+Output was identical everywhere. The hybrid stayed about 10% slower: the residency checks
+(`mincore`) cost about 1.8 ms per token and encoding 1–2.4 ms more, probably because each token
+binds about 480 different file-backed buffers, which Metal maps at commit (the standalone test
+reused the same ones). What zero-copy removes, copying page-cache hits into the windows, was
+mostly hidden behind the GPU's work on resident experts already; the reads on the critical path
+are the SSD misses, and those did not change. Not kept.
+
+**Side result: the protected cache** (see the P0 section below).
+
+## Protected decode slots (P0)
+
+The zero-copy tests suggested that macOS's file cache already holds what the 24 protected decode
+slots per layer do. Interleaved A/B on the current build (commit after `d81e49f`), same setup as
+above: three rounds, fresh server each, warmup + 2 short requests + the long one, 512 tokens
+each; `config-source.json` with only `LLAMA_MOE_PROTECTED_SLOTS` changed. Medians; peak and final
+footprint per server; internal-SSD transfer per server run (`iostat`, reads and writes, almost
+all reads):
+
+| Protected slots | After a short prompt | After the long prompt | Long prompt | Peak | Footprint after generating | SSD transfer per run |
+|---:|---:|---:|---:|---:|---:|---:|
+| 24 (configured) | 26.40 tok/s | 23.21 tok/s | 7.46 s | 9,446 MB | 9,320 MB | 189 GB |
+| 12 | 26.58 tok/s (+0.7%) | 23.38 tok/s (+0.7%) | 7.46 s | 9,181 MB | 8,360 MB | 173 GB |
+| **0** | **26.68 tok/s (+1.1%)** | **23.41 tok/s (+0.9%)** | 7.46 s | 9,180 MB | **7,400 MB** | **159 GB (−16%)** |
+
+- After the long prompt the ranges did not overlap (23.16–23.21 against 23.39–23.42 tok/s);
+  after a short one they touched (25.99–26.56 against 26.56–26.73).
+- Every response matched.
+- With no protected slots the decode windows take 1.9 GB less, which the page cache uses. The
+  SSD read 16% less over the same requests: an expert in a protected slot is usually also in the
+  page cache, so the slots held second copies. The peak hardly changes, because prefill's expert
+  bank sets it.
+- The protected cache was tuned before the page cache was measured as an expert cache (G2 found
+  the same effect for larger caches).
+
+Applied: `config-source.json` and the Flash Next profile in `configs/moeshift.json` now set
+`LLAMA_MOE_PROTECTED_SLOTS` to `0` (the Qwen3.6 profile keeps 24; not measured). The main
+`config.json` keeps 24. Without protected slots Flash Next's windows have 20 slots
+(`config-source.json`, depth 8), which allows decode steps of at most 2 rows for speculation.
 
 ## Tool calling
 

@@ -4,7 +4,7 @@ The [standard template](moeshift.json) includes both tested model profiles:
 
 | Model ID and alias | Prefill slots | Protected slots per layer |
 |---|---:|---:|
-| `qwen-3.8-flash-next-rco-gsq-iq3-xxs` | 512 | 24 |
+| `qwen-3.8-flash-next-rco-gsq-iq3-xxs` | 512 | 0 |
 | `qwen-3.6-35b-a3b-q6-xl` | 256 | 24 |
 
 ## Manual setup
@@ -75,13 +75,13 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `args.n-gpu-layers`, `args.flash-attn` | `99`, `on`; expert execution requires Metal |
 | `args.cache-type-k`, `args.cache-type-v` | `q8_0` KV quantization; the Qwen4Exp indexer stores keys only |
 | `args.no-mmap` | `true`; explicit reads for Qwen weights |
-| `env.LLAMA_MOE_DECODE_WINDOW` | `12` decode slots per layer; combined with 3 prefetch slots and 24 protected slots, the default total is 39 |
-| `env.LLAMA_MOE_PROTECTED_SLOTS` | `24` additional protected slots; larger values use more RAM and can reduce SSD reads; `0` disables the protected tier |
+| `env.LLAMA_MOE_DECODE_WINDOW` | `12` decode slots per layer; with 3 prefetch slots that is 15 for Flash Next, plus 24 protected slots (39) for Qwen3.6 |
+| `env.LLAMA_MOE_PROTECTED_SLOTS` | `0` for Flash Next, `24` for Qwen3.6: additional protected slots per layer; `0` disables the protected tier. On the M5 Max 36 GB, `0` made Flash Next generate about 1% faster, read 16% less from the SSD and use 1.9 GB less memory while generating, because macOS's file cache already held the protected experts ([measurements](../MACM5MAX36GB.md#protected-decode-slots-p0)) |
 | `env.LLAMA_MOE_LOOKAHEAD_PREFETCH` | `1`; enable predictive expert reads |
 | `env.LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`, `env.LLAMA_MOE_PREFETCH_READ` | Predict `3` experts, read `2` |
 | `env.LLAMA_MOE_LATE_PREFETCH`, `env.LLAMA_MOE_LATE_READ` | Unset (off). Flash Next only: route each next layer on the previous layer's output and read up to `LATE_READ` (default all) of its `LATE_PREFETCH` best guesses while its attention runs; `8` and `8` measured +1.8% generation after a short prompt, with identical output. Replaces the lookahead guess for one-token steps (see [late prefetch](../docs/les/late-prefetch.md)) |
 | `env.LLAMA_MOE_LATE_MIX` | `0`; `1` makes late guesses with the next layer's full hyper-connection mix (more accurate, more GPU work) |
-| `env.LLAMA_MOE_DECODE_ROWS` | `1` token per decode step; up to the narrowest window / 10 (`4` with the 44-slot source profile) lets batches of a few tokens, such as speculative checks, stay in the decode phase |
+| `env.LLAMA_MOE_DECODE_ROWS` | `1` token per decode step; up to the narrowest window / 10 lets batches of a few tokens, such as speculative checks, stay in the decode phase. Flash Next's 15-slot window allows only 1 (with prefetch depth 8, 20 slots allow 2); protected slots raise it |
 | `args.spec-type`, `args.spec-draft-model`, `args.spec-draft-n-max`, `args.spec-draft-n-min`, `args.spec-draft-ngl` | Unset; speculative decoding needs `LLAMA_MOE_DECODE_ROWS` of 2 or more, and drafts are capped at rows − 1 tokens (see [speculative decoding](../docs/les/speculative-decoding.md)) |
 | `env.LLAMA_MOE_PREFILL_PIPELINE` | `1`; overlap prefill reads with computation |
 | `env.LLAMA_GPU_KEEPALIVE` | `1`; keep the GPU active while the worker exists; `0` disables it |
