@@ -517,6 +517,26 @@ scripts/build-moeshift.sh --run --config ~/.config/moeshift/config-source.json
 
 Both files started successfully with their builds on 2026-11-07.
 
+### Could enable: late prefetch (not enabled)
+
+The source build can also read each layer's experts from a later, better guess
+(see [Late prefetch](#late-prefetch-n6a)). It is not in either file yet. To try
+it, add to the Flash Next profile's `env` in `config-source.json`:
+
+```diff
++        "LLAMA_MOE_LATE_PREFETCH": 8,
++        "LLAMA_MOE_LATE_READ": 8,
+```
+
+- Measured +1.8% generation after a short prompt and +0.7% after the long one,
+  with identical output and about 4 MB more memory.
+- Costs: one CPU thread spins while the GPU is generating (it sleeps when idle),
+  and about a quarter of the extra expert reads go unused.
+- The code is new (two output-changing bugs were found and fixed while
+  building it), so it stays off until it has had more use. Removing the two
+  lines turns it off completely.
+- It needs the current source build; the Homebrew build rejects these keys.
+
 Restart MoEShift after changing the configuration.
 
 ## Double-buffered prefill reads (commit `6de789b`)
@@ -1458,21 +1478,49 @@ layer L predicts L+1's experts much better than L's FFN input does, once L+1's o
 V1 with 16 guesses names 91–94% of the experts used. V2 (L+1's attention input) is worse than the
 shipped guess.
 
-What it would take, not built:
+**Delivery test.** The late guess exists on the GPU in the middle of a command buffer, while the
+CPU normally sees results only at each layer's split. A standalone Metal program
+(`/Volumes/Data/moeshift-scratch/n6a/delivery.mm`) ran a tiny "guess" kernel followed by a
+kernel of about 1 ms in one command buffer, with a CPU thread waiting for the guess:
 
-- **Timing.** The late guess exists only after layer L's FFN, about one attention block before
-  L+1's expert step, roughly half the shipped guess's lead. Missing-expert reads take about
-  0.36 ms per layer (G5 section), so a late read would hide part of each read, not all of it.
-- **Delivery.** The CPU sees GPU results only at each layer's expert split. Another split per
-  layer would cost about 220 µs of idle GPU (G5), more than the gain. It would need a GPU-signalled
-  `MTLSharedEvent` inside the command buffer and a spinning CPU thread (about 27 µs in the G5
-  probe) to start the reads.
-- **Cost.** V1 runs another hyper-connection mix per layer: two bf16 projections, about 12.5 MB of
-  weights, roughly 600 MB more read per token (about 1.6 ms at the B1 bandwidth). V3 needs only a
-  norm, a stream mean and the router (2.6 MB), about 0.5–1 ms per token in small kernels
-  (estimate).
-- **Reads.** 16 guesses means more reads of experts that are not used; R2b found that extra reads
-  compete with demand reads.
+| How the CPU learns of the guess | Seen after the buffer's GPU start | Lead before the buffer ends |
+|---|---:|---:|
+| A flag the kernel writes to shared memory (one or two encoders) | 1,100–1,330 µs | none: visible only at completion |
+| `MTLSharedEvent` signalled between two encoders, CPU thread spinning | 16–18 µs | 1,060–1,310 µs |
+
+The ids written by the guess kernel were visible when the event was seen. Ending the encoder and
+signalling cost the GPU about 1.5 µs.
+
+**Lead in the real engine.** A temporary probe (`/Volumes/Data/moeshift-scratch/n6a/lead-probe.patch`,
+reverted) put a one-element marker after each layer's final combine, where a late guess would be
+ready. The Metal encoder ended its encoder after the marker, signalled a shared event and opened a
+new one; a spinning thread stamped each signal, and the expert runtime compared it with the start
+of the next layer's step:
+
+| After | Lead p10 | p50 | p90 | Late |
+|---|---:|---:|---:|---:|
+| Short prompt | 322 µs | 356 µs | 415 µs | 0 of 12,032 |
+| Long prompt | 324 µs | 357 µs | 537 µs | 0 of 12,032 |
+
+Output was unchanged, and splitting the encoder in every layer did not slow generation (single
+runs).
+
+**What reads cost now.** With reads skipped (timing only, output invalid, `ignore_eos`, 512
+tokens), a token took 27.3 ms instead of 37.9 ms after a short prompt and 29.0 ms instead of
+42.7 ms after the long one: reads put 10.6–13.7 ms per token on the critical path, 28–32%. With
+`LLAMA_MOE_QUIET=0`, decode missed about 2.2 experts per layer (72–116 per token, 115–196 MiB),
+about 0.36 ms of `pread` thread time per expert. The internal SSD read only about 1.2 GB/s during
+decode (`iostat`); the page cache served most misses, so the SSD has headroom for extra reads.
+
+**Estimate, not measured** (built afterwards; see the late prefetch section). A layer's demand reads (an expert's matrices split over 12 threads)
+mostly take less than the 356 µs lead, so a covered miss read from the late guess would usually
+be in place in time. V1 with 16 guesses covers 81–86% of the misses today's guess leaves; if
+about half to two thirds of the read time went away, that is 5–7 ms per token (about +15–20%),
+minus V1's own cost (about 600 MB more bf16 reads, about 1.6 ms) and contention from extra reads
+(R2b). V3 is cheaper but covers 65–74%. Building it means: the guess and an event in the graph
+after each layer's combine, a spinning CPU thread that hands the guess to the prefetch worker,
+and demand reads that wait for a late read already in flight instead of reading again. Output
+cannot change, since prefetch only moves reads earlier.
 
 **The probe exposed a C1b bug (fixed, uncommitted).** One probe variant changed the short-prompt
 answer, deterministically. It was not F1: F1 switched off everywhere gave the reference answer,
@@ -1501,7 +1549,13 @@ writing a later node's output early) was checked in the other merges (`ggml_meta
   writing it), so it is allowed; any other overlap declines.
 - **Hyper-connection combine (REPEAT + MUL + ADD):** declines if the output overlaps `x` or `w`;
   no overlaps were counted.
-- Upstream merges (add chains, norm chains) were not changed.
+- **Upstream add chains and norm chains (A):** temporary counters over a short and a long
+  request (decode and prefill) found the output sharing an input's memory in 136 of 20,000 add
+  chains and none of 80,000 norm chains, always at the same start and with the same layout. That
+  is safe, since each element is written by the thread that read it (the norm kernel reads the
+  whole row, behind barriers, before writing). No other overlap occurred. Both now fall back to
+  separate kernels on any other overlap (`ggml_metal_op_clobbers`); `test-backend-ops` passes
+  for `ADD` (60/60) and `RMS_NORM_MUL_ADD` (30/30), and the real outputs are unchanged.
 
 `tests/test-metal-hc-fusion` now allocates two cases with `ggml_gallocr`: a computed row index
 whose memory goes to the next tensor (it fails without the fix), and the routing chain with the
@@ -1513,6 +1567,102 @@ both. Every response matched, the four n-gram speculation requests matched their
 peak memory was 9,446 MB (about 10 GB with speculation). This machine ran about 3% faster than
 during the P4 measurements.
 
+
+## Late prefetch (N6a)
+
+Built from the N6a probes, off by default (`LLAMA_MOE_LATE_PREFETCH`, `LLAMA_MOE_LATE_READ`; see
+[late prefetch](docs/les/late-prefetch.md)). At the end of each decode layer the graph routes the
+next layer on the new residual (its grouped norm, each stream routed and summed), the Metal
+encoder signals a shared event at its next barrier, a spinning thread hands the guess to the
+expert runtime, and the reads overlap the next layer's attention. Output is unchanged.
+
+How it got there, all on `short.json` with diagnostics on:
+
+- **First version: slower** (23.6 tok/s against about 26.2). With 16 guesses read, 70% of the
+  ~6 late reads per layer went unused, and the steps waited 460 µs on average for reads still in
+  flight. The readers also took the worst guess first (their queue is last in, first out).
+- **A race changed the output** in one run: a guess that arrived just after the layer's step
+  could evict experts the step had given to the GPU. The guess now checks freshness under the
+  layer's lock, under which the step counts itself; and no prefetch may evict the latest step's
+  experts. Repeated runs were identical afterwards.
+- **The guess cost 1.3–2 ms per token of GPU time** with no reads at all (24.9 against 26.1
+  tok/s). A microbenchmark of the chain put it at about 28 µs per layer, the router mat-vec
+  (2.6 MB of bf16 weights) about 10 µs of it. Routing the 4 streams in one mat-mul, deferring the
+  signal to the next barrier, and dropping the lookahead's own guess (the late one replaces it)
+  cut the net cost.
+- **Waiting on the CPU was the wrong place.** Reads took 185–193 µs after the callback at the
+  median, but 577–607 µs at p90 and over 1 ms at p99, against a lead of about 350 µs. A step that
+  waited on the CPU for such a read also held back the GPU's resident experts. Attaching the read
+  to the step's demand batch, with a negative slot id like a miss, lets the resident experts run
+  at once; an earlier attempt without the negative ids let the GPU read unfinished slots, and the
+  output changed until it was fixed.
+
+Sweep after those changes (single runs, baseline about 26.0–26.2 tok/s):
+
+| Guesses / read | Generation | Demand misses per token | Late reads used |
+|---|---:|---:|---:|
+| 8 / 8 | 26.28 tok/s | 78.7 (baseline 135.7) | 73.7% |
+| 16 / 6 | 25.73 tok/s | 64.8 | 54.6% |
+| 16 / 8 | 25.31 tok/s | 50.0 | 49.7% |
+
+More guesses cut more misses but cost more in unused reads (copies that compete for memory
+bandwidth) and in slow reads the GPU then waits for.
+
+Interleaved A/B, `config-source.json`, three rounds, fresh server each. Medians:
+
+| Configuration | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| Off | 26.17 tok/s | 22.85 tok/s | 7.47 s |
+| **8 guesses, read 8** | **26.63 tok/s (+1.8%)** | **23.01 tok/s (+0.7%)** | 7.49 s |
+| 8 guesses, read 6 | 26.67 tok/s (+1.9%) | 22.97 tok/s (+0.5%) | 7.48 s |
+
+After a short prompt the ranges did not overlap (26.07–26.42 against 26.54–26.72); after the long
+one they nearly did. Every response matched, the n-gram speculation suite (4-row steps, late
+prefetch on) matched its references, and peak memory was 9,450 MB against 9,446 MB. The gain is far
+below the 15–20% estimated from the read cost: the guess's GPU time and the slow tail of the
+extra reads take most of what the 42% fewer demand misses save.
+
+**Layer 0.** Layer 0 misses the most (7.1–7.4 experts per token against about 2 elsewhere) and gets
+no guess, since no layer comes before it. A temporary probe found nothing to guess from:
+
+- Its input before attention is the token embedding alone (PLE starts at layer 1). Routing that
+  through layer 0's FFN mix or norm named 2–6% of the experts it used, about chance (16 of 512 is
+  3.1%), so its routing depends on its attention over the context.
+- The previous step's router ranks 11–26 held 5–6% of layer 0's misses (19–20% for other layers).
+- An LRU replay of its expert ids (407–418 distinct experts in 511 steps) gave 8.5–8.8 misses per
+  step with 36 slots and 4.3–5.6 with 128: a 128-slot window for layer 0 alone (about +156 MB)
+  would save about 3 misses per token out of about 100.
+
+The CPU has 2.5–3 ms between a token's last layer step and the next token's layer-0 step, but no
+predictor for it.
+
+## Where a generated token's time goes now (G6 measurement)
+
+Temporary timers in `ggml_backend_sched_compute_splits` and a completion handler on every Metal
+command buffer (removed afterwards), `short.json` with `ignore_eos`, 512 tokens, averages per
+decode graph:
+
+| Per decode graph | Normal | Expert reads skipped (timing only, output invalid) |
+|---|---:|---:|
+| Total | 37.12 ms | 27.05 ms |
+| GPU busy (command buffers, start to end) | 23.72 ms | 21.96 ms |
+| GPU idle (total minus busy) | 13.4 ms | 5.1 ms |
+| Metal split: encode and commit | 5.53 ms | 3.49 ms |
+| CPU split: waiting for the GPU | 28.88 ms | 21.82 ms |
+| CPU split: expert step | 1.19 ms | 0.48 ms |
+| Splits | 98 | 98 |
+| Generation | 26.2 tok/s | 36.5 tok/s |
+
+With late prefetch on, the normal run was much the same (36.25 ms per graph, 24.53 ms GPU busy,
+4.96 ms encoding, 1.09 ms expert step).
+
+- The GPU computes for about 22 ms of each 38 ms token.
+- Expert reads put about 10 ms on the critical path, as measured before.
+- Handshakes, encoding and the expert step cost about 5.1 ms when no reads hide them, about
+  104 µs for each of the 49 CPU splits. That is what one command buffer per token (G6) could
+  recover: at most about 5 ms (+15%). In normal runs the layers with misses already hide their
+  encoding behind the reads (which is why G5's pre-encoding did not help), so a realistic gain is
+  perhaps 2–4 ms per token, about +5–10%; not measured.
 
 ## Tool calling
 

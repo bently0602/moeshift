@@ -545,6 +545,14 @@ struct llama_moe_slot_runtime::impl {
         uint64_t age = 0;
         les_protected_cache protected_cache;
         std::mutex mutex;
+        // late prefetch (guarded by mutex): experts being read from a late guess, the slot each goes
+        // to, and those a demand step has attached to its batch (the GPU waits for them there)
+        std::vector<uint8_t> late_inflight;
+        std::vector<int32_t> late_slot;
+        std::vector<uint8_t> late_attached;
+        // experts of this layer's latest decode step: the GPU may read them until the token ends,
+        // so a prefetch must not evict them (claim_slot_in_window)
+        std::vector<uint8_t> step_experts;
     };
     struct map_userdata {
         llama_moe_slot_runtime * runtime = nullptr;
@@ -709,9 +717,29 @@ void finish_demand_read(size_t layer_index) {
     demand_done.notify_all();
 }
 
+// the per-layer tickets and the reader threads, on first use (demand or late reads)
+void init_demand_readers() {
+    std::lock_guard<std::mutex> lock(demand_init_mutex);
+    if (!demand_tickets.empty()) {
+        return;
+    }
+    demand_batches = std::vector<demand_batch>(layers.size());
+    std::vector<void *> tickets(layers.size(), nullptr);
+    for (size_t il = 0; il < layers.size(); ++il) {
+        tickets[il] = les_io_create();
+        for (auto & binding : layers[il].dec_bindings)
+            les_io_register(tickets[il], binding.tensor->data);
+    }
+    for (int i = 0; i < kDemandReadThreads; ++i) demand_readers.emplace_back([this] { demand_reader(); });
+    demand_tickets = std::move(tickets);
+}
+std::mutex demand_init_mutex;
+
+// attached: late reads already in flight that this batch also waits for (late_finish)
 install_timing start_demand(
     layer_state & state,
-    const std::vector<pending_install> & pending
+    const std::vector<pending_install> & pending,
+    int attached = 0
 ) {
 
     for (const auto & binding : state.dec_bindings) {
@@ -720,16 +748,7 @@ install_timing start_demand(
             throw std::runtime_error("moeshift: asynchronous expert reads require Metal buffers");
     }
     const size_t layer_index = size_t(&state - layers.data());
-    if (demand_tickets.empty()) {
-        demand_tickets.resize(layers.size(), nullptr);
-        demand_batches = std::vector<demand_batch>(layers.size());
-        for (size_t il = 0; il < layers.size(); ++il) {
-            demand_tickets[il] = les_io_create();
-            for (auto & binding : layers[il].dec_bindings)
-                les_io_register(demand_tickets[il], binding.tensor->data);
-        }
-        for (int i = 0; i < kDemandReadThreads; ++i) demand_readers.emplace_back([this] { demand_reader(); });
-    }
+    init_demand_readers();
     auto & batch = demand_batches[layer_index];
     {
         // the previous batch of this layer writes the same window
@@ -745,7 +764,7 @@ install_timing start_demand(
     batch.next_layer = demand_next_layer;
     batch.next = std::move(demand_next);
     demand_next.clear();
-    batch.left.store((int) pending.size() * n_parts + 1, std::memory_order_release);
+    batch.left.store((int) pending.size() * n_parts + attached + 1, std::memory_order_release);
 
     install_timing queued;
     queued.n = (int) pending.size();
@@ -868,6 +887,7 @@ install_timing start_demand(
                 }
             });
         resolve_decode_window();
+        init_late();
         if (std::getenv("LLAMA_MOE_MATMUL_SPLIT")) {
             throw std::runtime_error("LLAMA_MOE_MATMUL_SPLIT was removed; use the Metal resident/missing pipeline");
         }
@@ -971,14 +991,15 @@ install_timing start_demand(
         // expert_to_slot 不能整体清：pending 的专家此时还没登记，所以直接全清是安全的。
         std::fill(st.expert_to_slot.begin(), st.expert_to_slot.end(), kSlotFree);
         std::fill(st.slot_prefetched.begin(), st.slot_prefetched.end(), 0);
+        std::fill(st.step_experts.begin(), st.step_experts.end(), 0);
         st.protected_cache.reset(st.slot_to_expert);
     }
 
     /// Counts a prefetched entry that is replaced before any use. Caller holds st.mutex.
     void reuse_slot(layer_state & st, int32_t slot) {
         if (st.slot_prefetched[(size_t) slot]) {
+            (st.slot_prefetched[(size_t) slot] == 2 ? late_unused : lookahead.n_pf_unused).fetch_add(1, std::memory_order_relaxed);
             st.slot_prefetched[(size_t) slot] = 0;
-            lookahead.n_pf_unused.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -1001,7 +1022,8 @@ install_timing start_demand(
     ///   false → 在**预读区**里挑（预读用；统一模式下就是整层窗口）
     ///
     /// 返回 -1 = 该专家已在窗口里，或无处可放。
-    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only) {
+    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only,
+                                 const std::vector<uint8_t> & keep = {}) {
         if (decode_window <= 0 || expert < 0 || expert >= n_expert) {
             return -1;
         }
@@ -1018,7 +1040,7 @@ install_timing start_demand(
 
         int32_t slot = -1;
         if (st.protected_cache.enabled() && !cache_only) {
-            slot = st.protected_cache.miss(st.slot_to_expert, st.slot_age, {}, {});
+            slot = st.protected_cache.miss(st.slot_to_expert, st.slot_age, st.step_experts, keep);
             if (slot < 0) return -1;
         }
         for (int32_t cand = from; slot < 0 && cand < hi; ++cand) {
@@ -1027,10 +1049,13 @@ install_timing start_demand(
                 break;
             }
         }
-        if (slot < 0) {
+        for (int pass = 0; pass < 2 && slot < 0; ++pass) {
             uint64_t oldest = UINT64_MAX;
             for (int32_t cand = from; cand < hi; ++cand) {
-                if (st.slot_to_expert[(size_t) cand] == kSlotPending) {
+                const int32_t resident = st.slot_to_expert[(size_t) cand];
+                if (resident == kSlotPending ||
+                        (resident >= 0 && !st.step_experts.empty() && st.step_experts[(size_t) resident]) ||
+                        (pass == 0 && resident >= 0 && !keep.empty() && keep[(size_t) resident])) {
                     continue;
                 }
                 if (st.slot_age[(size_t) cand] < oldest) {
@@ -1377,6 +1402,10 @@ install_timing start_demand(
     }
 
     ~impl() {
+        if (late_k > 0) {
+            les_late_set_callback(nullptr, nullptr);
+            drain_late();
+        }
         stop_demand_readers();
         for (void * ticket : demand_tickets) les_io_destroy(ticket);
         stop_prefill_read();
@@ -1385,6 +1414,7 @@ install_timing start_demand(
                 cur.n_tokens <= 1 ? n_decode_step : n_prefill_ubatch);
         }
         lookahead.report();
+        report_late();
         if (miss_pos_steps > 0) {
             std::string s;
             for (int i = 0; i < 16; ++i) {
@@ -2332,6 +2362,183 @@ install_timing start_demand(
     std::atomic<bool> parked{false};
     std::mutex park_mutex;
 
+    // ── Late prefetch (LLAMA_MOE_LATE_PREFETCH=K) ──────────────────────────────────────────
+    // At the end of each decode layer the graph routes the next layer on the new residual
+    // (qwen4exp), and the Metal encoder signals the CPU soon after that argsort (bridge.h), about
+    // 350 us before the next layer's step. late_guess() reads up to LLAMA_MOE_LATE_READ of the K
+    // best experts not yet in the window, split by matrix on the demand readers. The next layer's
+    // step attaches those of its experts still being read to its demand batch, which the GPU's
+    // missing-expert phase waits for, instead of reading them again.
+    int32_t late_k = 0;      // guesses per layer, kept from eviction
+    int32_t late_read = 0;   // at most this many of them read per layer
+    bool late_mix = false;
+    std::mutex late_gate;                       // closes late reads around parking
+    bool late_open = true;
+    std::atomic<int> late_outstanding{0};
+    std::mutex late_drain_mutex;
+    std::condition_variable late_drain_cv;
+    std::unique_ptr<std::atomic<uint64_t>[]> layer_steps;   // decode steps per layer, to drop stale guesses
+    std::atomic<uint64_t> late_signals{0}, late_stale{0}, late_reads{0}, late_used{0}, late_unused{0};
+    std::atomic<uint64_t> late_attach{0};   // late reads a demand step attached to its batch
+
+    static void late_callback(void * user, int layer, const int32_t * ids) {
+        static_cast<impl *>(user)->late_guess(layer, ids);
+    }
+
+    void init_late() {
+        const char * k = std::getenv("LLAMA_MOE_LATE_PREFETCH");
+        late_k = k ? std::max(0, std::min(32, std::atoi(k))) : 0;
+        late_mix = std::getenv("LLAMA_MOE_LATE_MIX") && std::atoi(std::getenv("LLAMA_MOE_LATE_MIX")) != 0;
+        const char * r = std::getenv("LLAMA_MOE_LATE_READ");
+        late_read = r ? std::max(0, std::min(late_k, std::atoi(r))) : late_k;
+        if (late_k <= 0 || decode_window <= 0) {
+            late_k = 0;
+            return;
+        }
+        for (auto & st : layers) {
+            st.late_inflight.assign((size_t) n_expert, 0);
+            st.late_slot.assign((size_t) n_expert, -1);
+            st.late_attached.assign((size_t) n_expert, 0);
+        }
+        layer_steps.reset(new std::atomic<uint64_t>[layers.size()]());
+        les_late_set_callback(&impl::late_callback, this);
+        moe_log("late prefetch: %d guesses per layer, %d read (%s)", (int) late_k, (int) late_read, late_mix ? "full mix" : "norm only");
+    }
+
+    void late_guess(int layer, const int32_t * ids) {
+        late_signals.fetch_add(1, std::memory_order_relaxed);
+        if (layer < 1 || layer >= (int) layers.size() || !layers[(size_t) layer].enabled) {
+            return;
+        }
+        std::lock_guard<std::mutex> gate(late_gate);
+        if (!late_open || !was_window || parked.load(std::memory_order_acquire)) {
+            late_stale.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        auto & st = layers[(size_t) layer];
+        std::vector<uint8_t> keep((size_t) n_expert, 0);
+        for (int k = 0; k < late_k; ++k) {
+            if (ids[k] >= 0 && ids[k] < n_expert) keep[(size_t) ids[k]] = 1;
+        }
+        std::vector<pending_install> todo;
+        {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            // fresh while the previous layer's step has run and this one's has not (both counted
+            // under their layer's lock, see process())
+            if (layer_steps[(size_t) layer].load(std::memory_order_acquire) >=
+                    layer_steps[(size_t) layer - 1].load(std::memory_order_acquire)) {
+                late_stale.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // the guesses replace the next-layer prediction that protects experts from eviction
+            {
+                std::lock_guard<std::mutex> lk(pred_mtx);
+                predicted[(size_t) layer].assign(ids, ids + late_k);
+            }
+            for (int k = 0; k < late_k && (int) todo.size() < late_read; ++k) {
+                const int32_t e = ids[k];
+                if (e < 0 || e >= n_expert || st.late_inflight[(size_t) e] || st.expert_to_slot[(size_t) e] >= 0) {
+                    continue;
+                }
+                // protect the other guesses from eviction
+                const int32_t slot = claim_slot_in_window(st, e, /*cache_only=*/false, keep);
+                if (slot < 0) {
+                    continue;
+                }
+                st.late_inflight[(size_t) e] = 1;
+                st.late_slot[(size_t) e] = slot;
+                todo.push_back({ e, slot });
+            }
+        }
+        if (todo.empty()) {
+            return;
+        }
+        init_demand_readers();
+        const int n_parts = (int) st.dec_pack_order.size();
+        late_outstanding.fetch_add((int) todo.size(), std::memory_order_acq_rel);
+        late_reads.fetch_add(todo.size(), std::memory_order_relaxed);
+        {
+            // the readers take the newest task first, so queue the best guess last
+            std::lock_guard<std::mutex> lock(demand_mutex);
+            for (auto it = todo.rbegin(); it != todo.rend(); ++it) {
+                const pending_install item = *it;
+                auto left = std::make_shared<std::atomic<int>>(n_parts);
+                for (int part = 0; part < n_parts; ++part) {
+                    demand_queue.push_back([this, &st, item, part, left] {
+                        try {
+                            read_expert_directv(st, item.expert, item.slot, true, part);
+                        } catch (const std::exception & e) {
+                            GGML_ABORT("late expert read failed: %s", e.what());
+                        }
+                        if (left->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            late_finish(st, item.expert, item.slot);
+                        }
+                    });
+                }
+            }
+        }
+        demand_queued.notify_all();
+    }
+
+    void late_finish(layer_state & st, int32_t expert, int32_t slot) {
+        bool attached = false;
+        {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            attached = st.late_attached[(size_t) expert] != 0;
+            if (attached) {
+                // the demand step already mapped the expert to this slot
+                st.late_attached[(size_t) expert] = 0;
+            } else if (publish_slot_in_window(st, expert, slot)) {
+                st.slot_prefetched[(size_t) slot] = 2;   // 2 = from a late guess
+            }
+            st.late_inflight[(size_t) expert] = 0;
+        }
+        if (attached) {
+            finish_demand_read(size_t(&st - layers.data()));
+        }
+        if (late_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(late_drain_mutex);
+            late_drain_cv.notify_all();
+        }
+    }
+
+    // wait for every late read; they write windows and hold pending slots
+    void drain_late() {
+        if (late_k <= 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(late_drain_mutex);
+        late_drain_cv.wait(lock, [&] { return late_outstanding.load(std::memory_order_acquire) == 0; });
+    }
+
+    void close_late(bool open) {
+        if (late_k <= 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> gate(late_gate);
+            late_open = open;
+        }
+        if (!open) {
+            drain_late();
+        }
+    }
+
+    void report_late() const {
+        if (late_k <= 0) {
+            return;
+        }
+        const uint64_t reads = late_reads.load(std::memory_order_relaxed);
+        const uint64_t used = late_used.load(std::memory_order_relaxed);
+        const uint64_t attach = late_attach.load(std::memory_order_relaxed);
+        moe_log("late prefetch: signals=%llu stale=%llu reads=%llu used=%llu (%.1f%%) evicted-unused=%llu attached=%llu",
+            (unsigned long long) late_signals.load(std::memory_order_relaxed),
+            (unsigned long long) late_stale.load(std::memory_order_relaxed),
+            (unsigned long long) reads, (unsigned long long) used, reads ? 100.0 * (double) used / (double) reads : 0.0,
+            (unsigned long long) late_unused.load(std::memory_order_relaxed),
+            (unsigned long long) attach);
+    }
+
     // ── 命中率扫描（诊断，默认关闭）──────────────────────────────────────
     // LLAMA_MOE_SWEEP=<path> 打开，把每个 decode 步、每一层的原始记录写成一行：
     //
@@ -2489,6 +2696,7 @@ install_timing start_demand(
         if (!park_window_enabled()) {
             return;
         }
+        close_late(false);
         lookahead.drain();
         std::lock_guard<std::mutex> lk(park_mutex);
         if (parked.load(std::memory_order_relaxed)) {
@@ -2529,6 +2737,7 @@ install_timing start_demand(
             }
         }
         parked.store(false, std::memory_order_release);
+        close_late(true);
         moe_log("unparked expert memory");
     }
 };
@@ -2593,6 +2802,14 @@ int llama_moe_slot_runtime::lookahead_prefetch_depth() const {
     return pimpl->lookahead.enabled ? (int) pimpl->lookahead.depth : 0;
 }
 
+int llama_moe_slot_runtime::late_prefetch() const {
+    return pimpl->late_k;
+}
+
+bool llama_moe_slot_runtime::late_prefetch_mix() const {
+    return pimpl->late_mix;
+}
+
 int llama_moe_slot_runtime::decode_window() const {
     return (int) pimpl->decode_window;
 }
@@ -2619,6 +2836,7 @@ void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
         throw std::runtime_error("adaptive LES requires a supported Qwen MoE with decode windows");
     pimpl->join_demand();
     pimpl->lookahead.drain();
+    pimpl->drain_late();
     pimpl->stop_prefill_read();
     pimpl->prewarm_ready = false;
     pimpl->prewarm_placed.clear();
@@ -2756,7 +2974,10 @@ void llama_moe_slot_runtime::process(
     const bool window_mode = pimpl->decode_window > 0 && pimpl->decode_rows(n_rows);
     const bool lookahead_step = pimpl->lookahead.enabled && window_mode;
     // Prefill overwrites the same storage: finish all previous prefetch reads first.
-    if (!window_mode && pimpl->was_window) pimpl->lookahead.drain();
+    if (!window_mode && pimpl->was_window) {
+        pimpl->lookahead.drain();
+        pimpl->drain_late();
+    }
 
     // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
     //
@@ -2784,10 +3005,17 @@ void llama_moe_slot_runtime::process(
         // is not held yet, so this cannot invert the lock order described above.
         if (n_rows > 1) {
             pimpl->lookahead.drain();
+            pimpl->drain_late();
         }
     }
 
     std::lock_guard<std::mutex> lock(state.mutex);
+
+    // Late prefetch: the step is counted under the layer's lock, which late_guess() takes to check
+    // freshness, so a guess that arrives after this point does not claim slots the GPU will read.
+    if (pimpl->late_k > 0 && window_mode) {
+        pimpl->layer_steps[(size_t) layer].fetch_add(1, std::memory_order_acq_rel);
+    }
 
     // 阶段切换：prefill 用的是整块 bank / prefill 共享视图，与每层窗口在物理上可能
     // 落在同一块内存，所以**进入窗口阶段时**必须把每层的映射整表清空。
@@ -2929,20 +3157,35 @@ void llama_moe_slot_runtime::process(
         }
     }
 
+    if (window_mode) state.step_experts = requested;
     if (window_mode && state.protected_cache.enabled()) state.protected_cache.begin_step(requested);
     std::vector<llama_moe_slot_runtime::impl::pending_install> pending;
     pending.reserve((size_t) std::min((int32_t) pimpl->n_slots, pimpl->n_expert));
 
+    std::vector<int32_t> attached;   // late reads in flight, waited for like this step's misses (late_finish)
     for (size_t pos = 0; pos < count; ++pos) {
         const int32_t expert = experts[pos];
+        // An expert still being read from a late guess: its read started earlier than a demand
+        // read would. Map it now, and let this step's batch (which the GPU waits for) include it.
+        if (pimpl->late_k > 0 && window_mode && state.late_inflight[(size_t) expert] &&
+                !state.late_attached[(size_t) expert] && state.expert_to_slot[expert] < 0) {
+            const int32_t slot = state.late_slot[(size_t) expert];
+            state.slot_to_expert[(size_t) slot] = expert;
+            state.expert_to_slot[(size_t) expert] = slot;
+            state.late_attached[(size_t) expert] = 1;
+            pimpl->late_used.fetch_add(1, std::memory_order_relaxed);
+            pimpl->late_attach.fetch_add(1, std::memory_order_relaxed);
+            attached.push_back(expert);
+        }
         if (state.expert_to_slot[expert] >= 0) {
             if (window_mode && state.protected_cache.enabled())
                 state.protected_cache.hit(state.expert_to_slot[expert],
                     state.slot_to_expert, state.slot_age, requested, keep);
             slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
             if (state.slot_prefetched[(size_t) slots[pos]]) {
+                (state.slot_prefetched[(size_t) slots[pos]] == 2 ? pimpl->late_used : pimpl->lookahead.n_pf_used)
+                    .fetch_add(1, std::memory_order_relaxed);
                 state.slot_prefetched[(size_t) slots[pos]] = 0;
-                pimpl->lookahead.n_pf_used.fetch_add(1, std::memory_order_relaxed);
             }
             continue;
         }
@@ -3081,8 +3324,8 @@ void llama_moe_slot_runtime::process(
     }
 
     const llama_moe_slot_runtime::impl::install_timing timing =
-        (window_mode && !pending.empty())
-        ? pimpl->start_demand(state, pending)
+        (window_mode && (!pending.empty() || !attached.empty()))
+        ? pimpl->start_demand(state, pending, (int) attached.size())
         : pipelined_prefill
             ? pimpl->install_prefill_pipeline(layer, pending)
             : pimpl->install_pending(state, pending, window_mode);
@@ -3201,6 +3444,11 @@ void llama_moe_slot_runtime::process(
         for (const auto & item : pending) {
             for (size_t pos = 0; pos < slots.size(); ++pos)
                 if (experts[pos] == item.expert) slots[pos] = -slots[pos] - 1;
+        }
+        // attached late reads are not ready either; the batch covers them
+        for (int32_t expert : attached) {
+            for (size_t pos = 0; pos < slots.size(); ++pos)
+                if (experts[pos] == expert) slots[pos] = -slots[pos] - 1;
         }
     }
     {

@@ -7,6 +7,7 @@
 #include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
+#include "bridge.h"
 
 #include <cassert>
 #include <algorithm>
@@ -40,6 +41,7 @@ struct ggml_metal_op {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+        this->cmd_buf         = cmd_buf;
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->idx_start       = idx_start;
         this->idx_end         = idx_end;
@@ -63,6 +65,12 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
+        if (late_layer >= 0) {
+            ggml_metal_encoder_end_encoding(this->enc);
+            ggml_metal_encoder_free(this->enc);
+            les_late_signal(this->cmd_buf, late_layer, late_ids);
+            this->enc = ggml_metal_encoder_init(this->cmd_buf, use_concurrency);
+        }
         ggml_metal_encoder_end_encoding(this->enc);
         ggml_metal_encoder_free(this->enc);
         ggml_mem_ranges_free(this->mem_ranges);
@@ -97,6 +105,11 @@ struct ggml_metal_op {
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
+    ggml_metal_cmd_buf_t cmd_buf;
+
+    // late prefetch: a guess whose signal waits for the next barrier (ggml_metal_op_late_flush)
+    int late_layer = -1;
+    const void * late_ids = nullptr;
     ggml_mem_ranges_t    mem_ranges;
 
     bool use_fusion;
@@ -190,7 +203,17 @@ static bool ggml_metal_op_overlap(const ggml_tensor * a, const ggml_tensor * b) 
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
 
+// for kernels where each output element is written by the thread that read the same element of the
+// inputs: sharing exactly those elements (same start and layout) is safe, any other overlap is not
+static bool ggml_metal_op_clobbers(const ggml_tensor * dst, const ggml_tensor * src) {
+    return ggml_metal_op_overlap(dst, src) && !(dst->data == src->data && ggml_are_same_layout(dst, src));
+}
+
 static bool ggml_metal_op_get_rows_skipped(ggml_metal_op_t ctx, int idx);
+
+// End the encoder, so that the GPU signals the CPU once everything encoded so far has finished, then
+// continue in a new encoder. Ending the encoder is a barrier as well.
+static void ggml_metal_op_late_flush(ggml_metal_op_t ctx);
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
@@ -246,7 +269,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
 
         if (!is_concurrent) {
-            ggml_metal_op_concurrency_reset(ctx);
+            if (ctx->late_layer >= 0) {
+                ggml_metal_op_late_flush(ctx);
+            } else {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
         }
 
         if (ctx->debug_graph > 0) {
@@ -517,7 +544,30 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // late prefetch (qwen4exp): the next layer's expert guess is encoded. Its signal goes in at the
+    // next barrier, so the guess runs alongside the next layer's first kernels
+    if (node->op == GGML_OP_ARGSORT && strncmp(node->name, "les_late-", 9) == 0) {
+        ggml_metal_op_late_flush(ctx);
+        ctx->late_layer = atoi(node->name + 9);
+        ctx->late_ids = node->data;
+    }
+
     return n_fuse;
+}
+
+static void ggml_metal_op_late_flush(ggml_metal_op_t ctx) {
+    if (ctx->late_layer < 0) {
+        return;
+    }
+    ggml_metal_encoder_end_encoding(ctx->enc);
+    ggml_metal_encoder_free(ctx->enc);
+    les_late_signal(ctx->cmd_buf, ctx->late_layer, ctx->late_ids);
+    ctx->late_layer = -1;
+    ctx->late_ids = nullptr;
+    ctx->enc = ggml_metal_encoder_init(ctx->cmd_buf, ctx->use_concurrency);
+    if (ctx->mem_ranges) {
+        ggml_mem_ranges_reset(ctx->mem_ranges);
+    }
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
@@ -3461,6 +3511,14 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
 
         ++n_fuse;
 
+        // the last ADD's output may have been given an earlier input's memory (see ggml_metal_op_overlap)
+        for (int i = 0; i < n_fuse && n_fuse > 1; ++i) {
+            const ggml_tensor * last = ctx->node(idx + n_fuse - 1);
+            if ((i == 0 && ggml_metal_op_clobbers(last, op->src[0])) || ggml_metal_op_clobbers(last, ctx->node(idx + i)->src[1])) {
+                n_fuse = 1;
+            }
+        }
+
         if (debug_fusion > 1 && n_fuse > 1) {
             GGML_LOG_DEBUG("%s: fuse: ADD x %d\n", __func__, n_fuse);
         }
@@ -3721,6 +3779,15 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
 
         ++n_fuse;
+
+        // the last node's output may have been given an earlier input's memory (see ggml_metal_op_overlap);
+        // the kernel reads each row whole before writing it, so only the same elements can be shared
+        for (int i = 0; i < n_fuse && n_fuse > 1; ++i) {
+            const ggml_tensor * last = ctx->node(idx + n_fuse - 1);
+            if (ggml_metal_op_clobbers(last, i == 0 ? op->src[0] : ctx->node(idx + i)->src[1])) {
+                n_fuse = 1;
+            }
+        }
 
         if (debug_fusion > 1 && n_fuse > 1) {
             if (n_fuse == 2) {
