@@ -2643,6 +2643,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * s,
         device       char * dst,
         device       char * dst_s, // new state without snapshots (K == 1): after the attention output, or the cache
+        device const char * s_rows, // K == 1 with args.nb_s_rows > 0: the cache row of each sequence's state
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2665,7 +2666,10 @@ kernel void kernel_gated_delta_net_impl(
     // input state layout (D, K, n_seqs): per-seq stride is K*H*D; we read slot 0.
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
     const uint state_in_base = (i23*K*args.ne21 + i21)*S_v*S_v + i20*S_v;
-    device const float * s_ptr = (device const float *) (s) + state_in_base;
+    // a one-token step can read its row of the recurrent cache instead of a gathered copy
+    device const float * s_ptr = args.nb_s_rows > 0
+        ? (device const float *) (s + (uint64_t) ((device const int32_t *) s_rows)[i23]*args.nb_s_rows) + (i21*S_v + i20)*S_v
+        : (device const float *) (s) + state_in_base;
 
     float ls[NSG];
 
@@ -5748,6 +5752,65 @@ kernel void kernel_argsort_f32_i32(
 
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
+
+// MoE routing after the softmax, in one kernel: the descending argsort of kernel_argsort_f32_i32 (one
+// threadgroup per row, the same bitonic network), then the top_k probabilities normalized by their
+// sum, computed as GET_ROWS, SUM_ROWS (one simd_sum), CLAMP and DIV do (ggml_metal_op_argsort)
+kernel void kernel_argsort_topk_norm_f32(
+        constant ggml_metal_kargs_argsort_topk_norm & args,
+        device   const char * src0,
+        device      int32_t * dst,
+        device        float * dst_w,
+        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int col = tpitg[0];
+    const int i01 = tgpig[0];
+
+    device const float * src0_row = (device const float *) (src0 + args.nb01*i01);
+
+    shmem_i32[col] = col;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= ntg.x; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (shmem_i32[col] >= args.ne00 ||
+                       (shmem_i32[ixj] <  args.ne00 && src0_row[shmem_i32[col]] < src0_row[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                } else {
+                    if (shmem_i32[ixj] >= args.ne00 ||
+                       (shmem_i32[col] <  args.ne00 && src0_row[shmem_i32[col]] > src0_row[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (col < args.ne00) {
+        ((device int32_t *) ((device char *) dst + args.nb1*i01))[col] = shmem_i32[col];
+    }
+
+    if (sgitg == 0) {
+        const float w = tiisg < args.top_k ? src0_row[shmem_i32[tiisg]] : 0.0f;
+
+        const float sum = clamp(simd_sum(w), args.min, args.max);
+
+        if (tiisg < args.top_k) {
+            ((device float *) ((device char *) dst_w + args.nbw1*i01))[tiisg] = w / sum;
+        }
+    }
+}
 
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
