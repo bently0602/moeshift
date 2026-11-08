@@ -385,7 +385,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
             ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
             cb(prefetch_router_logits, "prefetch_router_logits", il);
-            lookahead_next = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth()));
+            // a view of the argsort; the runtime reads it row by row (nb[1]), so no cont
+            lookahead_next = ggml_argsort_top_k(ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth());
             cb(lookahead_next, "prefetch_topk", il);
             ggml_build_forward_expand(gf, lookahead_next);
         }
@@ -586,13 +587,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
+    // add reads the strided slices directly, so no cont per slice.
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    }
+    if (r == 1) {
+        pooled = ggml_cont(ctx0, pooled);
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, "indexer_k_pooled", il);
@@ -1094,7 +1098,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 row_total, n_seqs, conv_states_all->nb[1],
                 (size_t(back) * mctx_cur->get_size() + kv_head) * row_size);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // the copy reads the strided view directly
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;

@@ -1213,6 +1213,125 @@ nothing. This matches the report that MTP drafting was slower on a 32 GB Mac tha
 experts (N4). n-gram drafting (N2) helps only on text that repeats its context, such as code
 edits, where almost every draft is accepted.
 
+## GPU time per generated token (trace for P3–P5, B1)
+
+A Metal System Trace with the shader timeline (`MST-shaders` template, `config-source.json`,
+current build) of 10 s of steady generation with `short.json`. Shader capture worked only with
+Instruments.app open; captures of prompt processing stayed empty, so this covers generation only.
+The traced request ran at 21.9 tok/s. The keepalive kernel and window-server work are excluded.
+196 tokens were traced (7,056 delta-net calls over 36 layers):
+
+| ms per token | Share | Calls per token | Kernels |
+|---:|---:|---:|---|
+| 7.40 | 31.7% | 260 | Quantized dense mat-vecs (attention, shared expert, output head) |
+| 5.43 | 23.3% | 344 | bf16 mat-vecs: hyper-connection projections, router (read twice), PLE, indexer |
+| 4.17 | 17.8% | 192 | Routed experts (`MUL_MAT_ID`) |
+| 1.78 | 7.6% | 270 | Copies (`cpy`) |
+| 0.98 | 4.2% | 178 | Routing: argsort, softmax, sum_rows |
+| 0.83 | 3.5% | 139 | `get_rows` (routing weights, state gathers) |
+| 0.63 | 2.7% | 284 | Fused adds and muls (expert sum and other chains) |
+| 0.58 | 2.5% | 117 | Delta-net (state update, convolution, l2 norm) |
+| 1.36 | 5.8% | 793 | Unary ops, norms, other elementwise, full attention |
+| **23.4** | | **2,578** | **Total kernel time** (about 45 ms per traced token) |
+
+The GPU kernels take about half of each token's time; the rest is CPU round trips and waiting
+for expert reads. The planned merges are small against this: the expert sum (P3) is already
+partly fused by ggml-metal, routing (P4) is about 1 ms, and the delta-net norm (P5) at most about
+0.2 ms.
+
+**bf16 weights (B1).** The GGUF stores these dense matrices as bf16: per layer the four
+hyper-connection projections `hc_attn_down/up` and `hc_ffn_down/up` ([10240, 320] and [320,
+10240], 1.2 GB over 48 layers) and the router `ffn_gate_inp` (120 MiB total, read twice per token
+with prefetch), plus PLE, indexer and `ssm_alpha/beta` matrices. A microbenchmark of the Metal
+mat-vec (`/Volumes/Data/moeshift-scratch/b1/mv_bench.cpp`) at these shapes:
+
+| Mat-vec | Time | Weight bandwidth |
+|---|---:|---:|
+| bf16 [10240, 320] (`down`), 96 in a graph | 17.1–17.8 µs | 367–384 GB/s |
+| bf16 [320, 10240] (`up`), 96 in a graph | 17.3–17.8 µs | 369–379 GB/s |
+| bf16 router [2560, 512], 96 in a graph | 8.5 µs | 306 GB/s |
+| Dependent `down` → `up` chain, 96 pairs (one token's projections) | 3.55 ms per pass | 353 GB/s |
+| Large 8192 × 8192: bf16 / f16 / q8_0 / q4_K | | 374 / 370 / 320 / 259 GB/s |
+
+The bf16 kernel is the fastest measured, at Flash Next's shapes as well as large ones; a 256 MiB
+copy reached only 218 GB/s (read plus write). A better kernel would gain about 10% at most. The
+cost is the bytes: about 1.45 GB of bf16 weights per token. Storing them as Q8_0 would roughly
+halve that (estimated 4.4 → 2.4 ms per token and about 0.7 GB less memory), but it changes the
+output and needs a quality comparison (B2 in `TODO.md`).
+
+## Delta-net state written into the cache (C1a, uncommitted)
+
+A dump of the one-token decode graph found 371 copy nodes per step (about 270 dispatched; empty
+ones are skipped). By bytes, one kind dominated: after each of the 36 delta-net layers, the 3.1 MB
+recurrent state went from the kernel's output buffer to the recurrent cache with a separate copy
+(113 MB per token, read and written). The rest are small: 47 `prefetch_topk` conts of 8 ints, 36
+convolution-tail conts, 48 attention-indexer key conts and a few per attention layer.
+
+The change, all in the Metal backend:
+
+- `ggml_graph_optimize` (`ggml-metal-common.cpp`) keeps a one-token `GATED_DELTA_NET` next to the
+  `CPY` of its new-state view into the cache, when no node in between touches either. The graph
+  order put two unrelated ops between them.
+- `ggml_metal_op_gated_delta_net` binds the copy's destination as the kernel's state output and
+  skips the copy. Otherwise it binds the old place, after the attention output.
+- The kernel's one-token path (`K == 1`) writes the state through that pointer. The snapshot
+  path for multi-token rollback is unchanged.
+
+`tests/test-metal-hc-fusion` compares the merged path against a separate copy, bit for bit, for
+the cache row and the attention output; with `GGML_METAL_FUSION_DEBUG=1` it logs the merge.
+
+Three-way interleaved A/B, `config-source.json`, fresh server per round, three rounds. Each round
+was a warmup and two `short.json` requests, then `long.json`, each generating 512 tokens. Medians:
+
+| Build | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| Memory fix (commit `5335427`) | 22.85 tok/s | 20.51 tok/s | 7.42 s |
+| Phases A and B (1 row) | 22.84 tok/s | 20.36 tok/s | 7.40 s |
+| **With C1a** | **24.31 tok/s (+6.4%)** | **21.54 tok/s (+5.0%)** | 7.39 s |
+
+The C1a short-prompt runs (24.12–24.82 tok/s) did not overlap the others (at most 23.42). Every
+response matched across builds and the earlier references; peak memory stayed 9,446 MB. The gain
+is larger than the bytes alone suggest (about 1 ms at the measured copy speed), probably because
+the kernel, its barrier and the GPU's wait for it also go away; not measured separately. All three
+builds ran about 6% slower here than in earlier runs of the same code, so only the interleaved
+comparison is meaningful. The phase A and B code costs nothing at its default.
+
+## Small copies removed from the graph (C1c, uncommitted)
+
+Three groups of `cont` in `src/models/qwen4exp.cpp` copied a strided view only so that the next
+op got a contiguous input. The next ops read strided input directly:
+
+- **Prefetch guesses** (47 per token): the next layer's top-k stays a view of the argsort. The
+  expert runtime reads it row by row (`nb[1]`), which also covers multi-row decode steps.
+- **Convolution tails** (36 delta-net layers and the PLE convolution): the copy into the
+  recurrent cache reads the tail view directly.
+- **Indexer key pooling** (48, four per attention layer): the adds read the four strided member
+  slices, in the same order. Without the copies between them, the three adds are adjacent and
+  eligible for Metal's add fusion (not confirmed with the fusion log). These copies grow with
+  the context: each one holds every block's key.
+
+Interleaved A/B against C1a, same setup as above (three rounds, fresh server each). Medians:
+
+| Build | After a short prompt | After the long prompt | Long prompt |
+|---|---:|---:|---:|
+| C1a | 24.78 tok/s | 21.46 tok/s | 7.43 s |
+| **C1a and C1c** | **25.20 tok/s (+1.7%)** | **22.35 tok/s (+4.1%)** | 7.48 s |
+
+The ranges did not overlap: after the long prompt 21.42–21.49 against 22.35–22.36 tok/s, after a
+short one 24.50–24.90 against 25.01–25.34 tok/s. The larger gain after the long prompt fits the
+indexer copies growing with the context; not traced separately. The long prompt took 0.05 s longer
+(7.43–7.46 against 7.45–7.48 s); that may be noise and was not resolved.
+
+- Every response matched C1a and the earlier references.
+- With n-gram speculation (4-row steps; the code edit accepted 47 of 48 drafted tokens), all four
+  requests matched the non-speculative references.
+- Peak memory was 9,446 MB (C1a 9,445 MB), and about 10 GB with speculation, as before. The
+  reserved compute buffer shrank from 6,696 to 6,120 MiB. It is reserved, not resident, so the
+  peak does not change.
+
+The indexer still pools, normalizes and rotates every cached block's key on every token; caching
+the pooled keys is I1 in `TODO.md`.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the

@@ -1804,11 +1804,38 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
 
+    // Without snapshots the new state normally follows the attention output in dst and is then
+    // copied into the recurrent cache. When that copy comes next (ggml_graph_optimize keeps them
+    // together), the kernel writes the state to the copy's destination instead and the copy is skipped.
+    const size_t attn_bytes  = ggml_nelements(op->src[2])*sizeof(float);
+    const size_t state_bytes = ggml_nbytes(op) - attn_bytes;
+    int n_fuse = 1;
+    ggml_metal_buffer_id bid_state = ggml_metal_get_buffer_id(op);
+    bid_state.offs += attn_bytes;
+    if (ctx->use_fusion && op->src[5]->ne[1] == 1 && idx + 1 < ctx->n_nodes()) {
+        const ggml_tensor * cpy  = ctx->node(idx + 1);
+        const ggml_tensor * view = cpy->src[0];
+        if (cpy->op == GGML_OP_CPY && view && view->op == GGML_OP_VIEW && view->view_src == op &&
+                view->view_offs == attn_bytes && ggml_nbytes(view) == state_bytes && ggml_is_contiguous(view) &&
+                view->type == GGML_TYPE_F32 && cpy->type == GGML_TYPE_F32 && ggml_is_contiguous(cpy) &&
+                ctx->use_count(view) == 1 && !(view->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            if (!ggml_metal_op_concurrency_check(ctx, cpy)) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+            bid_state = ggml_metal_get_buffer_id(cpy);
+            n_fuse = 2;
+            if (ctx->debug_fusion > 0) {
+                GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY (state into %s)\n", __func__, cpy->name);
+            }
+        }
+    }
+    ggml_metal_encoder_set_buffer  (enc, bid_state,                            ida++); // new state
+
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
