@@ -178,6 +178,18 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+// true if a and b share memory. ggml-alloc reuses a tensor's memory once its last listed reader has
+// run, so a merged kernel that reads an input after that point, or writes a later node's output
+// early, must not run if the allocator gave the two the same memory.
+static bool ggml_metal_op_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->buffer == nullptr || a->buffer != b->buffer || a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
 static bool ggml_metal_op_get_rows_skipped(ggml_metal_op_t ctx, int idx);
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -620,7 +632,9 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
                 ggml_is_contiguous(op) && ggml_is_contiguous(mul) && ggml_is_contiguous(add) &&
                 x->ne[0] == ne0 && x->ne[1] == 1 && x->ne[2] == ne2 && x->ne[3] == 1 &&
                 w->ne[0] == 1 && w->ne[1] == ne1 && w->ne[2] == ne2 && w->ne[3] == 1 &&
-                ne3 == 1 && ggml_are_same_shape(r, add) && ggml_nelements(add) <= INT32_MAX) {
+                ne3 == 1 && ggml_are_same_shape(r, add) && ggml_nelements(add) <= INT32_MAX &&
+                // the ADD's output may have been given the memory of x or w, which every stream reads
+                !ggml_metal_op_overlap(add, x) && !ggml_metal_op_overlap(add, w)) {
             for (int i = 1; i < 3; ++i) {
                 if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
                     ggml_metal_op_concurrency_reset(ctx);
@@ -859,6 +873,14 @@ static int ggml_metal_op_hc_mix_tail(ggml_metal_op_t ctx, int idx) {
         if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
             return 0;
         }
+    }
+    // the output belongs to the last node, which may have been given the inputs' memory. One token may
+    // write over the start of xn or g: each thread reads its own element there before writing it.
+    const auto clobbers = [&](const ggml_tensor * src) {
+        return ggml_metal_op_overlap(scale, src) && !(nt == 1 && scale->data == src->data);
+    };
+    if (clobbers(g) || clobbers(mul->src[0])) {
+        return 0;
     }
     for (int i = 1; i < n_fuse; ++i) {
         if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
@@ -1319,16 +1341,18 @@ static int ggml_metal_op_gdn_state_rows(ggml_metal_op_t ctx, int idx) {
         return -1;
     }
 
-    // reading the cache later than the GET_ROWS would is safe only if nothing in between writes it or the index
+    // reading the cache later than the GET_ROWS would is safe only if nothing in between writes it or the
+    // index. The GET_ROWS is the index's last listed reader, so the allocator may also have given the
+    // index's memory to any tensor written up to and including the kernel.
     const ggml_tensor * cache = src->view_src ? src->view_src : src;
     const ggml_tensor * ids   = rows->src[1]->view_src ? rows->src[1]->view_src : rows->src[1];
     for (int j = idx - 1; j >= 0 && j >= idx - MAX_DIST; --j) {
         const ggml_tensor * t = ctx->node(j);
         if (t == rows) {
-            return j;
+            return ggml_metal_op_overlap(op, rows->src[1]) ? -1 : j;
         }
         const ggml_tensor * base = t->view_src ? t->view_src : t;
-        if (base == cache || base == ids) {
+        if (base == cache || base == ids || ggml_metal_op_overlap(t, rows->src[1])) {
             return -1;
         }
     }
@@ -4524,6 +4548,14 @@ static int ggml_metal_op_argsort_topk_norm(ggml_metal_op_t ctx, int idx) {
             div->op != GGML_OP_DIV || div->src[0] != w2d || div->src[1] != clamp || !ggml_is_contiguous(div) ||
             ctx->use_count(rows) != 1 || ctx->use_count(w2d) != 2 || ctx->use_count(sum) != 1 || ctx->use_count(clamp) != 1 ||
             ((rows->flags | w2d->flags | sum->flags | clamp->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    // DIV comes after the probabilities' last reader, so its output may have been given their memory.
+    // One row is safe: its threadgroup reads them all before it writes. With several rows, another
+    // threadgroup may still be sorting a row that this one overwrites.
+    if (probs->ne[1] > 1 && (ggml_metal_op_overlap(div, probs) || ggml_metal_op_overlap(div, sort) ||
+                             ggml_metal_op_overlap(sort, probs))) {
         return 0;
     }
 
