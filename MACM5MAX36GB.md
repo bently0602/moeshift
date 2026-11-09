@@ -512,6 +512,10 @@ slots (see [Protected decode slots](#protected-decode-slots-p0); the previous fi
 
 It also sets `"cache-ram": 4096` (see [Prompt cache limit](#prompt-cache-limit-m2-uncommitted);
 the previous file is `config-source.json.bak-cram8192`).
+Since N2 it also drafts from repeated text, with 2-row checks
+(`"spec-type": "ngram-simple"`, `"spec-draft-n-max": 1`, `env.LLAMA_MOE_DECODE_ROWS: 2`; see
+[n-gram drafting](#n-gram-drafting-on-agent-style-output-n2-measurement); the previous file is
+`config-source.json.bak-nospec`).
 
 The Homebrew build rejects this file, because its validator still requires
 depth 3 when protected slots are on. The main `config.json` stays compatible
@@ -2120,6 +2124,82 @@ identically from the bank (4k: 8.76 s, 6k: 12.11 s, as before M1).
 - Contexts above 42k tokens.
 - Qwen3.6, whose profile also uses the pipeline.
 - The Homebrew build, which keeps the copy into the bank.
+
+## n-gram drafting on agent-style output (N2 measurement)
+
+N2 drafts tokens by looking up the last few generated tokens in the context and proposing what
+followed them there; one multi-row decode step then checks the draft. The server's n-gram
+drafters and multi-row checks under LES already work (phases A and B). Since P0 removed the
+protected slots, the 20-slot decode windows allow checks of 2 rows (1 drafted token).
+
+### How much output can be drafted
+
+Greedy reference outputs (`config-source.json`, thinking off unless noted) for eight tasks with
+real repository files as context: an edit tool call (`tools` field), the same with thinking on,
+rewriting a Python function, reproducing a 169-line C++ file with comments added, explaining code
+with quotes, editing a JSON config, `short.json` (a story) and a summary of `long.json`. A harness
+(`/Volumes/Data/moeshift-scratch/n2/replay.cpp`) replayed the server's own drafters over the
+reference tokens the way the server drives them; for greedy decoding this gives exactly the
+drafts and acceptances a real run would see. Predicted speedups, with a check of k drafted tokens
+costing 1 + 0.483·k single steps (from the earlier 4-row measurement):
+
+| Task | Draft 1 token | Draft 3 | Draft 7 |
+|---|---:|---:|---:|
+| Reproduce a whole file | 1.31× | 1.54× | 1.69× |
+| Edit a JSON config | 1.31× | 1.53× | 1.67× |
+| Rewrite a function | 1.22× | 1.35× | 1.38× |
+| Edit tool call | 1.08× | 1.07× | 1.03× |
+| Thinking before an edit | 1.05× | 1.04× | 1.04× |
+| Explain code with quotes | 1.04× | 1.03× | 1.02× |
+| Story, summary | 1.00× | 1.00× | 1.00× |
+
+Best drafter per cell; `ngram-simple` with its default 12-token key was best or close everywhere,
+and never drafted on prose. Short keys (3 tokens) drafted on prose and would have slowed it by up
+to 36%. Tool calls gain little because code inside JSON arguments is escaped (`\n`, `\"`) and no
+longer matches the source in the context; in this run the model also wrote prose first.
+
+### End-to-end
+
+`spec-type: ngram-simple`, against the same build without speculation (two interleaved rounds for
+2 rows, one for 3 and 4):
+
+| Task | No speculation | 2 rows | 3 rows (10 protected slots) | 4 rows (24 protected slots) |
+|---|---:|---:|---:|---:|
+| Reproduce a whole file | 20.63 / 20.68 tok/s | **25.39 / 25.48** | 26.91 | **32.31** |
+| Edit a JSON config | 22.65 / 22.45 | **27.86 / 27.95** | 29.61 | **35.77** |
+| Rewrite a function | 19.99 / 20.04 | **22.34 / 22.72** | 22.98 | **26.11** |
+| Edit tool call | 21.09 / 20.50 | 21.44 / 20.36 | 20.90 | 22.20 |
+| Story | 24.46 / 24.58 | 24.38 / 23.44 | 23.59 | 24.46 |
+| Summary (6k prompt) | 20.62 / 21.43 | 21.38 / 21.40 | 20.69 | 21.53 |
+
+Every response matched the reference (tool calls apart from their random ids). Over 99% of
+2-row drafts were accepted on the copy-heavy tasks. A 2-row check cost about 1.6 single steps
+(whole-file run). The 4-row runs gained more than predicted, probably because the protected
+slots also hold experts the drafted rows need. Drafting took 2.3 ms in total over 1,034 steps.
+
+Memory (system-wide and footprint peaks, `mem.sh` sequence, one run each):
+
+| Setting | 72 tokens + 512 generated | 4k | 6k + 512 generated | 42k |
+|---|---:|---:|---:|---:|
+| No speculation | 6.99 GB fp | 8.18 GB | 8.56 GB | 13.61 GB |
+| 2 rows, `spec-draft-n-max: 1` | 7.10 GB | 8.30 GB | 8.80 GB | 13.70 GB |
+| 4 rows, 24 protected slots | 9.35 GB | 9.35 GB | 10.07 GB | 13.93 GB |
+
+With 2 rows the cost is one recurrent-state snapshot (`spec-draft-n-max: 1`; the default 3
+keeps three). The 24 protected slots add about 2.4 GB while generating, which now sets the peak
+for prompts up to about 6k tokens.
+
+### Setting
+
+`config-source.json` now uses the 2-row option. Through the router, the config-editing task ran
+at 28.93 tok/s with 365 of 373 drafts accepted and the reference output. The shipped profile is
+unchanged: its prefetch depth of 3 gives 15-slot windows, which allow only 1 row, so speculation
+would be disabled with a message.
+
+### Not tested
+
+- Real agent sessions; how much of an agent's output is copy-heavy decides the overall gain.
+- Thinking output beyond the one task (no gain there), and `q8_0` KV.
 
 ## Tool calling
 
