@@ -2022,8 +2022,8 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_buffer state_data_tgt;
+    common_state_buffer state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -2128,17 +2128,33 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+void server_prompt_cache::evict_one(const char * limit) {
+    // drop the oldest entry that is cheap to reprocess (under a quarter of the largest entry's
+    // tokens), else the oldest: short side requests, such as an agent's title requests, go
+    // before the long conversation they interrupt, and long conversations replace each other in order
+    int n_max = 0;
+    for (const auto & state : states) {
+        n_max = std::max(n_max, state.n_tokens());
+    }
+
+    auto it = std::find_if(states.begin(), states.end(), [n_max](const server_prompt & state) {
+        return 4ll*state.n_tokens() < n_max;
+    });
+    if (it == states.end()) {
+        it = states.begin();
+    }
+
+    SRV_WRN(" - cache %s limit reached, removing entry with %d tokens (size = %.3f MiB)\n",
+            limit, it->n_tokens(), it->size() / (1024.0 * 1024.0));
+
+    states.erase(it);
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         // always keep at least one state, regardless of the limits
         while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one("size");
         }
     }
 
@@ -2150,14 +2166,7 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one("token");
         }
     }
 

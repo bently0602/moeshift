@@ -46,6 +46,7 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -2034,6 +2035,36 @@ bool common_prompt_batch_decode(
     }
 
     return true;
+}
+
+void * common_pages_alloc(size_t size) {
+    if (size == 0) {
+        return nullptr;
+    }
+#if defined(_WIN32)
+    void * ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+#else
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (ptr == MAP_FAILED) {
+        throw std::bad_alloc();
+    }
+#endif
+    return ptr;
+}
+
+void common_pages_free(void * ptr, size_t size) {
+    if (ptr == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    GGML_UNUSED(size);
+    VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+    munmap(ptr, size);
+#endif
 }
 
 size_t common_prompt_checkpoint::size() const {

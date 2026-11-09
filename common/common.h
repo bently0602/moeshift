@@ -1081,14 +1081,36 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Large state copies (context checkpoints, the server's prompt cache) take their pages straight
+// from the VM and return them when freed. macOS malloc keeps freed large blocks dirty in the
+// process, where they still count as memory and can be compressed or swapped.
+void * common_pages_alloc(size_t size);
+void   common_pages_free(void * ptr, size_t size);
+
+template <typename T>
+struct common_page_allocator {
+    using value_type = T;
+
+    common_page_allocator() = default;
+    template <typename U> common_page_allocator(const common_page_allocator<U> &) noexcept {}
+
+    T * allocate(size_t n) { return static_cast<T *>(common_pages_alloc(n * sizeof(T))); }
+    void deallocate(T * p, size_t n) noexcept { common_pages_free(p, n * sizeof(T)); }
+
+    template <typename U> bool operator==(const common_page_allocator<U> &) const noexcept { return true; }
+    template <typename U> bool operator!=(const common_page_allocator<U> &) const noexcept { return false; }
+};
+
+using common_state_buffer = std::vector<uint8_t, common_page_allocator<uint8_t>>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_buffer data_tgt;
+    common_state_buffer data_dft;
 
     size_t size() const;
 

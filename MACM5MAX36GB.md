@@ -510,6 +510,9 @@ slots (see [Protected decode slots](#protected-decode-slots-p0); the previous fi
 +        "LLAMA_MOE_PROTECTED_SLOTS": 0
 ```
 
+It also sets `"cache-ram": 4096` (see [Prompt cache limit](#prompt-cache-limit-m2-uncommitted);
+the previous file is `config-source.json.bak-cram8192`).
+
 The Homebrew build rejects this file, because its validator still requires
 depth 3 when protected slots are on. The main `config.json` stays compatible
 with Homebrew, for comparisons. To run the source build with the faster
@@ -1914,8 +1917,8 @@ system-wide figure is lower.
 - **A 256-slot prefill bank**: the worker aborts; a 6,144-token batch uses more than 256 of a
   layer's 512 experts.
 - **No prompt cache** (`LLAMA_ARG_CACHE_RAM=0`): 0.25 GB less on the long prompt. Kept: it lets a
-  client switch between conversations without reprocessing them. Its 8,192 MiB limit was not
-  tested; filled with several long conversations it could reach that size.
+  client switch between conversations without reprocessing them. Its limit is now 4,096 MiB (see
+  [Prompt cache limit](#prompt-cache-limit-m2-uncommitted)).
 
 ### Not tested
 
@@ -1924,6 +1927,114 @@ system-wide figure is lower.
 - Prefill straight from the staging buffers, which would remove the 1,138 MiB bank copy (see
   TODO).
 - The Homebrew build.
+
+## Prompt cache limit (M2, uncommitted)
+
+The worker has one slot. When a request does not continue the conversation in it, the server saves
+the slot's state (KV cache, recurrent state and its context checkpoint) to the prompt cache and
+restores the closest saved state for the new request, if there is one. When the cache exceeds
+`--cache-ram` (8,192 MiB by default), entries are dropped (upstream: oldest first; now cheap ones
+first, see [Eviction order](#eviction-order)), but the newest is always kept. A restored entry
+leaves the cache. Agent clients rely on this: title requests, subagents and
+summaries between turns each replace the main conversation in the slot.
+
+### Entry size
+
+From the server's log (`config-source.json`, `f16` KV): 240.5 MiB for 583 tokens, 398.7 MiB for
+6,571 and 1,346 MiB for 42,389. That is about 225 MiB fixed (113 MiB recurrent state and a
+113 MiB checkpoint) plus 27 KiB per token, about 1.9 GiB at 64k. 8 GiB holds about 34 short
+requests, so ordinary side requests fill it.
+
+### Agent-style session
+
+Twenty requests on a fresh worker: a 42,389-token conversation continued three times with its own
+replies (M1–M4), with side requests between turns: one title request before M2; a 3,996-token
+"subagent" prompt and two title requests before M3; 12 title requests before M4. Prompt time of the
+main turns:
+
+| `cache-ram` | M2 | M3 | M4 | Cache before M4 |
+|---|---:|---:|---:|---|
+| 8192 | 1.74 s | 2.59 s | 3.33 s | 16 entries, 5,023 MiB |
+| **4096** | **1.74 s** | **2.56 s** | **3.24 s** | 12 entries, 4,067 MiB (the four oldest side entries dropped) |
+| 2048 | 1.72 s | 2.54 s | 89.64 s | 8 entries, 1,910 MiB (main conversation dropped) |
+| 1024 | 1.64 s | 89.02 s | 89.62 s | 4 entries, 955 MiB |
+| 0 | 88.51 s | 88.49 s | 88.68 s | — |
+
+All 20 responses were identical at every limit, so restoring from the cache gives the same output
+as reprocessing. Saving or restoring an entry took 14–170 ms. With oldest-first eviction (these
+runs), the main conversation is lost when the side requests saved between two of its turns exceed
+the limit minus its own size.
+
+### Freed entries stayed in the process
+
+With 4096, the process footprint at the end was 14.6 GB, against 8.5 GB without the cache,
+although the cache held 2.9 GB. `vmmap` showed why: macOS malloc keeps freed large blocks (each
+restored, dropped or replaced entry) as 128 MiB chunks for reuse, still dirty. They took 4.4 GB:
+2.7 GB resident and 1.8 GB already compressed. Under memory pressure they would be swapped like
+live data. `malloc_zone_pressure_relief` after each cache update released none of them.
+
+Context checkpoints and prompt-cache states now use `common_state_buffer`
+(`common/common.h`), a vector whose pages come from `mmap` and return with `munmap`. Same
+session with 4096:
+
+| | malloc | Page-backed |
+|---|---:|---:|
+| Footprint at the end | 14.6 GB | **10.8 GB** |
+| Freed large blocks kept | 4.4 GB | 0.7 GB (as with the 6,571-token session without a cache) |
+| System-wide, last four requests | 15.0–15.7 GB | 11.4–12.6 GB |
+| Restoring the 42k entry | 170 ms | 79 ms |
+
+Responses were identical, and prompt times were the same.
+
+### 64k conversation
+
+The same session with a 63,286-token main conversation (63,429 by M4), page-backed build, 4096:
+
+| | Oldest first | Cheap first |
+|---|---:|---:|
+| M1, read from scratch | 159.9 s | 159.0 s |
+| M2, M3 | 1.74 s, 2.45 s | 1.73 s, 2.43 s |
+| M4, after 12 side requests | **160.9 s** (dropped at the 11th) | **2.93 s** |
+| Entries dropped | five short, the subagent, then the main conversation | five short, the subagent |
+
+The 64k entry took 1,900 MiB, leaving room for about nine short entries. Peak memory during the
+63k prompt was 16.8 and 17.9 GB system-wide in the two runs (42k: 16.2–16.5 GB), and 17.9 GB
+when the main conversation was reprocessed with 2.9 GB in the cache. A 64k prompt with a full
+4 GiB cache should stay near 21 GB (not measured). The footprint at the end was 11.5 GB. All
+20 responses matched between the two runs, including M4, which one run restored and the other
+reprocessed. Swap did not grow (806 → 817 MB, from other activity).
+
+### Eviction order
+
+Upstream drops the oldest entry first. Each side request is saved after the conversation it
+interrupted, so a burst of them pushes that conversation out, although it is by far the most
+expensive to reprocess (160 s against about 4 s for a title request).
+
+`server_prompt_cache::evict_one` (`tools/server/server-task.cpp`) now drops the oldest entry with
+fewer than a quarter of the largest entry's tokens, and only then the oldest of the rest. Short
+side requests and small subagent prompts go first; long conversations replace each other oldest
+first, so an unused one leaves as soon as another long one needs the room. In a simulation with
+the measured entry sizes, a 42k or 64k conversation survived 40 consecutive short side requests at
+4096. A greedy-dual-size order (prompt tokens per MiB, aged by evictions) was tried first and
+dropped: it ranked a stale 64k conversation above a recently used 42k one, and aged so slowly that
+an unused long conversation stayed indefinitely. The 42k session with cheap-first eviction
+behaved as before (M2–M4 1.63, 2.31 and 2.82 s; identical responses).
+
+### Setting
+
+`cache-ram` is now a profile option. `config-source.json` and the Flash Next profile in
+`configs/moeshift.json` use 4096: with cheap-first eviction it kept the main conversation through
+all side requests above at 42k and 64k, while halving the worst case to 4 GiB. Several long conversations in turn need more; raise it, or
+lower it to trade reprocessing for memory. `config.json` stays without it, because the Homebrew
+build rejects the option.
+
+### Not tested
+
+- Real agent clients; the session above imitates their side requests.
+- `q8_0` KV (smaller entries).
+- Several long conversations in turn with cheap-first eviction (only simulated).
+- The Homebrew build, which keeps the 8 GiB default, oldest-first eviction and the malloc
+  behavior.
 
 ## Tool calling
 
