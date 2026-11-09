@@ -145,10 +145,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // LES always serves one inference at a time with the experts page cache enabled.
+    // LES always serves one inference at a time. Expert reads during decode go through the file
+    // cache, which serves most decode misses; prefill reads bypass it, because a prefill reads every
+    // expert once and would otherwise replace the experts decode keeps cached, which the next
+    // prefill also hits.
     params.n_parallel = 1;
     params.hostname = "127.0.0.1";
-    setenv("LLAMA_MOE_F_NOCACHE", "0", 1);
+    setenv("LLAMA_MOE_F_NOCACHE", "auto", 1);
 
     // A speculative check of n drafted tokens is one decode step of n + 1 rows. Wider steps would
     // leave the decode phase, so drafts are capped to the decode rows the expert windows allow.
@@ -172,6 +175,10 @@ int main(int argc, char ** argv) {
     }
     // Enable growing KV buffers for LES; other clients retain the original allocator.
     setenv("LLAMA_KV_GROW", "1", 1);
+    // Only the newest context checkpoint is useful to the next request, which restores the one
+    // 4 tokens before this prompt's end. A minimum spacing skipped it after short messages, so the
+    // next request reprocessed the whole message.
+    params.checkpoint_min_step = 0;
     params.n_batch = params.n_ubatch = params.les_prefill_max_tokens;
     params.moe_slot_bank = params.les_prefill_bank;
     setenv("LLAMA_LES_DECODE_BANK", std::to_string(params.les_decode_bank).c_str(), 1);

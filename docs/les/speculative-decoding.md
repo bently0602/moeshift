@@ -18,9 +18,11 @@ the model profile:
   rows); speculation needs `LLAMA_MOE_PROTECTED_SLOTS` back above 0.
 - Drafts are capped at `rows - 1` tokens (`LLAMA_SPEC_DRAFT_CAP`, set by the worker), so a check
   never leaves the decode phase. n-gram drafts, which ignore `spec-draft-n-max`, are truncated.
-- A batch of several tokens counts as decode only while the decode phase is active. The last
-  tokens of a prompt still use the prefill phase. The context, the graph and the expert runtime
-  share this decision (`llama_moe_slot_runtime::decode_step`).
+- Any batch of at most `LLAMA_MOE_DECODE_ROWS` tokens runs in the decode phase, so the first check
+  right after a prompt uses the windows too. (Earlier, a multi-token batch counted as decode only
+  once the decode phase was active; a reply whose every step was a check then never left the
+  prefill phase.) Prompt tails are 4 tokens, so with 2 rows they still use prefill. The context,
+  the graph and the expert runtime share this decision (`llama_moe_slot_runtime::decode_step`).
 - The profile also accepts `spec-draft-model` (resolved like `model`), `spec-draft-n-max`,
   `spec-draft-n-min` and `spec-draft-ngl`.
 

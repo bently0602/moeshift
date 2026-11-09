@@ -2425,10 +2425,12 @@ install_timing start_demand(
     // Set by LLAMA_MOE_DECODE_ROWS (default 1) and bounded by the narrowest window, because every
     // expert of every row must be resident at once.
     int32_t window_max_rows = 1;
-    // A batch of several tokens stays in the decode phase only when that phase is already active,
-    // so speculative checks keep the windows while the last tokens of a prompt still use prefill.
+    // Any batch the windows can hold runs in the decode phase, including the first speculative
+    // check right after a prompt, which would otherwise read its experts through the shared bank.
+    // Prompt tails are 4 tokens (the server's last checkpoint offset), so with 2 rows they still use
+    // prefill.
     bool decode_rows(int32_t n_rows) const {
-        return n_rows == 1 || (n_rows <= window_max_rows && adaptive_decode);
+        return n_rows <= window_max_rows;
     }
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。
     ///
@@ -3130,6 +3132,19 @@ void llama_moe_slot_runtime::process(
 
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
 
+    // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
+    //
+    // 判据用批宽而不是 window_mode —— 后者还要求 decode 窗口开着，而窗口关掉时
+    // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
+    // moe_decode_phase 同源。默认（非 auto）下这段不生效。
+    if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
+        const bool want = !pimpl->decode_rows(n_rows);
+        if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
+            pimpl->want_nocache.store(want, std::memory_order_relaxed);
+            pimpl->apply_experts_nocache(want);
+        }
+    }
+
     // The graph reads staged views exactly when the context switched to the staged phase.
     const bool pipelined_prefill = pimpl->prefill_pipeline_enabled(n_rows);
     if (pipelined_prefill != pimpl->staged) {
@@ -3173,19 +3188,6 @@ void llama_moe_slot_runtime::process(
     if (!window_mode && pimpl->was_window) {
         pimpl->lookahead.drain();
         pimpl->drain_late();
-    }
-
-    // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
-    //
-    // 判据用批宽而不是 window_mode —— 后者还要求 decode 窗口开着，而窗口关掉时
-    // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
-    // moe_decode_phase 同源。默认（非 auto）下这段不生效。
-    if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
-        const bool want = !pimpl->decode_rows(n_rows);
-        if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
-            pimpl->want_nocache.store(want, std::memory_order_relaxed);
-            pimpl->apply_experts_nocache(want);
-        }
     }
 
     // **只在窗口模式下**需要在加锁之前等预读收工。

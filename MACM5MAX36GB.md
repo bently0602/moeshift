@@ -671,7 +671,8 @@ In steady state, 96 to 240 of them missed the per-layer cache (12 recent +
 150 misses and 250 MB of expert reads per token. Only about 58 MB per token
 came from the SSD; macOS's file cache served the rest, because expert reads do
 not bypass it by default. Bypassing the file cache (`LLAMA_MOE_F_NOCACHE`)
-would therefore slow generation.
+would therefore slow generation. (Prefill now bypasses it; see
+[File cache](#file-cache-prefill-bypasses-it).)
 
 **Prefetch accounting.** The final log reports `lookahead-prefetch: hits=0`.
 That counter is only updated outside window mode, and generation always runs in
@@ -2155,8 +2156,13 @@ costing 1 + 0.483·k single steps (from the earlier 4-row measurement):
 
 Best drafter per cell; `ngram-simple` with its default 12-token key was best or close everywhere,
 and never drafted on prose. Short keys (3 tokens) drafted on prose and would have slowed it by up
-to 36%. Tool calls gain little because code inside JSON arguments is escaped (`\n`, `\"`) and no
-longer matches the source in the context; in this run the model also wrote prose first.
+to 36%. The edit task gains little overall because most of it is prose: the model reasoned for
+390 tokens before its 187-token tool call. The call itself drafts well, since this model's chat
+template writes arguments as XML-style parameters with the code unescaped
+(`<parameter=old_string>` followed by the code as it appears in the file). Within the call,
+`ngram-simple` with a 12-token key gives 1.12× (1 drafted token) and 1.16× (3); a 6-token key
+1.17× and 1.24×, because it resyncs sooner after each changed line, but it also drafts on prose.
+Drafting through JSON escaping, considered for tool calls, would gain nothing with this model.
 
 ### End-to-end
 
@@ -2200,6 +2206,97 @@ would be disabled with a message.
 
 - Real agent sessions; how much of an agent's output is copy-heavy decides the overall gain.
 - Thinking output beyond the one task (no gain there), and `q8_0` KV.
+
+## Per-turn prompt latency (uncommitted)
+
+In an agent session each turn appends new text (tool output, a file) to a cached conversation,
+and the wait before the reply is mostly its prefill. Two growing conversations
+(`/Volumes/Data/moeshift-scratch/turns/turns.py`) appended messages of about 64 to 4,000 tokens
+of C++ source in shuffled order, with `config-source.json` settings (2-row n-gram drafting) and
+16-token replies.
+
+### What a turn costs
+
+- **Expert reads set a floor of about 4.5–6 s from a few hundred tokens up.** A batch of 1,024
+  tokens or more reads all 40 GB of experts (about 8.8–9.3 GB/s here, SSD plus file cache; the SSD
+  alone reads about 7.2 GB/s). Smaller batches read only the experts they use, but by about 500
+  tokens that is most of them, read slot by slot. A 79-token turn took 2.2 s, 485 tokens 5.6 s,
+  1,200 tokens 6.7 s, 4,400 tokens 7.3 s. There is no step at 1,024 tokens.
+- **Extra small batches.** The server split each turn at the start of the latest user message (a
+  batch of about 9 tokens) and before the last 4 tokens. With one checkpoint kept, the first split
+  is useless: the checkpoint before the last 4 tokens replaces it in the same prompt.
+- **Reprocessing after short messages.** Checkpoints had to be at least 256 tokens apart, so after
+  a shorter message no checkpoint was taken near its end, and the next turn restored the older one
+  and processed the short message again: 310 tokens in 7.39 s for a 64-token turn, 3,488 tokens in
+  11.0 s for a 3,000-token turn.
+- **Replies that stay in the prefill phase.** A 2-token speculative check right after the prompt
+  counted as prefill (multi-token batches were decode only once decode was active), so when every
+  step drafted, a whole reply ran as 2-token prefill batches reading experts through the bank.
+
+### Changes
+
+- `server-les.cpp` sets `checkpoint_min_step` to 0: the checkpoint 4 tokens before each prompt's
+  end is always taken (it replaces the previous one; creating it took a few milliseconds).
+- `server-context.cpp` does not split the batch before the latest user message when only one
+  checkpoint is kept and there is no minimum spacing.
+- `decode_rows` in `src/llama-moe-slot.cpp`: every batch of at most `LLAMA_MOE_DECODE_ROWS` tokens
+  runs in the decode phase.
+
+Same two conversations, committed build against these changes:
+
+| Turn | Before | After |
+|---|---:|---:|
+| 3,000 tokens after a 128-token turn | 3,488 processed, 10.42 s | 3,292 processed, **6.98 s** |
+| 64 tokens after a 128-token turn | 310 processed, 7.39 s | 134 processed, **3.55 s** |
+| 768 tokens after a 64-token turn | 680 processed, 6.32 s | 605 processed, **5.61 s** |
+| Other turns | | 0.2–0.45 s faster each (one 9-token batch fewer), some within ±0.3 s |
+| Total prompt time, conversation A / B | 67.6 / 69.0 s | **61.2 / 64.7 s** |
+
+All 22 replies matched the committed build. The n-gram speed tests (N2) gave the same speeds and
+outputs with these changes: in those tasks drafting did not start on the first step.
+
+### File cache: prefill bypasses it
+
+Expert reads went through macOS's file cache in every phase. SSD traffic (`iostat`) and expert
+residency (`mincore` on the layer files, `/Volumes/Data/moeshift-scratch/pc`) around single
+requests showed:
+
+- About 14–15 GB of experts fit in the file cache next to the worker.
+- **Prefill hit almost nothing:** a staged prefill reads all 48 layers in order, 40.9 GB through a
+  14 GB cache, so each layer was evicted before it was needed again (40.5 and 38.9 GB read from the
+  SSD). Afterwards only layers 34–47 were cached; generation then started with a cold cache.
+- Generation read about 75–95 MB per token from the SSD and kept 300–400 MB per layer cached.
+
+The worker now sets `LLAMA_MOE_F_NOCACHE=auto` (it forced `0` before): prefill reads use
+`F_NOCACHE`, decode reads go through the cache (`process()` in `src/llama-moe-slot.cpp` switches
+the expert files at each phase change, now also before staged batches). Prefill still finds what
+decode left cached, and no longer replaces it. Bypassing the cache in every phase (`1`) would slow
+generation, as measured in G1.
+
+| Request | Cached prefill: SSD, prompt | Prefill bypass: SSD, prompt | First 16 layers kept cached in prefill |
+|---|---:|---:|---:|
+| 4k prompt, first | 39.5 GB, 6.45 s | 34.3 GB, 5.85 s | 37.3 GB, 6.20 s |
+| 6k prompt + 512 tokens | 83.3 GB, 7.39 s | 78.4 GB, 7.04 s | 73.8 GB, 7.35 s |
+| 4k prompt again | 38.7 GB, 6.38 s | **27.9 GB, 4.86 s** | 37.1 GB, 6.22 s |
+| 72 tokens + 512 tokens | 43.3 GB, 2.12 s | 42.8 GB, 1.79 s | 44.8 GB, 2.01 s |
+
+Generation ran at 22.0–22.1 and 24.5–24.9 tok/s in all three; outputs were identical. Keeping a
+fixed set of layers cached during prefill did not hold: decode reads evicted them between prompts.
+
+The two conversations, the per-turn changes alone against both:
+
+| | Per-turn changes | + prefill bypass |
+|---|---:|---:|
+| Total prompt time, conversation A / B | 61.6 / 62.2 s | **52.7 / 53.4 s** |
+| Each turn | | 0.4–1.1 s faster |
+
+All replies matched. With 16-token replies, generation warmed the cache only a little between
+turns; longer replies should leave more for the next prefill (not measured).
+
+### Not tested
+
+- Thinking turns, whose re-rendered history drops the reasoning and may need longer rollbacks.
+- Clients that edit or regenerate the last user message, which used the checkpoint before it.
 
 ## Tool calling
 
