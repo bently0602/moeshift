@@ -8,6 +8,7 @@
         "moe-experts": "/path/to/experts",
         "ctx-size": 65536,
         "ctx-checkpoints": 1,
+        "cache-ram": 4096,
         "prefill-max-tokens": 3072,
         "moe-prefill-bank": 512,
         "moe-decode-bank": 0,

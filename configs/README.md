@@ -69,6 +69,7 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `args.model`, `args.moe-experts` | First GGUF shard and matching expert directory/manifest; required paths |
 | `args.alias` | Model ID; must equal its key under `models` |
 | `args.ctx-size`, `args.ctx-checkpoints` | `65536` tokens; `1` checkpoint |
+| `args.cache-ram` | `4096` MiB for Flash Next; unset (`8192`) for Qwen3.6. Saved states of earlier conversations, restored when a request continues one instead of reprocessing it. Above the limit, the oldest entry under a quarter of the largest entry's tokens is dropped first (short side requests before the long conversation they interrupt), then the oldest; the newest is always kept. `0` disables it. A Flash Next entry takes about 225 MiB plus 27 KiB per token with `f16` KV ([measurements](../MACM5MAX36GB.md#prompt-cache-limit-m2-uncommitted)) |
 | `args.threads` | `10` CPU threads |
 | `args.prefill-max-tokens` | `3072` tokens per prefill microbatch |
 | `args.moe-prefill-bank`, `args.moe-decode-bank` | `512` / `256` shared expert slots during prefill (Flash Next / Qwen3.6); larger banks use more RAM; `0` shared slots retained during decode |

@@ -5,7 +5,7 @@
 #include <string>
 
 inline const std::set<std::string> moeshift_model_options{
-    "model", "moe-experts", "ctx-size", "ctx-checkpoints", "prefill-max-tokens",
+    "model", "moe-experts", "ctx-size", "ctx-checkpoints", "cache-ram", "prefill-max-tokens",
     "moe-prefill-bank", "moe-decode-bank", "n-gpu-layers", "flash-attn",
     "cache-type-k", "cache-type-v", "threads", "no-mmap", "alias",
     "spec-type", "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min", "spec-draft-ngl"};

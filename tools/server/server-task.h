@@ -565,8 +565,8 @@ struct server_task_result_apply_lora : server_task_result {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_buffer main;
+    common_state_buffer drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -628,4 +628,6 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
+
+    void evict_one(const char * limit);
 };
