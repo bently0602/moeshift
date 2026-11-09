@@ -11,9 +11,9 @@ Edit the model profile in `~/.config/moeshift/config.json`:
 | Profile entry | Default | Effect |
 |---|---:|---|
 | `args.prefill-max-tokens` | `3072` | Maximum logical batch and physical microbatch size. Smaller batches reduce peak working memory. |
-| `args.moe-prefill-bank` | `512` / `256` | Shared expert slots used during prefill. A larger bank can reduce SSD reads, using more memory. |
+| `args.moe-prefill-bank` | `512` / `256` | Shared expert slots used by prefill batches that do not use the pipeline (under 1,024 tokens, or with the pipeline off). A larger bank can reduce SSD reads, using more memory. |
 | `args.moe-decode-bank` | `0` | Shared expert slots retained during decode; must be smaller than the prefill bank. Per-layer decode windows remain allocated separately. |
-| `env.LLAMA_MOE_PREFILL_PIPELINE` | `1` | Overlap prefill expert reads with computation. |
+| `env.LLAMA_MOE_PREFILL_PIPELINE` | `1` | Read whole layers ahead into a staging buffer and compute batches of 1,024 tokens or more from it. `0` uses the shared bank for every batch. |
 
 The three `args` entries also accept CLI overrides with the corresponding
 `--` names. Runtime tuning is read from JSON, not inherited shell exports.
@@ -23,15 +23,20 @@ slots; see [protected decode cache](protected-decode-cache.md).
 ## Execution and phase transitions
 
 The server fills each batch with available prompt tokens up to the configured
-limit. Context checkpoints can split it further. The shared bank is reused across
-layers: 512 slots cover Flash Next's 512 experts;
+limit. Context checkpoints can split it further; the last few tokens of a prompt
+usually form their own batch. Batches of 1,024 tokens or more use the prefill
+pipeline (below). Smaller ones read only the experts they use into the shared
+bank, which is reused across layers: 512 slots cover Flash Next's 512 experts;
 256 cover Qwen3.6's 256 experts.
 
-Before switching phases, the runtime synchronizes GPU work and drains expert
-readers. It invalidates cached mappings and sets the active Metal buffer ranges
-for the new phase. During decode, the unused shared-bank ranges are released;
-the per-layer decode windows and protected cache remain available. During
-prefill, the decode windows are released the same way. Each switch replaces the
+There are three expert memory phases: decode (per-layer windows), prefill (the
+shared bank) and staged prefill (the pipeline's staging buffer). Before
+switching, the runtime synchronizes GPU work and drains expert readers. It
+invalidates cached mappings and sets the active Metal buffer ranges for the new
+phase. During decode, the unused shared-bank ranges and the staging buffer are
+released; the per-layer decode windows and protected cache remain available.
+During prefill, the decode windows and the staging buffer are released the same
+way, and during staged prefill the bank and the windows. Each switch replaces the
 inactive ranges with fresh zero-fill memory, so their pages leave the process at
 once while the virtual addresses stay reserved. (Marking them
 `MADV_FREE_REUSABLE` instead let macOS compress them under file-cache pressure,
@@ -58,11 +63,14 @@ pages.
 Set `env.LLAMA_MOE_QUIET` to `0` for diagnostics such as `adaptive-batch`,
 `adaptive phase=prefill/decode`, `phase-scratch`, and `protected-cache`.
 
-The pipeline stages at most 1,200 MiB of expert data per layer; larger layers
-use bounded slot reads instead. One reader thread reads layers in order into two
-host staging buffers, so the next layer's read does not wait for the current
-layer's copy into the shared bank. Both buffers hold the largest layer and are
-released before decoding.
+The pipeline reads whole layer packs (all experts of a layer, as stored in the
+expert files) into the two halves of one Metal staging buffer, each the size of
+the largest layer. One reader thread reads the layers in order, alternating
+halves. The graph's expert matmuls read views of the half holding their layer,
+with the pack stride between experts, so nothing is copied and the shared bank
+is not used. A small CPU op after each layer's experts frees its half for the
+read two layers ahead while the next layer's attention runs. Models whose layers
+exceed 1,200 MiB use bounded slot reads into the bank instead.
 
 ## Code and verification
 

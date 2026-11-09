@@ -1444,11 +1444,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_slots) {
         moe_slots->ensure_unparked();
         const bool decode = moe_slots->decode_step((int) ubatch.n_tokens);
-        if (moe_slots->adaptive_phase_change(decode)) {
+        if (moe_slots->adaptive_phase_change((int) ubatch.n_tokens)) {
             ggml_backend_sched_synchronize(sched.get());
             ggml_backend_sched_reset(sched.get());
             gf_res_prev->reset();
-            moe_slots->set_adaptive_phase(decode);
+            moe_slots->set_adaptive_phase((int) ubatch.n_tokens);
         }
         if (!quiet && !decode && std::getenv("LLAMA_LES_DECODE_BANK"))
             fprintf(stderr, "moeshift: adaptive-batch: tokens=%u cap=%u\n", ubatch.n_tokens, cparams.n_ubatch);

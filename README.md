@@ -126,7 +126,7 @@ MoEShift to apply it.
 | Setting | Default | Direct effect |
 |---|---|---|
 | `args.ctx-size` | `65536` | Maximum conversation length in tokens. Lower it to limit memory growth during long conversations; raise it to allow longer conversations, with more memory use as they grow. |
-| `args.moe-prefill-bank` | `512` / `256`¹ | Expert cache used when reading your prompt. More slots can reduce SSD reads and speed up prompt processing, using more RAM; fewer slots save RAM. |
+| `args.moe-prefill-bank` | `512` / `256`¹ | Expert cache used when reading short prompts or the last part of a prompt (batches under 1,024 tokens; longer batches read whole layers into a separate staging buffer). More slots can reduce SSD reads, using more RAM; fewer slots save RAM. |
 | `args.cache-ram` | `4096`² | Memory kept for earlier conversations, in MiB, so that returning to one, for example after an agent tool's side request, does not reprocess it. A larger value keeps more conversations, using more RAM; `0` turns it off. |
 | `args.prefill-max-tokens` | `3072` | Amount of prompt text processed per batch. Smaller batches reduce peak working memory; larger batches can improve prompt-processing speed. |
 | `env.LLAMA_MOE_PROTECTED_SLOTS` | `24` | Extra experts kept in memory while generating replies. More slots can reduce SSD reads and improve speed, using more RAM; fewer slots save RAM. |

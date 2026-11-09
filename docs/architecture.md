@@ -185,9 +185,10 @@ missing-expert read is hidden.
 
 ## 6. Expert caches and phase transitions
 
-Prefill processes prompt microbatches using a shared expert bank. Decode uses
-smaller per-layer expert windows so that repeated token generation does not
-require retaining the full prefill bank.
+Prefill computes prompt batches of 1,024 tokens or more directly from whole
+layers staged by the prefill pipeline, and smaller batches from a shared expert
+bank. Decode uses smaller per-layer expert windows so that repeated token
+generation does not require retaining the full prefill bank.
 
 The profiles use 512 prefill slots for Flash Next or 256 for Qwen3.6, a zero-slot retained shared
 decode bank, and a separate per-layer decode allocation of **39 slots**:
@@ -225,11 +226,17 @@ reduce reads at the cost of more resident expert memory.
 stateDiagram-v2
     [*] --> Prefill
     Prefill: Shared expert bank active
+    Staged: Prefill staging buffer active
     Decode: Per-layer recent and protected cache active
     Prefill --> Decode: Synchronize, invalidate mappings, release unused shared ranges
     Decode --> Prefill: Synchronize, invalidate mappings, restore shared ranges
+    Prefill --> Staged: Synchronize, release the bank, restore the staging buffer
+    Staged --> Prefill: Synchronize, release the staging buffer, restore the bank
+    Staged --> Decode: Synchronize, release the staging buffer, restore the windows
+    Decode --> Staged: Synchronize, release the windows, restore the staging buffer
     Decode --> [*]: Worker stops
     Prefill --> [*]: Worker stops
+    Staged --> [*]: Worker stops
 ```
 
 Phase transitions drain demand and lookahead work before changing memory ranges.
@@ -238,9 +245,10 @@ is reset. Unused shared-bank pages become reclaimable while virtual addresses
 remain reserved. A later prefill restores the ranges before they are used.
 Per-layer decode windows remain separate from the shared-bank budget.
 
-The prefill pipeline also stages upcoming expert reads to overlap storage access
-with current-layer computation. Its staging memory and the graph's temporary
-working memory are separate from persistent decode-cache capacity.
+The prefill pipeline reads whole layers ahead into the two halves of a staging
+buffer, overlapping storage access with computation; the expert matmuls read the
+staged layer in place. Its staging memory and the graph's temporary working
+memory are separate from persistent decode-cache capacity.
 
 ## 7. Context and memory model
 
@@ -249,7 +257,8 @@ Expert offloading addresses only one part of the process's memory requirements.
 | Memory class | Lifetime and scaling |
 |---|---|
 | Resident model tensors | Loaded for the worker; determined by the model and placement. |
-| Shared expert bank | Active prefill budget; reduced to the retained bank budget during decode. |
+| Shared expert bank | Active for prefill batches under 1,024 tokens; reduced to the retained bank budget during decode and released during staged prefill. |
+| Prefill staging buffer | Two halves of the largest layer, active only while batches of 1,024 tokens or more are processed. |
 | Per-layer expert windows | Recent and protected decode capacity, set by the profile. |
 | Attention context buffers | Grow with occupied context, up to configured capacity. |
 | Indexer keys | Key-only context storage for sparse attention indexing. |
