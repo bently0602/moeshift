@@ -533,7 +533,9 @@ it, add to the Flash Next profile's `env` in `config-source.json`:
 ```
 
 - Measured +1.8% generation after a short prompt and +0.7% after the long one,
-  with identical output and about 4 MB more memory.
+  with identical output and about 4 MB more memory, with 24 protected slots. With the
+  protected tier off (the current setting) it gained nothing measurable in one run (see
+  [R1](#cache-settings-without-the-protected-tier-r1)), so it is not worth enabling now.
 - Costs: one CPU thread spins while the GPU is generating (it sleeps when idle),
   and about a quarter of the extra expert reads go unused.
 - The code is new (two output-changing bugs were found and fixed while
@@ -1805,6 +1807,123 @@ Applied: `config-source.json` and the Flash Next profile in `configs/moeshift.js
 `LLAMA_MOE_PROTECTED_SLOTS` to `0` (the Qwen3.6 profile keeps 24; not measured). The main
 `config.json` keeps 24. Without protected slots Flash Next's windows have 20 slots
 (`config-source.json`, depth 8), which allows decode steps of at most 2 rows for speculation.
+
+## Cache settings without the protected tier (R1)
+
+With protected slots at 0 the page cache is the second-level expert cache, so the decode window,
+the prefetch depth and late prefetch were checked again. Single runs (fresh server, warmup, then
+`short.json` and `long.json`, 512 tokens each), `config-source.json` with one change each:
+
+| Change | After a short prompt | After the long prompt | Long prompt | Footprint after generating | SSD transfer per run |
+|---|---:|---:|---:|---:|---:|
+| None (window 12, depth 8, read 8) | 26.28–26.35 tok/s | 22.81–23.05 tok/s | 7.49–7.50 s | 7,400 MB | 143–148 GB |
+| Window 10 | 26.35 | 23.10 | 7.47 s | 7,240 MB | 142 GB |
+| Window 16 | 26.47 | 23.04 | 7.47 s | 7,720 MB | 148 GB |
+| Depth 3, read 3 | 22.95 | 20.36 | 7.47 s | 7,000 MB | 124 GB |
+| Depth 6, read 6 | 25.97 | 22.89 | 7.47 s | 7,240 MB | 134 GB |
+| Depth 10, read 10 | 25.93 | 22.17 | 7.48 s | 7,560 MB | 166 GB |
+| Depth 12, read 12 | 25.53 | 21.82 | 8.08 s | 7,720 MB | 180 GB |
+| Late prefetch 8 / 8 | 26.50 | 23.05 | 7.47 s | 7,400 MB | 145 GB |
+
+Every response matched. The current settings are the best measured: the window (10–16 slots,
+of which at least 10 are needed per token) makes no difference beyond about 1%; prefetch depth 8
+is clearly better than 3 (13% faster) and somewhat better than 6, 10 or 12. Late prefetch, which
+gained 1.8% with the protected tier on, now gains nothing measurable (+0.6% and 0 in one run):
+with the file cache holding more experts, most of its guesses are no longer misses. No setting
+was changed.
+
+## Prefill peak memory (R2, uncommitted)
+
+### What the footprint does not count
+
+Metal shared buffers are host memory wrapped without a copy. A test wrapped a 1 GiB
+`vm_allocate` buffer the way ggml-metal does and had the GPU write every page. The process
+footprint rose by 89 MiB, and `resident_size`, `internal` and `vmmap` showed nothing. System-wide
+internal + wired + compressed memory rose by 1,131 MiB. The pages appeared in the process
+(+1,024 MiB) only once the CPU read them.
+
+So pages that only the GPU writes, which is most of the graph's compute buffer, are missing from
+`phys_footprint`, `footprint` and `vmmap`. Pages the CPU writes are counted: the graph inputs (KQ
+mask, indexer bias) and the buffers it clears (the KV cache). The peak footprints elsewhere in this
+document undercount prefill by the compute buffer.
+
+The figures below are system-wide instead: the change in internal + wired + compressed pages from
+just before the worker started, taking the highest 1-second rolling median
+(`/Volumes/Data/moeshift-scratch/r2m/tools/memwatch.c`). The figure includes other processes;
+repeated runs differed by up to 0.3 GB.
+
+### Where prefill memory goes
+
+`config-source.json`, a 6,144-token batch, at about 42k tokens of context:
+
+| Part | Size |
+|---|---:|
+| Non-expert weights (Metal) and token embedding (CPU) | 3,665 + 260 MiB |
+| Prefill staging: two host buffers, each the largest layer pack (the pipeline reads whole layers) | 2 × 1,137 MiB |
+| Prefill bank: 512 slots of the largest layer, into which the used experts are copied from staging | 1,138 MiB |
+| KV cache (grows; 49,152 cells here) and indexer keys | 1,152 + 144 MiB |
+| Recurrent state, one context checkpoint | 113 + 113 MiB |
+| Compute buffer, allocated per graph (allocator high-water) | 2,653 MiB at short context, 5,806 MiB at 42k |
+
+The compute buffer grows with context through the indexer's `[n_kv, rows]` tensors: scores,
+expanded scores, the f32 copy of the mask and, largest, the top-k scratch at 8 bytes per score
+(3 GiB for 6,144 rows at 64k cells). The buffer reserved at load is 6,120 MiB, mostly logits for
+all 6,144 rows (5,820 MiB), although a prompt needs only the last row's logits. LES already
+releases compute buffers before each decode phase, so later prefills allocate only what their
+graph needs. The first prompt after a reserve, however, ran in the reserved buffer, and Metal made
+all of it resident on first use: the 72-token warm-up prompt held 14.4–14.6 GB.
+
+### Changes
+
+- **Release the reserved compute buffers** (`sched_reserve` in `src/llama-context.cpp`): for
+  LES models the scheduler is recreated after reserving, as before each decode phase. The
+  first prompt after load then allocates like every later one.
+- **Sparse attention in chunks of query rows** (`build_qsa_top_k` and `build_attn_qsa` in
+  `src/models/qwen4exp.cpp`): keys, K/V stores and the indexer queries are computed once; scores,
+  top-k, the attention mask and flash attention run per chunk, and the outputs are concatenated.
+  Chunks are used only when the whole batch's top-k scratch would exceed 512 MiB (above about
+  10.9k cells for 6,144 rows), sized to that budget, equal and rounded up to 32 rows. Every op
+  involved works row by row, so the output is unchanged. In a test build with 1,024-row chunks, the
+  compute high-water during the 42k prompt stayed at 2,653–3,484 MiB, against 2,653–5,806 MiB.
+
+Interleaved A/B, two rounds, fresh worker each. Each round sent `short.json`, a 3,996-token
+prompt, `long.json` and a 42,389-token prompt (the long prompt's text seven times, 16 tokens
+generated):
+
+| Request | R1 system peak | R2 system peak | R1 prompt | R2 prompt |
+|---|---:|---:|---:|---:|
+| First prompt (72 tokens) | 14.39 / 14.59 GB | **8.17 / 8.15 GB** | 2.10 / 2.09 s | **1.69 / 1.68 s** |
+| 3,996 tokens | 11.16 / 11.45 GB | 11.71 / 11.54 GB | 6.26 / 6.30 s | 6.25 / 6.29 s |
+| 6,060 tokens (`long.json`) | 12.26 / 12.61 GB | 12.77 / 12.72 GB | 7.45 / 7.57 s | 7.46 / 7.45 s |
+| 42,389 tokens | 17.26 / 17.58 GB | **16.18 / 16.46 GB** | 88.2 / 88.0 s | 88.1 / 88.2 s |
+
+Every response matched the R1 build: 512 tokens after the short and long prompts, and the 16 after
+the 42k prompt (generated with chunked attention). Generation was 26.03–26.36 tok/s (R1) and
+26.66–26.67 (R2) after the short prompt, and 23.39–23.48 and 23.42–23.66 after the long one; the
+difference is within noise. At 4k and 6k tokens both builds run the same graph, so the differences
+there are run-to-run noise. The chunked graph raises the process footprint at 42k (13.1 → 14.4 GB),
+because the CPU-written inputs land on different compute pages from batch to batch; the
+system-wide figure is lower.
+
+### Tried and not kept
+
+- **Smaller prefill batches** (`prefill-max-tokens` 4096 or 3072): the long prompt took 14.32 and
+  12.91 s instead of 7.47 s, and the 4k prompt 6.39 and 10.75 s instead of 6.32 s, since every
+  batch reads all experts again. (The footprint peaks measured, 9,106 and 9,045 MB against
+  9,273 MB, also miss the smaller compute buffer.)
+- **A 256-slot prefill bank**: the worker aborts; a 6,144-token batch uses more than 256 of a
+  layer's 512 experts.
+- **No prompt cache** (`LLAMA_ARG_CACHE_RAM=0`): 0.25 GB less on the long prompt. Kept: it lets a
+  client switch between conversations without reprocessing them. Its 8,192 MiB limit was not
+  tested; filled with several long conversations it could reach that size.
+
+### Not tested
+
+- Contexts above 42k tokens, where chunking should save more (the unchunked top-k scratch reaches
+  3 GiB at 64k cells).
+- Prefill straight from the staging buffers, which would remove the 1,138 MiB bank copy (see
+  TODO).
+- The Homebrew build.
 
 ## Tool calling
 

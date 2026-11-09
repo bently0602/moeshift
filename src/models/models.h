@@ -1879,7 +1879,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+  const std::vector<ggml_tensor *> & top_ks,
+  const std::vector<std::pair<int64_t, int64_t>> & chunks,
                           float   kq_scale,
                             int   il);
 
@@ -1887,14 +1888,19 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: token indices this layer's queries may attend to, one tensor per chunk of query rows
+        std::vector<ggml_tensor *> build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
+  const std::vector<std::pair<int64_t, int64_t>> & chunks,
                             int   il);
+
+        // QSA: the query rows of a ubatch as (first row, rows) chunks, and one chunk's mask rows
+        std::vector<std::pair<int64_t, int64_t>> qsa_chunks(int64_t n_kv, int64_t n_tps, int64_t n_stream) const;
+        ggml_tensor * qsa_mask_rows(ggml_tensor * kq_mask, int64_t t0, int64_t nt) const;
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
