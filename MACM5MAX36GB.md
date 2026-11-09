@@ -2202,6 +2202,26 @@ at 28.93 tok/s with 365 of 373 drafts accepted and the reference output. The shi
 unchanged: its prefetch depth of 3 gives 15-slot windows, which allow only 1 row, so speculation
 would be disabled with a message.
 
+### Prefetching a copied token's experts (probe, not kept)
+
+The idea: a token the drafter copies from the context might use the experts its source position
+used during prefill, which could be read ahead for the drafted row. A temporary build dumped every
+routing decision; for the three copy-heavy tasks, without speculation, each generated token whose
+preceding 12 tokens occurred earlier (with the same next token) was compared with that source
+position:
+
+| Task | Copied tokens | Same experts as the source | As the previous token | Chance |
+|---|---:|---:|---:|---:|
+| Reproduce a whole file | 1,095 of 1,200 | 24.7% | 22.8% | 5.9% |
+| Edit a JSON config | 717 of 778 | 29.6% | 26.3% | 5.2% |
+| Rewrite a function | 437 of 700 | 27.7% | 21.3% | 5.3% |
+
+Only the first layers route mostly by the token itself: about 90% overlap at layer 0, 60–80% at
+layers 1–3 and about 50% at layers 4–7, then 10–20% through the middle and 30–50% in the last
+layers, which depend on the context. Reading the source's experts for drafted rows would cover a
+quarter of their experts, about what the existing one-layer lookahead already predicts, so it was
+not built. (`/Volumes/Data/moeshift-scratch/n2p`)
+
 ### Not tested
 
 - Real agent sessions; how much of an agent's output is copy-heavy decides the overall gain.
