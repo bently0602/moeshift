@@ -53,10 +53,6 @@ namespace {
 // LLAMA_MOE_IO_THREADS. Defaults to 4, the value all earlier measurements used.
 constexpr int kMoeSsdIoThreadsDefault = 4;
 
-// Threads copying a prefetched layer into its slots. A synthetic copy of one Flash Next
-// layer on M5 Max took 11.1 ms with one thread and 6.9 ms with eight.
-constexpr int kPrefillCopyThreads = 8;
-
 // Persistent threads for decode-time demand reads. Each missing expert's matrices are read
 // separately, about ten reads per layer with Flash Next, so more threads than experts help.
 constexpr int kDemandReadThreads = 12;
@@ -103,6 +99,14 @@ static void moe_log(const char * fmt, ...) {
     fprintf(stderr, "[moeshift] %s\n", buf);
     fflush(stderr);
     LLAMA_LOG_INFO("[moeshift] %s\n", buf);
+}
+
+static size_t vm_page_bytes() {
+#ifdef _WIN32
+    return 4096;
+#else
+    return (size_t) sysconf(_SC_PAGESIZE);
+#endif
 }
 
 static bool park_window_enabled() {
@@ -968,6 +972,7 @@ install_timing start_demand(
         }
         sweep_init();
         prewarm_init();
+        init_stage();
     }
 
     /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
@@ -1409,6 +1414,12 @@ install_timing start_demand(
         stop_demand_readers();
         for (void * ticket : demand_tickets) les_io_destroy(ticket);
         stop_prefill_read();
+        if (stage_ctx) {
+            ggml_free(stage_ctx);
+        }
+        if (stage_buf) {
+            ggml_backend_buffer_free(stage_buf);
+        }
         if (cur.n_layers > 0) {
             flush_ubatch(cur.n_tokens <= 1 ? "decode" : "prefill",
                 cur.n_tokens <= 1 ? n_decode_step : n_prefill_ubatch);
@@ -1850,9 +1861,11 @@ install_timing start_demand(
         dst.scatter_ex += src.scatter_ex;
     }
 
-    // Two host buffers let one reader stream layers back to back while the previous layer is
-    // copied into the shared banks. They contain immutable packed weights only, never model
-    // state or routing decisions.
+    // Pipelined prefill reads whole layer packs into the two halves of one Metal buffer, and the
+    // graph's expert matmuls read views of them (stage_views), so the shared bank is not used.
+    // One reader streams the layers in order; a half is free again once the GPU has finished
+    // its layer. The halves hold immutable packed weights only, never model state or routing
+    // decisions. Outside the staged phase the buffer keeps one page (stage_active).
     struct prefill_buffer {
         uint8_t * data = nullptr;
         int layer = -1;      // layer being read or held; -1 when free
@@ -1861,13 +1874,17 @@ install_timing start_demand(
         int64_t read_ns = 0;
     };
     prefill_buffer prefill_buf[2];
-    size_t prefill_capacity = 0;
+    ggml_backend_buffer_t stage_buf = nullptr;
+    size_t stage_half = 0;
+    ggml_context * stage_ctx = nullptr;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> stage_views;  // slot tensor -> view
+    std::vector<int> stage_index;                                         // layer -> half
+    bool staged = false;
     std::thread prefill_reader;
     std::mutex prefill_mutex;
     std::condition_variable prefill_cv;
     bool prefill_stop = false;
     bool prefill_done = false;
-    int prefill_first = -1;
     int prefill_expect = -1;
 
     void stop_prefill_read() {
@@ -1880,77 +1897,123 @@ install_timing start_demand(
             prefill_reader.join();
         }
         prefill_expect = -1;
-        if (prefill_buf[0].data) {
-#ifdef __APPLE__
-            munmap(prefill_buf[0].data, 2 * prefill_capacity);
-#else
-            std::free(prefill_buf[0].data);
-#endif
-            prefill_capacity = 0;
-        }
         for (auto & buf : prefill_buf) {
-            buf = prefill_buffer();
+            buf.layer = -1;
+            buf.ready = false;
+            buf.error.clear();
+            buf.read_ns = 0;
         }
     }
 
     bool prefill_pipeline_enabled(int n_rows) const {
+        return stage_buf != nullptr && n_rows >= 1024;
+    }
+
+    // Allocates the staged halves and their views. Requires the adaptive phases, which release
+    // the halves outside pipelined prefill, and layer packs of at most 1,200 MiB; larger quants
+    // keep the bounded slot reader.
+    void init_stage() {
 #if defined(__APPLE__) && TARGET_OS_OSX
-        if (!llm_arch_supports_les(model.arch) || n_rows < 1024) {
-            return false;
+        const char * pipeline = std::getenv("LLAMA_MOE_PREFILL_PIPELINE");
+        if (!llm_arch_supports_les(model.arch) || !std::getenv("LLAMA_LES_DECODE_BANK") ||
+            (pipeline && std::strcmp(pipeline, "0") == 0)) {
+            return;
         }
-        const char * value = std::getenv("LLAMA_MOE_PREFILL_PIPELINE");
-        if (value && std::strcmp(value, "0") == 0) {
-            return false;
-        }
-        // Larger quants must retain the bounded slot reader rather than grow this buffer.
+        size_t half = 0;
         for (const auto & state : layers) {
+            if (!state.enabled) {
+                continue;
+            }
             if (state.pack_stride > 1200ULL * 1024 * 1024 / (size_t) n_expert) {
-                return false;
+                return;
+            }
+            half = std::max(half, (size_t) n_expert * state.pack_stride);
+        }
+        const auto buffers = expert_buffers();
+        if (half == 0 || buffers.empty()) {
+            return;
+        }
+        const size_t page = vm_page_bytes();
+        half = (half + page - 1) / page * page;
+        stage_buf = ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(buffers[0]), 2 * half);
+        stage_half = half;
+        if (!stage_buf || !stage_ranges(false)) {
+            // prefill then uses the shared bank with bounded slot reads
+            LLAMA_LOG_WARN("%s: no MoE prefill staging buffer (%s); prefill uses the shared bank\n", __func__,
+                           stage_buf ? "cannot release its pages" : "allocation failed");
+            if (stage_buf) {
+                ggml_backend_buffer_free(stage_buf);
+                stage_buf = nullptr;
+            }
+            return;
+        }
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(stage_buf);
+        prefill_buf[0].data = base;
+        prefill_buf[1].data = base + half;
+
+        size_t n_views = 0;
+        for (const auto & state : layers) {
+            n_views += state.enabled ? state.bindings.size() : 0;
+        }
+        ggml_init_params params = { n_views * ggml_tensor_overhead(), nullptr, true };
+        stage_ctx = ggml_init(params);
+        stage_index.assign(layers.size(), -1);
+        int ordinal = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & state = layers[il];
+            if (!state.enabled) {
+                continue;
+            }
+            stage_index[il] = ordinal++ & 1;
+            for (const auto & b : state.bindings) {
+                // the slot tensor's rows, with experts at the pack stride instead of back to back
+                ggml_tensor * view = ggml_new_tensor_3d(stage_ctx, b.tensor->type,
+                    b.tensor->ne[0], b.tensor->ne[1], n_expert);
+                view->nb[2] = state.pack_stride;
+                view->nb[3] = state.pack_stride * (size_t) n_expert;
+                ggml_format_name(view, "%s (staged)", ggml_get_name(b.tensor));
+                const size_t offset = (size_t) stage_index[il] * half + (b.entry->offset - state.pack_base);
+                if (ggml_backend_tensor_alloc(stage_buf, view, base + offset) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to place MoE staged expert view");
+                }
+                stage_views[b.tensor] = view;
             }
         }
-        return true;
-#else
-        (void) n_rows;
-        return false;
+        moe_log("prefill staging: 2 x %.1f MiB, %zu views", half / 1024.0 / 1024.0, n_views);
 #endif
     }
 
-    // Reads enabled layers from `first` onwards, alternating buffers; waits while both are held.
-    void start_prefill_read(int first) {
-        GGML_ASSERT(!prefill_reader.joinable());
-        if (!prefill_buf[0].data) {
-            size_t capacity = 0;
-            for (const auto & candidate : layers) {
-                capacity = std::max(capacity, (size_t) n_expert * candidate.pack_stride);
-            }
-            // munmap releases the prefill budget before Metal allocates its decode graph.
-#ifdef __APPLE__
-            void * data = mmap(nullptr, 2 * capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (data == MAP_FAILED) {
-                throw std::runtime_error("failed to allocate MoE prefill read buffers");
-            }
-#else
-            void * data = std::malloc(2 * capacity);
-            if (!data) {
-                throw std::bad_alloc();
-            }
-#endif
-            prefill_buf[0].data = (uint8_t *) data;
-            prefill_buf[1].data = (uint8_t *) data + capacity;
-            prefill_capacity = capacity;
+    // The whole staging buffer during pipelined prefill, otherwise one page.
+    bool stage_ranges(bool active) {
+        const size_t offset = 0;
+        const size_t size = active ? 2 * stage_half : vm_page_bytes();
+        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(stage_buf));
+        using ranges_fn = bool (*)(ggml_backend_buffer_t, const size_t *, const size_t *, size_t);
+        auto fn = dev ? (ranges_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+            "ggml_backend_metal_buffer_active_ranges") : nullptr;
+        return fn && fn(stage_buf, &offset, &size, 1);
+    }
+
+    void stage_active(bool active) {
+        if (stage_buf && !stage_ranges(active)) {
+            throw std::runtime_error("cannot release/restore the MoE prefill staging buffer");
         }
+    }
+
+    // Reads enabled layers from `first` onwards, each into its own half; waits while it is held.
+    void start_prefill_read(int first) {
+        GGML_ASSERT(!prefill_reader.joinable() && stage_buf);
         std::vector<int> fds;
         for (int layer = first; layer < (int) layers.size() && layers[layer].enabled; ++layer) {
             fds.push_back(fd_for(layers[layer].pack_path));
         }
         prefill_stop = false;
         prefill_done = false;
-        prefill_first = first;
         prefill_expect = first;
         prefill_reader = std::thread([this, first, fds = std::move(fds)]() {
             for (size_t i = 0; i < fds.size(); ++i) {
                 const int layer = first + (int) i;
-                auto & buf = prefill_buf[i & 1];
+                auto & buf = prefill_buf[stage_index[layer]];
                 {
                     std::unique_lock<std::mutex> lk(prefill_mutex);
                     prefill_cv.wait(lk, [&] { return prefill_stop || buf.layer < 0; });
@@ -1988,16 +2051,39 @@ install_timing start_demand(
         });
     }
 
-    install_timing install_prefill_pipeline(int layer, const std::vector<pending_install> & pending) {
+    void release_staged(int layer) {
+        {
+            std::lock_guard<std::mutex> lk(prefill_mutex);
+            for (auto & buf : prefill_buf) {
+                if (buf.layer == layer && buf.ready) {
+                    buf.layer = -1;
+                    buf.ready = false;
+                }
+            }
+        }
+        prefill_cv.notify_all();
+    }
+
+    // A pipelined prefill layer: waits for its pack and passes the expert ids through, since the
+    // graph's views are indexed by expert. The previous layer's half is normally released by its
+    // stage-release op already; this runs after the GPU has finished every earlier layer anyway.
+    install_timing install_staged(int layer) {
         const auto & state = layers[layer];
         const int64_t start = now_ns();
         if (prefill_expect != layer) {
             stop_prefill_read();
             start_prefill_read(layer);
         }
-        auto & buf = prefill_buf[(layer - prefill_first) & 1];
+        auto & buf = prefill_buf[stage_index[layer]];
         {
             std::unique_lock<std::mutex> lk(prefill_mutex);
+            for (auto & other : prefill_buf) {
+                if (&other != &buf && other.ready && other.layer >= 0 && other.layer < layer) {
+                    other.layer = -1;
+                    other.ready = false;
+                }
+            }
+            prefill_cv.notify_all();
             prefill_cv.wait(lk, [&] { return (buf.layer == layer && buf.ready) || prefill_done; });
         }
         if (buf.layer != layer || !buf.ready) {
@@ -2006,53 +2092,79 @@ install_timing start_demand(
         if (!buf.error.empty()) {
             throw std::runtime_error(buf.error);
         }
-        // The GPU waits for this copy at every layer; one thread does not saturate memory bandwidth.
-        const int n_th = std::max(1, std::min(kPrefillCopyThreads, (int) pending.size()));
-        std::atomic<size_t> next{0};
-        auto copy = [&]() {
-            for (size_t k = next.fetch_add(1, std::memory_order_relaxed); k < pending.size();
-                 k = next.fetch_add(1, std::memory_order_relaxed)) {
-                const auto & item = pending[k];
-                for (const auto & binding : state.bindings) {
-                    const auto & entry = *binding.entry;
-                    std::memcpy((uint8_t *) binding.tensor->data + (size_t) item.slot * entry.bytes_per_expert,
-                                buf.data + (size_t) item.expert * state.pack_stride +
-                                    entry.offset - state.pack_base, entry.bytes_per_expert);
-                }
-            }
-        };
-        std::vector<std::thread> helpers;
-        helpers.reserve((size_t) n_th - 1);
-        for (int i = 1; i < n_th; ++i) {
-            helpers.emplace_back(copy);
-        }
-        copy();
-        for (auto & h : helpers) {
-            h.join();
-        }
-        const int64_t read_ns = buf.read_ns;
-        {
-            std::lock_guard<std::mutex> lk(prefill_mutex);
-            buf.layer = -1;
-            buf.ready = false;
-        }
-        prefill_cv.notify_all();
+        // the last layer's half stays held until the next batch or phase change restarts the reader
+        prefill_expect = layer + 1 < (int) layers.size() && layers[layer + 1].enabled ? layer + 1 : -1;
         install_timing t;
-        t.n = (int) pending.size();
-        t.n_th = n_th;
+        t.n = n_expert;
+        t.n_th = 1;
         t.pack = true;
         t.bytes = (size_t) n_expert * state.pack_stride;
-        t.pread_sum_ns = t.pread_max_ns = read_ns;
+        t.pread_sum_ns = t.pread_max_ns = buf.read_ns;
         stats.n_bytes.fetch_add(t.bytes, std::memory_order_relaxed);
-        stats.pread_ns.fetch_add(read_ns, std::memory_order_relaxed);
-        stats.n_miss.fetch_add(pending.size(), std::memory_order_relaxed);
-        if (layer + 1 < (int) layers.size() && layers[layer + 1].enabled) {
-            prefill_expect = layer + 1;
-        } else {
-            stop_prefill_read();
-        }
+        stats.pread_ns.fetch_add(buf.read_ns, std::memory_order_relaxed);
         t.wall_ns = now_ns() - start;
         return t;
+    }
+
+    // Per-layer counters and the periodic ubatch diagnostics.
+    void account_layer(int layer, const layer_state & state, const install_timing & timing, int n_tokens,
+                       int n_used, int n_unique, int n_miss, bool window_mode) {
+        const int n_hit = n_unique - n_miss;
+
+        if (layer == 0) {
+            if (cur.n_layers > 0) {
+                flush_ubatch(cur.n_tokens <= window_max_rows ? "decode" : "prefill",
+                    cur.n_tokens <= window_max_rows ? n_decode_step : n_prefill_ubatch);
+            }
+            if (window_mode) {
+                n_decode_step++;
+                miss_per_layer_steps++;   // 每 decode 步一次（不是每层）
+            } else {
+                n_prefill_ubatch++;
+            }
+            cur.n_tokens = n_tokens;
+            cur.n_used = n_used;
+        }
+
+        cur.n_layers++;
+        cur.unique_sum += n_unique;
+        cur.miss_sum += n_miss;
+        cur.n_th = std::max(cur.n_th, timing.n_th);
+        cur.pack_layers += state.pack_ok ? 1 : 0;
+        cur.wall_ns += timing.wall_ns;
+        cur.pread_sum_ns += timing.pread_sum_ns;
+        cur.bytes += timing.bytes;
+        if (window_mode && layer < (int) miss_per_layer.size()) {
+            miss_per_layer[(size_t) layer] += (uint64_t) n_miss;
+        }
+
+        const uint64_t ubatch_idx = window_mode ? n_decode_step : n_prefill_ubatch;
+        const bool sample_layer = (layer == 0 || layer == 1 ||
+            layer == last_moe_layer / 2 || layer == last_moe_layer);
+        if (ubatch_idx <= 2 && sample_layer && (n_miss > 0 || layer == 0)) {
+            moe_log("layer l=%d tok=%d used=%d unique=%d miss=%d hit=%d pack=%d nth=%d "
+                    "pread_wall=%.1fms pread_sum=%.1fms pread_max=%.1fms bytes=%.1fMiB par=%.2f",
+                layer, n_tokens, n_used, n_unique, n_miss, n_hit,
+                timing.pack ? 1 : 0, timing.n_th,
+                ms_of(timing.wall_ns),
+                ms_of(timing.pread_sum_ns),
+                ms_of(timing.pread_max_ns),
+                mib_of(timing.bytes),
+                par_of(timing.pread_sum_ns, timing.wall_ns));
+        }
+
+        if (layer == last_moe_layer) {
+            const char * kind = window_mode ? "decode" : "prefill";
+            const uint64_t idx = window_mode ? n_decode_step : n_prefill_ubatch;
+            if (should_log_ubatch(n_tokens, idx)) {
+                flush_ubatch(kind, idx);
+            } else {
+                cur = ubatch_acc{};
+            }
+            if (idx == 8 || (idx > 8 && (idx % 8) == 0)) {
+                log_io(kind);
+            }
+        }
     }
 
     install_timing install_pending(layer_state & state, const std::vector<pending_install> & pending,
@@ -2688,7 +2800,11 @@ install_timing start_demand(
             add(st.bindings);
             add(st.dec_bindings);
         }
-        return { uniq.begin(), uniq.end() };
+        std::vector<ggml_backend_buffer_t> res(uniq.begin(), uniq.end());
+        if (stage_buf) {
+            res.push_back(stage_buf);
+        }
+        return res;
     }
 
     void park_expert_memory() {
@@ -2760,6 +2876,22 @@ void llama_moe_slot_runtime::map_custom(
     data->runtime->add_process_ns(now_ns() - t0);
 }
 
+void llama_moe_slot_runtime::map_stage_release(
+        ggml_tensor * dst,
+        const ggml_tensor * src,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
+    data->runtime->pimpl->release_staged(data->layer);
+}
+
 void llama_moe_slot_runtime::map_custom_lookahead(
         ggml_tensor * dst,
         const ggml_tensor * a,
@@ -2826,12 +2958,33 @@ void llama_moe_slot_runtime::park_expert_memory() {
     pimpl->park_expert_memory();
 }
 
-bool llama_moe_slot_runtime::adaptive_phase_change(bool decode) const {
-    return std::getenv("LLAMA_LES_DECODE_BANK") && decode != pimpl->adaptive_decode;
+bool llama_moe_slot_runtime::staged_prefill(int n_rows) const {
+    return !decode_step(n_rows) && pimpl->prefill_pipeline_enabled(n_rows);
 }
 
-void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
-    if (!adaptive_phase_change(decode)) return;
+ggml_tensor * llama_moe_slot_runtime::staged_weight(ggml_tensor * slot_tensor) const {
+    const auto it = pimpl->stage_views.find(slot_tensor);
+    if (it == pimpl->stage_views.end()) {
+        throw std::runtime_error(format("no staged view for MoE slot tensor '%s'", ggml_get_name(slot_tensor)));
+    }
+    return it->second;
+}
+
+ggml_tensor * llama_moe_slot_runtime::build_stage_release(ggml_context * ctx, ggml_tensor * moe_out, int layer) {
+    return ggml_map_custom1(ctx, ggml_view_1d(ctx, moe_out, 1, 0), map_stage_release, 1, &pimpl->userdata[(size_t) layer]);
+}
+
+bool llama_moe_slot_runtime::adaptive_phase_change(int n_rows) const {
+    return std::getenv("LLAMA_LES_DECODE_BANK") &&
+        (decode_step(n_rows) != pimpl->adaptive_decode || staged_prefill(n_rows) != pimpl->staged);
+}
+
+// Three expert memory phases: decode keeps the per-layer windows, prefill the shared bank, and
+// pipelined prefill (staged) only the staging buffer; everything else is released.
+void llama_moe_slot_runtime::set_adaptive_phase(int n_rows) {
+    if (!adaptive_phase_change(n_rows)) return;
+    const bool decode = decode_step(n_rows);
+    const bool staged = staged_prefill(n_rows);
     if (!llm_arch_supports_les(pimpl->model.arch) || pimpl->decode_window <= 0)
         throw std::runtime_error("adaptive LES requires a supported Qwen MoE with decode windows");
     pimpl->join_demand();
@@ -2840,6 +2993,9 @@ void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
     pimpl->stop_prefill_read();
     pimpl->prewarm_ready = false;
     pimpl->prewarm_placed.clear();
+    if (!staged) {
+        pimpl->stage_active(false);
+    }
     const size_t retained = std::stoul(std::getenv("LLAMA_LES_DECODE_BANK"));
     using span = std::pair<size_t, size_t>;
     std::map<ggml_backend_buffer_t, std::map<ggml_tensor *, size_t>> bases;
@@ -2860,6 +3016,10 @@ void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
             if (decode) ranges.emplace_back(offset + discard, ggml_nbytes(base.first) - discard);
             else ranges.emplace_back(offset, pimpl->n_slots * base.second);
         }
+        if (staged) {
+            // nothing here is read while staged; keep one page
+            ranges.assign(1, span(0, vm_page_bytes()));
+        }
         std::sort(ranges.begin(), ranges.end());
         std::vector<size_t> offsets, sizes;
         for (const auto & range : ranges) { offsets.push_back(range.first); sizes.push_back(range.second); }
@@ -2870,8 +3030,12 @@ void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
         if (!fn || !fn(buffer.first, offsets.data(), sizes.data(), offsets.size()))
             throw std::runtime_error("adaptive LES cannot release/restore expert Metal memory");
     }
+    if (staged) {
+        pimpl->stage_active(true);
+    }
     pimpl->was_window = false;
     pimpl->adaptive_decode = decode;
+    pimpl->staged = staged;
     if (decode) {
         size_t extra_bytes = 0;
         int protected_layers = 0;
@@ -2888,7 +3052,8 @@ void llama_moe_slot_runtime::set_adaptive_phase(bool decode) {
             extra_bytes, extra_bytes / (double) protected_slots / 1e6);
     }
     moe_log("adaptive phase=%s shared-bank=%zu windows=%d prefetch=%d",
-            decode ? "decode" : "prefill", decode ? retained : size_t(pimpl->n_slots),
+            decode ? "decode" : staged ? "staged" : "prefill",
+            decode ? retained : staged ? size_t(0) : size_t(pimpl->n_slots),
             pimpl->decode_window, pimpl->prefetch_slots);
 }
 
@@ -2965,8 +3130,39 @@ void llama_moe_slot_runtime::process(
 
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
 
+    // The graph reads staged views exactly when the context switched to the staged phase.
     const bool pipelined_prefill = pimpl->prefill_pipeline_enabled(n_rows);
-    if (!pipelined_prefill && pimpl->prefill_buf[0].data != nullptr) {
+    if (pipelined_prefill != pimpl->staged) {
+        throw std::runtime_error(format("MoE layer %d: %d-row batch outside its expert memory phase", layer, n_rows));
+    }
+    if (pipelined_prefill) {
+        std::vector<int32_t> experts;
+        {
+            const int64_t t0 = now_ns();
+            pimpl->read_i32_ids(expert_ids, experts);
+            pimpl->readids_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        }
+        std::vector<uint8_t> requested(pimpl->n_expert, 0);
+        int n_unique = 0;
+        for (const int32_t expert : experts) {
+            if (expert < 0 || expert >= pimpl->n_expert) {
+                throw std::runtime_error("MoE expert id is out of range");
+            }
+            n_unique += !requested[expert];
+            requested[expert] = 1;
+        }
+        pimpl->unique_sum.fetch_add(n_unique, std::memory_order_relaxed);
+        pimpl->stats.n_miss.fetch_add(n_unique, std::memory_order_relaxed);
+        const auto timing = pimpl->install_staged(layer);
+        pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
+        pimpl->account_layer(layer, state, timing, (int) expert_ids->ne[1], (int) expert_ids->ne[0],
+                             n_unique, n_unique, false);
+        const int64_t t0 = now_ns();
+        pimpl->write_i32_ids(slot_ids, experts);
+        pimpl->writeids_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        return;
+    }
+    if (pimpl->prefill_reader.joinable()) {
         pimpl->stop_prefill_read();
     }
     const bool decode = n_rows == 1;
@@ -3326,9 +3522,7 @@ void llama_moe_slot_runtime::process(
     const llama_moe_slot_runtime::impl::install_timing timing =
         (window_mode && (!pending.empty() || !attached.empty()))
         ? pimpl->start_demand(state, pending, (int) attached.size())
-        : pipelined_prefill
-            ? pimpl->install_prefill_pipeline(layer, pending)
-            : pimpl->install_pending(state, pending, window_mode);
+        : pimpl->install_pending(state, pending, window_mode);
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
 
     if (!pending.empty()) {
@@ -3359,62 +3553,7 @@ void llama_moe_slot_runtime::process(
     const int n_tokens = (int) expert_ids->ne[1];
     const int n_used = (int) expert_ids->ne[0];
     const int n_miss = (int) pending.size();
-    const int n_hit = n_unique - n_miss;
-
-    if (layer == 0) {
-        if (pimpl->cur.n_layers > 0) {
-            pimpl->flush_ubatch(pimpl->cur.n_tokens <= pimpl->window_max_rows ? "decode" : "prefill",
-                pimpl->cur.n_tokens <= pimpl->window_max_rows ? pimpl->n_decode_step : pimpl->n_prefill_ubatch);
-        }
-        if (window_mode) {
-            pimpl->n_decode_step++;
-            pimpl->miss_per_layer_steps++;   // 每 decode 步一次（不是每层）
-        } else {
-            pimpl->n_prefill_ubatch++;
-        }
-        pimpl->cur.n_tokens = n_tokens;
-        pimpl->cur.n_used = n_used;
-    }
-
-    pimpl->cur.n_layers++;
-    pimpl->cur.unique_sum += n_unique;
-    pimpl->cur.miss_sum += n_miss;
-    pimpl->cur.n_th = std::max(pimpl->cur.n_th, timing.n_th);
-    pimpl->cur.pack_layers += state.pack_ok ? 1 : 0;
-    pimpl->cur.wall_ns += timing.wall_ns;
-    pimpl->cur.pread_sum_ns += timing.pread_sum_ns;
-    pimpl->cur.bytes += timing.bytes;
-    if (window_mode && layer < (int) pimpl->miss_per_layer.size()) {
-        pimpl->miss_per_layer[(size_t) layer] += (uint64_t) n_miss;
-    }
-
-    const uint64_t ubatch_idx = window_mode ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
-    const bool sample_layer = (layer == 0 || layer == 1 ||
-        layer == pimpl->last_moe_layer / 2 || layer == pimpl->last_moe_layer);
-    if (ubatch_idx <= 2 && sample_layer && (n_miss > 0 || layer == 0)) {
-        moe_log("layer l=%d tok=%d used=%d unique=%d miss=%d hit=%d pack=%d nth=%d "
-                "pread_wall=%.1fms pread_sum=%.1fms pread_max=%.1fms bytes=%.1fMiB par=%.2f",
-            layer, n_tokens, n_used, n_unique, n_miss, n_hit,
-            timing.pack ? 1 : 0, timing.n_th,
-            llama_moe_slot_runtime::impl::ms_of(timing.wall_ns),
-            llama_moe_slot_runtime::impl::ms_of(timing.pread_sum_ns),
-            llama_moe_slot_runtime::impl::ms_of(timing.pread_max_ns),
-            llama_moe_slot_runtime::impl::mib_of(timing.bytes),
-            llama_moe_slot_runtime::impl::par_of(timing.pread_sum_ns, timing.wall_ns));
-    }
-
-    if (layer == pimpl->last_moe_layer) {
-        const char * kind = window_mode ? "decode" : "prefill";
-        const uint64_t idx = window_mode ? pimpl->n_decode_step : pimpl->n_prefill_ubatch;
-        if (pimpl->should_log_ubatch(n_tokens, idx)) {
-            pimpl->flush_ubatch(kind, idx);
-        } else {
-            pimpl->cur = llama_moe_slot_runtime::impl::ubatch_acc{};
-        }
-        if (idx == 8 || (idx > 8 && (idx % 8) == 0)) {
-            pimpl->log_io(kind);
-        }
-    }
+    pimpl->account_layer(layer, state, timing, n_tokens, n_used, n_unique, n_miss, window_mode);
 
     // slots[] 已在分配循环里按位置填好（被延后的也有有效槽位地址）。这里只补
     // LRU 时间戳：位置越靠后越新，与原来一致。

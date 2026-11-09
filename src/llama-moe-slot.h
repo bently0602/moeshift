@@ -65,8 +65,17 @@ public:
     /// 下次 process() / llama_decode 会自动再包。页内容作废，必须清 LRU。
     void park_expert_memory();
     void ensure_unparked();
-    bool adaptive_phase_change(bool decode) const;
-    void set_adaptive_phase(bool decode);
+    // Expert memory phase for a batch of n_rows (decode windows, shared bank, or staged layer
+    // packs for pipelined prefill); the context switches it before building the batch's graph.
+    bool adaptive_phase_change(int n_rows) const;
+    void set_adaptive_phase(int n_rows);
+    // Whether a batch of n_rows runs pipelined prefill, whose expert matmuls read staged_weight()
+    // views of whole layer packs instead of the slot tensors.
+    bool staged_prefill(int n_rows) const;
+    ggml_tensor * staged_weight(ggml_tensor * slot_tensor) const;
+    // A CPU op on one element of the layer's expert output: once the GPU has finished the expert
+    // matmuls, it frees the layer's staging half for the next read.
+    ggml_tensor * build_stage_release(ggml_context * ctx, ggml_tensor * moe_out, int layer);
 
     /// 在 prefill 之前、空闲期把静态预热表读进各层 decode 窗口（见 LLAMA_MOE_PREWARM）。
     /// decode 段与 prefill 段物理分离，所以这笔读能活过 prefill，阶段切换只重挂映射。
@@ -75,6 +84,12 @@ public:
 
 private:
     static void map_custom(
+        ggml_tensor * dst,
+        const ggml_tensor * src,
+        int ith,
+        int nth,
+        void * userdata);
+    static void map_stage_release(
         ggml_tensor * dst,
         const ggml_tensor * src,
         int ith,

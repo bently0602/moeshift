@@ -2036,6 +2036,91 @@ build rejects the option.
 - The Homebrew build, which keeps the 8 GiB default, oldest-first eviction and the malloc
   behavior.
 
+## Prefill from the staging buffers (M1, uncommitted)
+
+M1 would run prefill's expert matmuls straight from the two staging buffers that hold whole layer
+packs, instead of copying the experts into the 512-slot bank (1,138 MiB). Two probes checked its
+risks before building it.
+
+### Strided expert views
+
+In a layer pack each expert's gate, up and down weights lie back to back, so prefill would use
+views with the pack stride between experts instead of contiguous `[ne0, ne1, 512]` tensors. The
+Metal `mul_mat_id` kernels address experts as `i02*nb02`, and no fusion or support check requires
+contiguous weights. A standalone test (`/Volumes/Data/moeshift-scratch/m1/probe1.cpp`) read one real
+layer file per layout (10 layouts: gate/up in IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS or IQ3_S, down in
+IQ4_NL or Q2_0) and ran gate, up, SiLU·up and down with 10 random experts per token, from a
+contiguous copy and from views into the pack:
+
+| Rows | Gate/up and down results | Time, contiguous → strided |
+|---|---|---|
+| 6,144 | bit-identical on all 10 layouts | 28.8–33.1 ms, −0.1% to +0.1% |
+| 1,024 | bit-identical on all 10 layouts | 6.3–7.4 ms, −0.2% to +0.3% |
+
+### Pipeline timing
+
+A probe build logged per layer when the reader got a buffer and finished its read, and when each
+install started, had its layer ready and finished the copy (`config-source.json`, 1,209-, 3,996-,
+6,060- and 42,389-token prompts; 11 batches). A replay from those times reproduced every batch, then
+applied M1's rules: no copy, and a staging buffer held until the GPU has run that layer's expert
+matmuls (the probe's 7–33 ms after the install):
+
+| Prompt | Reader idle | GPU waiting for reads | Copy | Today | M1 (replay) |
+|---|---:|---:|---:|---:|---:|
+| 1,209 tokens | 0 s | 4.03 s | 0.26 s | 5.47 s | 5.46 s (−0.1%) |
+| 3,996 | 0 s | 1.89 s | 0.29 s | 6.06 s | 6.05 s (−0.1%) |
+| 6,060 | 0.64 s | 0.18 s | 0.28 s | 6.77 s | 6.65 s (−1.9%) |
+| 42,389 (7 batches) | 0.98–9.97 s per batch | 0.09–0.15 s per batch | 0.28–0.39 s per batch | 84.39 s | 82.51 s (−2.2%) |
+
+Times run from the first to the last install of each batch. Up to 4k tokens the SSD sets the
+pace: the GPU finishes a layer long before the next read, so holding its buffer costs nothing.
+From 6k tokens the GPU sets it and the reader is already idle, so the lost read-ahead does not
+matter either; what remains is the copy, about 6 ms per layer. Holding each buffer until the next
+install instead (an upper bound) would cost up to 4.5% at 6k tokens; releasing it at once (a lower
+bound) would save 2.4%.
+
+### Implementation
+
+- **Staging buffer** (`init_stage` in `src/llama-moe-slot.cpp`): one Metal buffer with two halves
+  of the largest layer pack (2 × 1,137.5 MiB), allocated at load from the expert buffers' type and
+  kept at one page outside pipelined prefill. Views of each layer's gate, up and down weights
+  (144) point into the half that layer always uses (even or odd among the MoE layers), with the
+  pack stride between experts.
+- **Third phase**: batches of 1,024 tokens or more run in a *staged* phase, in which the bank and
+  the decode windows are released and the staging buffer is active (`set_adaptive_phase`).
+  Smaller prefill batches, such as the last 4 tokens the server splits off a prompt, keep the
+  bank phase; decode is unchanged. `build_qwen_moe_ffn` uses the views in the staged phase, and
+  the slot-id op passes the expert ids through after waiting for its layer's read.
+- **Release**: a half is freed by a CPU op on one element of its layer's expert output, so the
+  reader starts the read two layers ahead as soon as the GPU has finished those matmuls. The
+  first version freed it at the next layer's slot-id op, after that layer's attention too, and
+  was 2.5% slower at 4k tokens, 5.5% at 6k and 1.8% at 42k (the probe's upper bound).
+- The copy into the bank is gone. If the staging buffer cannot be allocated or released, the
+  worker logs it and uses the bank for every batch, as with `LLAMA_MOE_PREFILL_PIPELINE=0`.
+
+Interleaved A/B against the committed build (`09a6193`), two rounds, fresh worker each,
+`config-source.json` settings, the same four requests as R2:
+
+| Request | Footprint peak | System peak | Prompt |
+|---|---:|---:|---:|
+| 72 tokens | 6.99 → 6.99 GB | 8.10–8.18 → 7.60–8.44 GB | 1.69–1.82 → 1.70–1.74 s |
+| 3,996 tokens | 9.24 → **8.18 GB** | 11.19–11.25 → **9.29–10.11 GB** | 6.23 → 6.16–6.20 s |
+| 6,060 tokens | 9.66 → **8.56 GB** | 12.44–12.48 → **10.29–11.18 GB** | 7.43–7.45 → 7.38–7.40 s |
+| 42,389 tokens | 14.71 → **13.58–13.61 GB** | 16.20–16.32 → **15.08–15.74 GB** | 88.3–88.4 → **85.9 s** |
+
+All responses were identical to the committed build's, and generation speed was unchanged
+(23.27–23.40 against 23.30–23.40 tok/s after the long prompt). The footprint, which counts the
+CPU-written bank and staging pages, fell by 1.06–1.13 GB, as the bank's 1,138 MiB predicts; the
+system-wide figures vary more between runs. The 42k prompt was 2.8% faster, close to the replay's
+2.2%; at 4–6k tokens the gain was under 1%. With the pipeline off, the same build answered
+identically from the bank (4k: 8.76 s, 6k: 12.11 s, as before M1).
+
+### Not tested
+
+- Contexts above 42k tokens.
+- Qwen3.6, whose profile also uses the pipeline.
+- The Homebrew build, which keeps the copy into the bank.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the

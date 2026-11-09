@@ -72,7 +72,7 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `args.cache-ram` | `4096` MiB for Flash Next; unset (`8192`) for Qwen3.6. Saved states of earlier conversations, restored when a request continues one instead of reprocessing it. Above the limit, the oldest entry under a quarter of the largest entry's tokens is dropped first (short side requests before the long conversation they interrupt), then the oldest; the newest is always kept. `0` disables it. A Flash Next entry takes about 225 MiB plus 27 KiB per token with `f16` KV ([measurements](../MACM5MAX36GB.md#prompt-cache-limit-m2-uncommitted)) |
 | `args.threads` | `10` CPU threads |
 | `args.prefill-max-tokens` | `3072` tokens per prefill microbatch |
-| `args.moe-prefill-bank`, `args.moe-decode-bank` | `512` / `256` shared expert slots during prefill (Flash Next / Qwen3.6); larger banks use more RAM; `0` shared slots retained during decode |
+| `args.moe-prefill-bank`, `args.moe-decode-bank` | `512` / `256` shared expert slots for prefill batches under 1,024 tokens, or all batches with the pipeline off (Flash Next / Qwen3.6); larger banks use more RAM; `0` shared slots retained during decode |
 | `args.n-gpu-layers`, `args.flash-attn` | `99`, `on`; expert execution requires Metal |
 | `args.cache-type-k`, `args.cache-type-v` | `q8_0` KV quantization; the Qwen4Exp indexer stores keys only |
 | `args.no-mmap` | `true`; explicit reads for Qwen weights |
@@ -84,7 +84,7 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `env.LLAMA_MOE_LATE_MIX` | `0`; `1` makes late guesses with the next layer's full hyper-connection mix (more accurate, more GPU work) |
 | `env.LLAMA_MOE_DECODE_ROWS` | `1` token per decode step; up to the narrowest window / 10 lets batches of a few tokens, such as speculative checks, stay in the decode phase. Flash Next's 15-slot window allows only 1 (with prefetch depth 8, 20 slots allow 2); protected slots raise it |
 | `args.spec-type`, `args.spec-draft-model`, `args.spec-draft-n-max`, `args.spec-draft-n-min`, `args.spec-draft-ngl` | Unset; speculative decoding needs `LLAMA_MOE_DECODE_ROWS` of 2 or more, and drafts are capped at rows − 1 tokens (see [speculative decoding](../docs/les/speculative-decoding.md)) |
-| `env.LLAMA_MOE_PREFILL_PIPELINE` | `1`; overlap prefill reads with computation |
+| `env.LLAMA_MOE_PREFILL_PIPELINE` | `1`; batches of 1,024 tokens or more read whole layers ahead into a staging buffer (two layers' size) and compute from it, overlapping reads with computation; `0` uses the shared bank, which is slower for long prompts |
 | `env.LLAMA_GPU_KEEPALIVE` | `1`; keep the GPU active while the worker exists; `0` disables it |
 | `env.LLAMA_MOE_QUIET` | `1`; suppress expert diagnostics; `0` enables them |
 

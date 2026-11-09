@@ -3240,6 +3240,14 @@ ggml_tensor * llm_graph_context::build_qwen_moe_ffn(ggml_tensor * cur, const lla
     ggml_tensor * p_gate = moe_decode_phase && L.ffn_gate_exps_dec    ? L.ffn_gate_exps_dec    : L.ffn_gate_exps;
     ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
     ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
+    const bool staged = !moe_decode_phase && moe_slots && moe_slots->uses_layer(il) && moe_slots->staged_prefill(n_tokens);
+    if (staged) {
+        for (ggml_tensor ** w : { &p_up, &p_gate, &p_down, &p_gu }) {
+            if (*w) {
+                *w = moe_slots->staged_weight(*w);
+            }
+        }
+    }
 
     auto build_shared = [&]() -> ggml_tensor * {
         ggml_tensor * ffn_shexp =
@@ -3285,6 +3293,9 @@ ggml_tensor * llm_graph_context::build_qwen_moe_ffn(ggml_tensor * cur, const lla
             L.ffn_gate_exps_s,
             L.ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
+    if (staged) {
+        ggml_build_forward_expand(gf, moe_slots->build_stage_release(ctx0, moe_out, il));
+    }
 
     // shared experts, as in the Qwen3Next reference
     if (L.ffn_up_shexp != nullptr) {
