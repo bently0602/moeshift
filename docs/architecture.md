@@ -267,6 +267,11 @@ The sparse-attention indexer stores keys without allocating an unused value
 cache. Its token positions follow the attention cache's slot layout. Key-only
 storage remains key-only through buffer growth and state handling.
 
+The indexer scores every cached cell for every query row, so its scratch grows
+with context times batch rows. When the top-k scratch for a whole batch would
+exceed 512 MiB, the scores, top-k and masked attention run one chunk of query
+rows at a time. Each row is computed exactly as before.
+
 Configured capacity, allocated tensor bytes, reserved virtual addresses and
 physical process footprint are different quantities. In particular, releasing
 expert ranges does not imply an identical immediate reduction in whole-system

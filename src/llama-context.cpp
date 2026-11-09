@@ -680,6 +680,21 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // LES releases the compute buffers before every decode phase (process_ubatch), so each prefill
+    // already allocates only what its graph needs. Release the reserved buffers here too: they are
+    // sized for logits on every row at full context, and Metal makes a whole buffer resident when it
+    // is first used, so the first prompt after a reserve would otherwise hold them all.
+    if (moe_slots && llm_arch_supports_les(model.arch)) {
+        size_t reserved = 0;
+        for (auto * backend : backend_ptrs) reserved += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        gf_res_prev->reset();
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+            backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        const char * moe_quiet = std::getenv("LLAMA_MOE_QUIET");
+        if (moe_quiet && std::strcmp(moe_quiet, "0") == 0)
+            fprintf(stderr, "moeshift: phase-scratch: released %zu reserved bytes\n", reserved);
+    }
 }
 
 void llama_context::synchronize() {

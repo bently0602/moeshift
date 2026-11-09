@@ -43,6 +43,18 @@ Expert execution uses the common Metal phase identifiers in
 `MISSING` (2). The resident/missing path requires Metal placement. Predictions
 schedule reads; the actual router determines which experts are computed.
 
+Graph scratch (the compute buffers) follows the same phases. Before a decode
+phase, `src/llama-context.cpp` releases the prefill compute buffers, so each
+later prefill allocates only what its graph needs. The buffers reserved at load
+or after a settings change are released the same way: they are sized for logits
+on every row at full context, and Metal makes a whole buffer resident when it is
+first used.
+
+Pages of these buffers that only the GPU writes do not appear in the process
+footprint (`phys_footprint`, `footprint`, `vmmap`), although they take physical
+memory. To measure peak memory, use system-wide internal + wired + compressed
+pages.
+
 Set `env.LLAMA_MOE_QUIET` to `0` for diagnostics such as `adaptive-batch`,
 `adaptive phase=prefill/decode`, `phase-scratch`, and `protected-cache`.
 
