@@ -3122,7 +3122,11 @@ private:
                             n_swa > 0);
 
                     const int32_t n_before_user = slot.task->params.n_before_user;
-                    const bool n_before_user_known = n_before_user > 0;
+                    // With one checkpoint and no minimum spacing, the checkpoint near the prompt's
+                    // end replaces the one before the user input, so splitting the batch there only
+                    // adds a batch.
+                    const bool n_before_user_known = n_before_user > 0 &&
+                        (params_base.n_ctx_checkpoints > 1 || params_base.checkpoint_min_step > 0);
 
                     bool has_mtmd = false;
 

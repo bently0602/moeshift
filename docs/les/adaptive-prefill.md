@@ -23,8 +23,12 @@ slots; see [protected decode cache](protected-decode-cache.md).
 ## Execution and phase transitions
 
 The server fills each batch with available prompt tokens up to the configured
-limit. Context checkpoints can split it further; the last few tokens of a prompt
-usually form their own batch. Batches of 1,024 tokens or more use the prefill
+limit. Context checkpoints split it further: the last 4 tokens of a prompt form
+their own batch, so that the checkpoint taken before them can be restored by the
+next request, whose re-rendered history differs from this prompt only in those
+tokens. The worker keeps one checkpoint, takes it whatever the distance to the
+previous one (`checkpoint_min_step` 0), and does not split the batch before the
+latest user message, whose checkpoint the end checkpoint would replace anyway. Batches of 1,024 tokens or more use the prefill
 pipeline (below). Smaller ones read only the experts they use into the shared
 bank, which is reused across layers: 512 slots cover Flash Next's 512 experts;
 256 cover Qwen3.6's 256 experts.
@@ -71,6 +75,12 @@ with the pack stride between experts, so nothing is copied and the shared bank
 is not used. A small CPU op after each layer's experts frees its half for the
 read two layers ahead while the next layer's attention runs. Models whose layers
 exceed 1,200 MiB use bounded slot reads into the bank instead.
+
+Prefill reads bypass macOS's file cache (`F_NOCACHE`); decode reads go through
+it. A prefill reads every expert once, so caching its reads would replace the
+experts decode keeps cached, which serve most decode misses and part of the next
+prefill. The worker sets `LLAMA_MOE_F_NOCACHE=auto`; the expert files switch at
+each phase change.
 
 ## Code and verification
 
