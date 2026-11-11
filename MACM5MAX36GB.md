@@ -516,6 +516,9 @@ Since N2 it also drafts from repeated text, with 2-row checks
 (`"spec-type": "ngram-simple"`, `"spec-draft-n-max": 1`, `env.LLAMA_MOE_DECODE_ROWS: 2`; see
 [n-gram drafting](#n-gram-drafting-on-agent-style-output-n2-measurement); the previous file is
 `config-source.json.bak-nospec`).
+Since B2 it also sets `"hc-type": "q8_0"`, which changes output (see
+[Q8_0 hyper-connection weights](#q8_0-hyper-connection-weights-b2-hc-type-uncommitted); the previous
+file is `config-source.json.bak-hcbf16`).
 
 The Homebrew build rejects this file, because its validator still requires
 depth 3 when protected slots are on. The main `config.json` stays compatible
@@ -2317,6 +2320,778 @@ turns; longer replies should leave more for the next prefill (not measured).
 
 - Thinking turns, whose re-rendered history drops the reasoning and may need longer rollbacks.
 - Clients that edit or regenerate the last user message, which used the checkpoint before it.
+
+## Expert predictor on the Neural Engine (N7, stage 1: the ceiling)
+
+The idea, tried before in other forms: a small model that predicts which experts each layer will
+need early enough to read them before the layer runs, on the Neural Engine so that it costs no GPU
+time. Earlier guesses were accurate but late: N6a named 91–94% of the next layer's experts with
+16 guesses, but only about 356 µs ahead and with GPU work of its own, and gained 1.8% (nothing
+after P0). The same-token data from the N2 probe shows the early layers are largely decided by
+the token itself (73% of layer 0's experts, 45–50% at layers 1–7, for the same token after a
+different previous token), the middle layers by context (25–35%).
+
+**Stage 1: what reads cost now.** `config-source.json` settings without speculation, 512 tokens
+with `ignore_eos`, normal against `LLAMA_MOE_SKIP_READ=1` (timing only, output invalid), two
+interleaved rounds:
+
+| After | Normal | Reads skipped | Reads on the critical path |
+|---|---:|---:|---:|
+| `short.json` | 24.45 / 24.88 tok/s (40.2–40.9 ms) | 36.07 / 36.10 tok/s (27.7 ms) | 12.5–13.2 ms (31–32%) |
+| `long.json` | 22.26 / 22.56 tok/s (44.3–44.9 ms) | 33.35 / 33.36 tok/s (30.0 ms) | 14.3–14.9 ms (32–33%) |
+
+Hiding every expert read would make generation about 45–48% faster (35% in G5, before the GPU-side
+changes). Normal generation read about 85–95 MB per token from the SSD (`iostat`), the file cache
+serving the rest of about 100 misses per token. Read 27.7 ms apart, those bytes need about
+3.1 GB/s, within the SSD's 7.2 GB/s: bandwidth would not limit a good predictor, lead time and
+accuracy would.
+
+## Expert predictor on the Neural Engine (N7, stage 2: offline accuracy)
+
+A temporary build dumped each layer's router input (2,560 values, fp16) and the experts it chose,
+while prefilling 16 documents: about 17,700 tokens to train on (engine C++ and Python sources,
+these notes, the long prose prompt, model-generated code) and 6,000 held out (other sources,
+LES docs, generated prose, the TODO). Routing does not depend on whether a token is prefilled or
+generated. For every layer pair up to 4 apart, predictors of layer L+d's experts from layer L's
+router input were scored on the held-out tokens: the share of the 10 experts a token used that
+are among the top 8 or 16 guesses (`/Volumes/Data/moeshift-scratch/ane/stage2.py`; PyTorch 2.8 on
+the GPU, 146 s for all of them).
+
+| Layers ahead | L+d's router on L's input, 8 / 16 guesses | Trained linear, 8 / 16 | Two-layer net (512 hidden), 8 / 16 |
+|---:|---:|---:|---:|
+| 1 | 55.7 / 76.3% | 58.3 / 80.4% | 59.3 / 81.3% |
+| 2 | 47.4 / 65.9% | 55.6 / 77.3% | 56.8 / 78.6% |
+| 3 | 43.7 / 61.1% | 53.8 / 75.3% | — |
+| 4 | 41.7 / 58.5% | 52.9 / 74.2% | — |
+
+(Averages over target layers; per layer, the linear model with 16 guesses ranged 64–88%.) A
+token → experts table from the training rows named 69% of layer 0's experts with 16 guesses
+(52% with 8) and 46–52% at layers 1–7; 82% of held-out tokens occurred in the training rows.
+
+- Training adds 11–16 points over the router heuristic from 2 layers ahead, and accuracy falls
+  slowly with distance (80% → 74% from 1 to 4 layers ahead), so lead time is cheap in accuracy.
+- The stop point set for this stage, about 85% with 16 guesses at 2 or more layers ahead, was not
+  reached (77–79%).
+- The input was limited: layer L's router input, before its expert output is added. N6a's late
+  guess, from the residual after layer L with L+1's own mix, named 91–94% one layer ahead, against
+  80% here, so a richer input should raise every row. The training set was also small.
+- Recall of all experts used overstates what matters: experts already in the decode window are
+  the easy ones, and every wrong guess costs a read (about 2 MB). The deciding measure is how many
+  of today's misses a predictor catches within a fixed read budget, which a replay of the decode
+  windows over these routing sequences can estimate.
+
+## Expert predictor on the Neural Engine (N7, stage 2b: richer input, window replay)
+
+A second dump over a larger corpus: 56,200 training tokens (24 C++ and Python sources, 7 Markdown
+files, model-written prose and reasoning from ten prompts, the long prose prompt) and 10,200
+held out (other sources and prose). Besides each layer's router input, it saved the residual after
+layers 3, 7, …, 43 (all 4 hyper-connection streams, 10,240 values). Predictors of layer L+d's
+experts were trained per sampled L and scored on the held-out tokens, by recall and by a replay of
+the decode windows: a 20-slot LRU window per layer, reset at each document like a new reply,
+filled per token with up to 8 read-ahead guesses and then the 10 experts used
+(`/Volumes/Data/moeshift-scratch/ane/stage2b.py`, 413 s).
+
+| Layers ahead | Today's guess (T's router on T−1's input), 8 | Linear on L's router input, 8 / 16 | Linear on L's residual, 8 / 16 | Net on L's residual (1,024 hidden), 8 / 16 |
+|---:|---:|---:|---:|---:|
+| 1 | 59.0% | 59.0 / 81.5% | 55.5 / 76.4% | 60.7 / 82.3% |
+| 2 | 58.7% | 56.5 / 78.9% | 53.8 / 74.7% | 59.2 / 81.1% |
+| 3 | 55.2% | 54.8 / 76.7% | 54.8 / 76.1% | — |
+| 4 | 51.3% | 49.4 / 69.9% | 47.6 / 67.0% | — |
+
+Window replay, misses per layer and token (8 reads ahead per layer):
+
+| Layers ahead | No read-ahead | Today's guess | Best predictor |
+|---:|---:|---:|---:|
+| 1 | 5.16 | 2.66 | 2.37 |
+| 2 | 5.40 | 2.71 | 2.59 |
+| 3 | 5.93 | 3.05 | 3.00 |
+| 4 | 5.06 | 2.95 | 3.08 |
+
+- The residual did not help a linear model, and a network on it gained 1–2 points: with 8 guesses
+  every predictor named about 59% of the experts, the same as today's one-layer-ahead guess.
+- Two layers ahead, the best predictor removed about 4% of the misses today's guess leaves (the
+  replay ignores timing). Its remaining advantage is arriving on time: N3 found 14% of misses
+  were guessed but late. Both together might be worth about 2 ms per token (about 5%), before
+  the cost of running a model on the Neural Engine every token and copying the residual off the GPU.
+- **Not continued.** Two or more layers ahead there is not enough information in this layer's
+  state to name more of the next layers' experts within 8 reads. A different input (routing
+  history over several tokens) or more expert cache (memory) would be needed; the LRU window and
+  the file cache already capture much of both.
+
+## Expert predictor from a small model (N7, stage 2c)
+
+Qwen3.5-0.8B tokenizes the corpus exactly like Flash Next, so its states line up with the stage 2b
+routing token by token. A small tool (`/Volumes/Data/moeshift-scratch/ane/small/hid.cpp`, on the GPU
+for this study) saved the outputs of its layers 5, 11 and 17 (3 × 1,024 values per token); MLPs
+(1,024 hidden) were trained per big-model layer on the same train/held-out split
+(`stage3s.py`, 467 s):
+
+| Big-model layers | Today's guess, 8 | Small model, same token, 8 / 16 | Small model, next token, 8 / 16 | Small model + big model's router input of T−2, 8 / 16 |
+|---|---:|---:|---:|---:|
+| All | 54.9% | 45.6 / 65.1% | 35.6 / 52.8% | 58.1 / 79.7% |
+| 0–7 | 48.4% (none for layer 0) | 58.7 / 80.9% | 45.3 / 65.2% | 60.9 / 83.0% |
+| 8–39 | 56.1% | 43.5 / 62.7% | 34.3 / 51.4% | 57.6 / 79.3% |
+| 40–47 | 55.6% | 40.6 / 58.7% | 30.7 / 46.2% | 57.9 / 78.7% |
+
+Window replay (20 slots, 8 reads ahead), misses per token over all layers: no read-ahead 265,
+today's guess 147, the small model alone 165, the small model with the big model's state two
+layers back 127 (−14%).
+
+- The two are complementary: the small model alone is weaker than today's guess past layer 7,
+  but with the big model's router input from two layers back it names more experts than today's
+  one-layer-ahead guess, and early enough not to be late.
+- Layer 0, which nothing predicted before (see L0), gets 68% of its experts with 8 guesses (91%
+  with 16) from the small model's state for the same token: 8.9 → 2.9 misses per token.
+- Predicting the next token's experts from the small model alone is weak (36% with 8).
+- Not yet known: whether the small model can run fast enough and cheaply enough per token (it must
+  finish token t before the big model's layers need the guesses), and the memory of the heads (48
+  MLPs of 1,024 hidden are about 300 M parameters; smaller heads untested).
+
+### On the Neural Engine (N7, stage 3a)
+
+A PyTorch decode step with Qwen3.5-0.8B's shapes for layers 0–17 (the predictor uses the outputs of
+5, 11 and 17; random weights): gated delta-net layers with their 16 × 128 × 128 recurrent and
+convolution state, a gated full-attention layer every fourth layer with a 1,024-token KV cache,
+SwiGLU FFNs; all state in Core ML states (one per layer, written by slice assignment). Converted
+with coremltools 9 (fp16, macOS 15 target, `/Volumes/Data/moeshift-scratch/ane/small/ane_probe.py`):
+
+- The compute plan for CPU + Neural Engine puts all 1,364 non-constant operations on the Neural
+  Engine, including the state reads and writes.
+- One step (100 runs after warm-up): 6.78 ms median (p90 7.30) on CPU + Neural Engine, 7.15 ms
+  with all units, 4.20 ms on CPU + GPU; CPU only failed to load (error −14, probably the fp16
+  states). Loading took 2.5 s.
+
+**Running alongside the big model** (`ane_loop.py`, `conc.sh` in the same folder): 512 tokens
+with `ignore_eos` after `short.json` and `long.json`, the step looping in a separate process on
+CPU + Neural Engine, two interleaved rounds:
+
+| Neural Engine load | After `short.json` | After `long.json` | `long.json` prompt | Small-model step |
+|---|---:|---:|---:|---:|
+| Off | 25.78 / 26.63 tok/s | 25.02 / 24.98 tok/s | 7.03 / 7.04 s | — |
+| One step every 40 ms (one per token) | 26.11 / 26.22 tok/s | 24.47 / 24.60 tok/s | 7.14 / 7.17 s | 7.33–7.35 ms (p99 7.8) |
+| As fast as possible (about 140 steps/s) | 23.88 / 23.90 tok/s | 22.61 / 22.55 tok/s | 7.68 / 7.70 s | 7.08 ms |
+
+At one step per token the big model lost 0–2% (none after the short prompt, 1.9% after the long
+one; its prompt 1.6%); flat out 9–10%. The shared resource is most likely memory bandwidth: the
+fp16 weights add about 19 GB/s at 25 steps per second. The paced loop also ran during prompts and
+between requests, which a real integration would not.
+
+**4-bit palettized weights** (`palettize.py`: k-means, a lookup table per group of 16 channels,
+`coremltools.optimize.coreml.palettize_weights`): the compiled model shrank from 716 to 180 MB, all
+1,364 operations stayed on the Neural Engine (the 140 lookup-table expansions are constants), and a
+step took 4.36 ms alone (p90 4.41). Alongside the big model, same test:
+
+| Neural Engine load, 4-bit | After `short.json` | After `long.json` | `long.json` prompt | Small-model step |
+|---|---:|---:|---:|---:|
+| Off | 26.18 / 26.24 tok/s | 24.79 / 24.76 tok/s | 7.08 / 7.10 s | — |
+| One step every 40 ms | 26.07 / 26.12 tok/s | 24.67 / 24.55 tok/s | 7.08 / 7.09 s | 4.76–4.78 ms (p99 5.0) |
+| As fast as possible (about 220 steps/s) | 25.37 / 25.21 tok/s | 23.98 / 23.82 tok/s | 7.31 / 7.35 s | 4.57 ms |
+
+At one step per token the big model lost 0.4–0.7%, its prompts nothing. The weights are random,
+so the 4-bit model's hidden states (and how well the predictor works on them) are untested; a
+predictor would have to be trained on the 4-bit model's own outputs.
+
+Still open: predictions
+arrive about 7 ms after a token is sampled, in time two layers ahead only from about layer 10,
+unless the step is split so that layer 5's output comes earlier; fp16 weights take about 0.76 GB
+(4-bit palettization untested); the KV cache grows with context (about 0.6 GB at 60k tokens);
+prompts need a batched prefill path. Core ML compiled into the internal SSD's temporary folder
+twice before compilation was pointed at `/Volumes/Data` (about 1.5 GB written).
+
+### Real weights on the Neural Engine (N7, stage 3b)
+
+The PyTorch step with Qwen3.5-0.8B's real weights (dequantized from the Q8_0 GGUF,
+`/Volumes/Data/moeshift-scratch/ane/small/real_step.py`) matched llama.cpp's layer 5/11/17
+outputs (cosine 1.0000 over 96 tokens). Converted to Core ML with a 4,096-token KV cache
+(`convert_real.py`) and run on CPU + Neural Engine:
+
+| Version | Step | Cosine with fp32, layers 5 / 11 / 17 (median, first 96 tokens) | Lowest |
+|---|---:|---:|---:|
+| fp16 | 8.77 ms | 0.983 / 0.967 / 0.979 | 0.92 |
+| 4-bit palettized | 5.99 ms | 0.941 / 0.912 / 0.936 | 0.61 |
+
+The whole corpus, token by token from a fresh state per document (`run_corpus.py`; one
+6,246-token training document restarted its state every 4,096 tokens), took 396 s at 4-bit and
+581 s at fp16. Agreement with llama.cpp's outputs by position (`drift.py`, median cosine):
+
+| Layer | fp16, positions 0–64 / 64–256 / 256–1,024 / 1,024–4,096 | 4-bit, same |
+|---|---|---|
+| 5 | 0.982 / 0.984 / 0.984 / 0.983 | 0.943 / 0.950 / 0.952 / 0.949 |
+| 11 | 0.972 / 0.963 / 0.956 / 0.947 | 0.927 / 0.914 / 0.902 / 0.888 |
+| 17 | 0.982 / 0.975 / 0.970 / 0.964 | 0.946 / 0.938 / 0.931 / 0.922 |
+
+Layer 5 stays steady; layers 11 and 17, which carry the recurrent and attention state of earlier
+layers, drift further along the document (fp16 rounding accumulating in that state). Heads
+retrained on each version's own outputs (`heads.py`) predicted as well as on llama.cpp's:
+
+| States from | Small model alone, 8 guesses | Small + big model's input of T−2, 8 guesses | Misses per token, small + big (today's guess 147) | Layer 0, 8 guesses |
+|---|---:|---:|---:|---:|
+| llama.cpp (Q8) | 45.6% | 58.1% | 127 | 67.9% |
+| Core ML fp16 | 44.9% | 58.0% | 128 | 68.3% |
+| Core ML 4-bit | 44.3% | 57.9% | 128 | 68.8% |
+
+At up to 4,096 tokens the drift costs nothing measurable. Untested: contexts of 16–64k, where it
+keeps growing; a turn could start from an exact state if the small model's prompt is processed by
+llama.cpp on the GPU and its state handed over, so drift would accumulate only over each reply.
+
+### Smaller heads (N7, stage 3c)
+
+The heads above (1,024 hidden, inputs 3,072 + 2,560) have about 297 M parameters (594 MB at fp16).
+Retrained on the 4-bit Neural Engine model's outputs, with the same window replay
+(`/Volumes/Data/moeshift-scratch/ane/small/shrink.py`); "PCA 256" compresses the small model's
+3,072 values once per token (64% of their variance); "router(T)" feeds layer T's own router applied
+to the big model's input of T−2 (512 scores, no new weights) instead of that 2,560-value input:
+
+| Heads | Misses per token (today's guess 147) | Recall with 8 guesses | Parameters | fp16 |
+|---|---:|---:|---:|---:|
+| Small 3,072 + big 2,560, 1,024 hidden (above) | 128.0 | 57.9% | 297 M | 594 MB |
+| Small 3,072 + big 2,560, 256 hidden | 133.7 | 55.9% | 74 M | 148 MB |
+| Small PCA 256 + big 2,560, 256 hidden | 132.2 | 56.3% | 40 M | 81 MB |
+| Small PCA 256 + router(T), 256 hidden | 129.2 | 58.0% | 16 M | 33 MB |
+| Small PCA 256 + router(T), linear | 128.4 | 57.6% | 19 M | 38 MB |
+| Small PCA 256 + router(T), 128 hidden | 133.1 | 56.7% | 9 M | 17 MB |
+
+Feeding the big model's state through the target layer's existing router keeps the whole gain with
+a fraction of the weights: a linear head of 768 → 512 per layer (38 MB at fp16, about 19 MB at
+8-bit, untested) matched the full heads. With the 4-bit small model (180 MB) and its cache, the
+predictor would take about 250 MB at short contexts.
+
+### Long context (N7, stage 3d)
+
+A 16,643-token document (the start of these notes, in a chat prompt) prefilled once by the dump
+build for its routing and router inputs, llama.cpp's small-model states as the exact reference,
+and two Neural Engine versions of the 4-bit step: one with a 20,480-token KV cache, and the 4k
+step used as a ring buffer (attention over the last 4,096 tokens, rotary positions absolute, the
+delta-net state over the whole document). The compact linear heads, trained on the corpus
+(documents under 4k tokens), were applied to the long document; the window replay ran through it
+without a reset (`/Volumes/Data/moeshift-scratch/ane/small/run_long.py`, `run_window.py`,
+`long_eval.py`).
+
+| | 20k cache | 4k ring buffer |
+|---|---:|---:|
+| Step, at every position | 15.27 ms | 5.94 ms |
+| KV cache of the small model | about 170 MB | about 32 MB |
+
+The full cache costs the same at every position because the step reads all of it.
+
+Median cosine with llama.cpp's states by position (the ring buffer also differs by design past 4k):
+
+| | Layer | 0–1k | 2–4k | 4–8k | 8–12k | 12–16.6k |
+|---|---|---:|---:|---:|---:|---:|
+| 20k cache | 5 | 0.947 | 0.949 | 0.951 | 0.942 | 0.936 |
+| | 11 | 0.900 | 0.881 | 0.877 | 0.863 | 0.839 |
+| | 17 | 0.932 | 0.921 | 0.916 | 0.908 | 0.893 |
+| Ring buffer | 11 | 0.900 | 0.881 | 0.841 | 0.812 | 0.795 |
+| | 17 | 0.932 | 0.921 | 0.894 | 0.872 | 0.856 |
+
+Misses per token in the window replay:
+
+| Position | 0–1k | 1–2k | 2–4k | 4–8k | 8–12k | 12–16.6k |
+|---|---:|---:|---:|---:|---:|---:|
+| Heads, 20k cache | 127.8 | 128.3 | 139.5 | 140.0 | 139.1 | 147.8 |
+| Heads, 4k ring buffer | 127.9 | 128.1 | 139.7 | 140.2 | 139.7 | 148.5 |
+| Today's guess | 143.0 | 144.6 | 153.1 | 151.6 | 151.3 | 156.6 |
+
+The ring buffer predicts as well as the full cache at a constant 6 ms step and 32 MB. Against today's
+guess the reduction shrinks along the document, from 11% to 5–6%; the heads never saw positions past
+4k in training, which training on long documents would address (untested).
+
+### Heads trained on long documents (N7, stage 3e)
+
+Five more training documents of 12–18k tokens (the first 52,000 characters of
+`src/llama-moe-slot.cpp`, `tools/server/server-context.cpp`, `ggml-metal-ops.cpp`,
+`src/llama-graph.cpp` and the other Markdown docs; 75,433 tokens) and a second held-out long
+document (`src/llama-context.cpp`, 14,528 tokens), dumped like the others; the small model's states
+from the 4k ring buffer on the Neural Engine (537 s for all six). Compact linear heads trained on the
+short corpus only, or on the short corpus plus the five long documents
+(`/Volumes/Data/moeshift-scratch/ane/small/long_train.py`). Misses per token in the window replay:
+
+| Held-out | Position | Short-trained | Short + long-trained | Today's guess |
+|---|---|---:|---:|---:|
+| Notes, 16.6k tokens | 0–1k | 129.5 | 123.0 | 143.0 |
+| | 1–2k | 130.1 | 124.2 | 144.6 |
+| | 2–4k | 141.7 | 134.1 | 153.1 |
+| | 4–8k | 142.1 | 133.3 | 151.6 |
+| | 8–12k | 141.6 | 132.2 | 151.3 |
+| | 12–16.6k | 150.6 | 140.2 | 156.6 |
+| `llama-context.cpp`, 14.5k tokens | 0–1k | 125.6 | 116.1 | 145.7 |
+| | 1–2k | 137.6 | 128.3 | 154.9 |
+| | 2–4k | 152.1 | 140.7 | 169.6 |
+| | 4–8k | 154.8 | 142.5 | 172.0 |
+| | 8–12k | 162.7 | 149.1 | 178.6 |
+| | 12–14.5k | 151.1 | 140.4 | 171.2 |
+| Short held-out set | all | 130.3 | 124.6 | 146.5 |
+
+With long documents in training, the heads cut misses against today's guess by 10–14% on the notes
+(the smallest gain at the end), 17–20% on the long source file, and 15% on the short held-out set
+(11% when trained on the short corpus alone): more training data helped at every length.
+
+### In the engine (N7, stage 4: guesses injected from a file, not kept)
+
+Before building the Neural Engine path into the engine, the heads' guesses were computed offline for
+a fixed greedy run and fed to the engine, to measure the real gain. A scratch build (worktree
+`/Volumes/Data/moeshift-scratch/n7i/wt`, patch `n7i/patch_n7i.py`, not in the repository) dumped
+the tokens, routing and router inputs of `short-ie.json` and `long-ie.json` (512 tokens each,
+`config-source.json` settings without speculation, one server for both). `n7i/make_guesses.py` ran
+the 4-bit small model with its 4k ring buffer over each request's tokens on the Neural Engine and
+trained the stage 3e heads (short + long documents). It wrote the heads' guesses per decode step
+and layer, and today's guesses as a control. The engine then replaced the graph's guess for layer
+L+1 with the file's (same timing as today: read once layer L's demand reads finish). A check against
+the recorded layer-0 routing found every step aligned, and every response matched the dump run.
+
+On the model's own output, the window replay gave the heads 10% fewer misses than today's guess
+after the short prompt and 6% after the long one. Starting at layer 8, roughly where the small
+model's output would arrive in time (about 6 ms into a 38–40 ms step), it gave 7% and 4%. Three
+interleaved rounds, fresh server each; medians, with demand misses per token from the probe's
+counter:
+
+| Guesses | After `short-ie.json` | After `long-ie.json` |
+|---|---:|---:|
+| Graph (baseline) | 26.22 tok/s, 160.9 misses | 24.89 tok/s, 180.2 misses |
+| Today's, from the file (control) | 26.46 tok/s, 159.8 misses | 24.82 tok/s, 180.3 misses |
+| Heads, layers 1–47 | 26.52 tok/s, 150.3 misses | 24.62 tok/s, 175.0 misses |
+| Heads from layer 8, today's before | 26.41 tok/s, 154.6 misses | 24.76 tok/s, 177.7 misses |
+
+The heads cut demand misses by 6% and 3% but gained nothing; after the long prompt they were
+0.8% slower in all three rounds (ranges 24.51–24.67 against 24.78–24.84). With diagnostics on,
+the control read about 174k experts on demand and 205k by prefetch (65% of them used) over the run.
+The heads read about 166k and 210k (67.5% used): they moved about 2% of the reads from demand to
+prefetch, and the total stayed within 1%.
+
+**Ceiling.** The experts each layer actually used, injected the same way (two rounds each):
+
+| Guesses | After `short-ie.json` | After `long-ie.json` | Demand misses, first 768 steps |
+|---|---:|---:|---:|
+| Today's, from the file | 26.49–26.67 tok/s | 24.87 tok/s | 125k |
+| Exact, 8 of the 10 read | 28.65–28.97 tok/s (+8–9%) | 26.96–27.11 tok/s (+9%) | 55k |
+| Exact, all 10 read | 27.63–28.20 tok/s | 25.56–26.67 tok/s | 55–57k |
+
+At today's timing, even exact guesses gain only about 9%, for 56% fewer demand misses. The heads
+remove about a tenth of those misses, worth about 1% at most, and the Neural Engine model would cost
+0.4–0.7% and about 250 MB. The integration was stopped here. A predictor would have to remove about
+half of the demand misses at this timing to approach 9%; a larger gain needs guesses well ahead of
+today's one layer.
+
+**Early guesses: what accuracy pays.** To decide whether fine-tuning the small model could be worth
+it, a second scratch patch (`n7i/patch_early.py`) read guesses early. At the start of each decode
+step, the guesses for layers F and up go into a queue in layer order. After an optional delay,
+four threads read them into each layer's window through the read-ahead install path, which never
+evicts the latest step's experts and drops its copy if a demand read got there first. Guesses for
+a layer the step has already reached are dropped. Today's guess for the next layer stays on. F = 8
+with a 6 ms delay approximates the Neural Engine model: its output arrives about 6 ms into the step,
+when the big model is near layer 8. Exact guesses (the 10 experts used) and copies with some
+replaced by random unused experts, all 10 read; two interleaved rounds, every response identical.
+The baseline ran about 4% slower that session than in the table above.
+
+| Early guesses | After `short-ie.json` | After `long-ie.json` | Demand misses per token, short |
+|---|---:|---:|---:|
+| None (baseline) | 25.16–25.23 tok/s | 23.28–23.52 tok/s | 165 |
+| Exact, layers 1–47, at step start | 30.16–30.19 (+20%) | 28.31–28.45 (+21%) | 46 |
+| Exact, layers 8–47, 6 ms in | 28.89–28.99 (+15%) | 27.16–27.24 (+16%) | 73 |
+| 8 of 10 right, layers 8–47, 6 ms in | 24.66–24.69 (−2%) | 22.54–22.61 (−3%) | 107 |
+| 6 of 10 right | 20.02–20.06 (−20%) | 18.63–18.71 (−20%) | 151 |
+| 4 of 10 right | 16.90 (−33%) | 15.29–15.93 (−33%) | 194 |
+
+Early, exact guesses would be worth about 15% at the Neural Engine's timing, but a wrong guess costs
+a full expert read and can push a useful expert out of the window: below about 85% right it is a
+loss. Random wrong guesses are the worst case, since they are never already in the window. Real
+predictions err on plausible experts and can be limited to the confident ones, so heads on the
+small model's state alone (`n7i/small_only.py`, PCA 256, linear, trained as stage 3e; precision of
+the top 2 / 4 / 8 guesses 72% / 65% / 53%, recall 14% / 26% / 43%) were read the same way. Two
+rounds, every response identical:
+
+| Small-model heads, layers 8–47, 6 ms in | After `short-ie.json` | After `long-ie.json` | Demand misses per token, short / long |
+|---|---:|---:|---:|
+| None (baseline) | 25.14–25.30 tok/s | 23.44–23.66 tok/s | 165 / 186 |
+| Top 2 read | 25.37–25.43 (+0.5%) | 23.25–23.48 (−0.8%) | 156 / 179 |
+| Top 4 read | 25.37–25.43 (+0.5%) | 23.03–23.27 (−1.7%) | 148 / 173 |
+| Top 8 read | 25.05–25.06 (−0.7%) | 22.46 (−4%) | 142 / 171 |
+
+Fine-tuning was not tried. To pay, it would have to take the small model from 53% to about 85% precision
+with most of the used experts named, from the tokens alone. Earlier stages found the token decides
+most of layer 0's experts but only 25–35% of the middle layers'. The big model's own next-layer
+signal, the best guess found (N6a), names 72% of the experts with 8 guesses.
+
+**The big model's residual, k layers ahead.** Whether N6a's accurate late guess keeps its accuracy
+further ahead. The scratch build dumped, for the same two requests (responses identical), the
+residual streams after every layer, and for each decode step and layer the experts resident when
+the routing arrived and the demand misses (`n7i/patch_resid.py`). `n7i/ahead.py` guessed layer T
+from the residual after layer T−k. V1 applies layer T's full hyper-connection mix, then its router
+(N6a's V1). V3 applies layer T's grouped norm only, each stream routed and summed (the late
+prefetch's default form). A guess catches a miss if it names a demand miss and wastes a read if it
+names an expert neither used nor resident. The gain is estimated from the early-read curve above,
+which these two numbers fit within a few points: about +0.16% per miss caught and −0.14% per
+wasted read. Layers 4–47 (145 of the 169 demand misses per token), top 4 guesses per layer:
+
+| Guess | Lead before the layer's experts | Guesses used | Misses caught per token | Wasted reads per token | Reads that were needed | Estimated gain |
+|---|---|---:|---:|---:|---:|---:|
+| V1, k = 1 | about 0.35 ms (layer T's attention) | 97% | 27.5 | 2.7 | 91% | +4.1% |
+| V1, k = 2 | about 1.1 ms | 88% | 25.4 | 11.6 | 69% | +2.5% |
+| V1, k = 3 | about 1.9 ms | 78% | 24.9 | 27.4 | 48% | +0.1% |
+| V1, k = 4 | about 2.6 ms | 69% | 23.7 | 42.0 | 36% | −2.2% |
+| V3, k = 1 / 2 / 3 | | 92% / 86% / 81% | 24.8 / 23.4 / 23.8 | 7.0 / 13.2 / 19.7 | 78% / 64% / 55% | +3.0% / +1.9% / +1.0% |
+| Today's guess (k = 1) | | 84% | 10.5 | 3.5 | 75% | +1.2% |
+
+The best of any width: V1 k = 1 with 8 guesses, +9.1%; V1 k = 2 with 6 guesses, +3.1%; V3 k = 2 with 4
+guesses, +1.9%. Accuracy falls off quickly with lead: the share of reads that were needed drops
+from 91% to 69%, 48% and 36% for k = 1 to 4. Where it is high, the lead is too short for the
+reads. N6a measured late reads at 185–193 µs at the median and 577–607 µs at p90, and its k = 1
+version gained 1.8% before P0 and nothing after. These estimates assume every read finishes in
+time, and they leave out the guesses' GPU cost: V1 reads about 13 MB of mix weights per layer, and
+N6a's cheaper V3 chain cost 1.3–2 ms per token before it was trimmed. Two layers ahead, the best
+estimate (+2.5–3%) is about what the guess costs to compute. No guess source found reaches the
+accuracy that early reads need, so expert prediction was left here.
+
+## Cache bounds for expert reads (after N7)
+
+What any keep-or-evict policy could save, from the held-out stage 2b routing in token order
+(`/Volumes/Data/moeshift-scratch/ane/bounds.py`, `l2bounds.py`; no read-ahead, so absolute
+numbers are higher than in generation).
+
+Decode window, per layer, reset per document:
+
+| Policy | Misses per layer and token | Per token |
+|---|---:|---:|
+| LRU, 20 slots (today) | 5.53 | 265 |
+| Belady's optimal, 20 slots | 4.11 | 197 |
+| LRU, 40 / 64 slots | 4.11 / 3.01 | 198 / 144 |
+
+A perfect replacement policy would cut window misses by 26%, as much as doubling the window
+(about +1.7 GB). Most window misses are served by the file cache, though.
+
+File cache, all window misses of the 66,400-token corpus in order through a cache shared by all
+layers and kept across documents (about 14 GB holds roughly 7,000 of the 24,576 experts):
+
+| Capacity | LRU | Admit only experts missed twice in the last 20,000 misses | Belady's optimal |
+|---|---:|---:|---:|
+| 7,000 experts | 56.9 SSD reads per token | 52.5 | 24.3 |
+| 5,000 experts | 94.7 | 83.6 | 41.5 |
+
+The simulated LRU figure is close to the 40–45 experts per token generation reads from the SSD
+(85–95 MB). An optimal file-cache policy would read 57% fewer experts from the SSD; a simple
+frequency rule recovers 8–12% of that. The engine controls admission (a second, `F_NOCACHE`
+descriptor per file for reads that should not be cached), not the OS's eviction order.
+
+**What an SSD read costs.** The same greedy 256-token generation after `short.json`, in one
+worker, with the expert pages first pushed out of the file cache (reading 16 GB of unrelated
+data) and then repeated with them cached; the SSD counter read when the first token streamed in
+separates prefill from generation (`/Volumes/Data/moeshift-scratch/ane/ssdsplit.sh`):
+
+| Run | Prefill: SSD, time | Generation: SSD per token | Generation |
+|---|---:|---:|---:|
+| Cold | 13.1 / 12.3 GB, 2.51 / 2.41 s | 75.9 / 74.0 MB | 41.13 / 41.17 ms per token |
+| Warm | 3.5 / 3.6 GB, 1.10 / 1.12 s | 22.0 / 22.3 MB | 35.51 / 35.79 ms per token |
+
+All four generated the same text. About 53 MB per token (roughly 30 experts) read from the file
+cache instead of the SSD saved about 5.5 ms per token: about 0.1 ms per MB, 0.18 ms per expert.
+Even fully warm, a token took 35.6 ms against 27.7 ms with reads skipped, so about 8 ms per token
+is the copy from the file cache and the per-layer handshakes, not the SSD.
+
+At about 85–95 MB per token from the SSD in a session's steady state, the optimal file-cache
+policy above (57% fewer SSD reads) would be worth about 5 ms per token (+12–14%); a policy that
+closes half the gap to it about +6–7%.
+
+## Learned file-cache policy (N8, offline, not kept)
+
+The file-cache access stream of decoding the stage 2b corpus, with today's read-ahead (8 guesses
+per layer from the next layer's router), through a 7,000-expert cache; models trained on the first
+60% of the stream, scored on the last 40% (`/Volumes/Data/moeshift-scratch/ane/l2learn.py`,
+`l2evict.py`, `l2ra.py`). The stream had 371 accesses per token, 59% of them read-ahead.
+
+| Policy | SSD reads per token: demand + read-ahead |
+|---|---:|
+| LRU, admit everything (today) | 37.3 + 42.0 = 79.3 |
+| Admit if accessed in the last 10,000 accesses | 35.2 + 38.7 = 73.9 |
+| Learned admission (MLP on recency, counts over 1k–1M accesses, layer, kind), best of 9 settings | 34.8 + 37.1 = 71.9 |
+| Learned eviction: furthest predicted next use (MLP regression of reuse distance) | 50.7 + 53.6 = 104.3 |
+| LFU-style eviction (accesses in the last 100,000) | 49.9 + 57.2 = 107.2 |
+| Read-ahead misses not cached | 30.1 + 69.6 = 99.6 |
+| Belady's optimum | 16.6 + 17.2 = 33.8 |
+
+- With the OS keeping its LRU-like eviction order, admission recovers 9% of the SSD reads (about
+  1.3 ms per token, 3%). The gap to the optimum is in eviction order.
+- Owning the cache (for example in purgeable memory, which the kernel discards instead of swapping)
+  would allow any eviction order, but eviction learned from these history features was worse than
+  LRU: the access pattern is dominated by recency, which LRU already uses, and the optimum's
+  advantage comes from knowing the future, which the history does not carry.
+- Not caching read-ahead misses cut demand SSD reads by 19% but raised read-ahead reads by 66%,
+  because wrong guesses were read again. Measured in the engine (a temporary build reading
+  read-ahead through a second, `F_NOCACHE` descriptor; 512 tokens after `short.json`, `long.json`
+  and `short.json` again per worker, two interleaved rounds): generation was 2–3% slower in steady
+  state (26.49 / 26.50 against 27.35 / 27.41 tok/s after the second short prompt, 24.78 / 24.71
+  against 25.29 / 25.32 after the long one) and read 32–45% more from the SSD; outputs identical.
+  Not kept.
+
+## What a GB of file cache is worth
+
+Routed experts take 40 GB on disk and the file cache holds roughly 14–17 GB of them, so any memory
+the worker or other programs hold comes out of the expert cache. Expert use is spread out: in the
+66,400-token corpus, the 1,000 most-used experts (1.6 GB) served 24% of expert uses, the top 7,000
+(11.4 GB) 70% and the top 15,000 (24.4 GB) 92%. Only 2 of the 24,576 experts served more than half
+of the tokens and 451 more than 10%. The hot set also moves with the content: the 7,000 experts
+most used on code covered 44% of the uses on other text (that text's own top 7,000: 79%), and the
+corpus's top 7,000 covered 47% of the two benchmark generations. A fixed pinned set would do worse
+than the recency-ordered file cache.
+
+To measure the value of cache memory, a helper (`/Volumes/Data/moeshift-scratch/memval/balloon.c`)
+filled 0, 2, 4 or 6 GB with random data and locked it (`mlock`, so it was neither compressed nor
+swapped), and a fresh server then ran `short-ie.json`, `long-ie.json`, `short-ie.json`,
+`long-ie.json` (512 tokens each, `config-source.json` settings without speculation). Two
+interleaved rounds; swap use did not change. Generation of the second pair, both rounds, SSD
+reads per request (`iostat`, prefill included) and demand misses per generated token:
+
+| Memory locked | Second short request | Second long request | SSD per request (short / long) | Demand misses (short / long) |
+|---:|---:|---:|---:|---:|
+| 0 GB | 25.42 / 25.38 tok/s | 22.56 / 23.36 tok/s | 34 / 59 GB | 165 / 187 |
+| 2 GB | 24.45 / 24.00 (−4.6%) | 21.88 / 21.36 (−5.8%) | 43 / 76 GB | 169 / 193 |
+| 4 GB | 23.10 / 23.16 (−8.9%) | 20.72 / 21.10 (−8.9%) | 54 / 87 GB | 173 / 197 |
+| 6 GB | 21.56 / 21.61 (−15%) | 19.66 / 19.73 (−14%) | 71 / 103 GB | 180 / 202 |
+
+The first pair of requests showed the same trend (after the short prompt 25.46, 24.77, 23.62 and
+22.45 tok/s; after the long one 24.00, 22.27, 21.18 and 19.68). Each GB taken from the file cache
+cost about 2.3–2.9% of generation (about 1 ms per token), close to linearly up to 6 GB. Demand
+misses hardly changed (+6–9%); the extra misses went to the SSD instead of the file cache. By the
+same slope, a GB the worker or other programs give back is worth roughly +2.5%, until the cache
+holds most of what a session uses.
+
+This prices the memory the configuration spends: the prompt cache (`cache-ram`, up to 4,096 MiB:
+about 10% of generation when full; it held 640 MiB in these runs), the decode windows (12 cache
+plus 8 read-ahead slots per layer, 1,027 MiB, mostly second copies of file-cache pages), and
+other applications.
+
+**Where the worker's footprint goes** (`footprint` after one `short-ie.json` request, repository
+build, `config-source.json` settings): 6,663 MB, of which 5,808 MB untagged (Metal buffers: the
+non-expert weights, the decode windows, caches) and 679 MB of large `malloc` blocks. `vmmap` counted
+433 MB of those as freed but still dirty ("Malloc Large (empty)"): memory the process no longer
+uses but macOS still charges to it, as the prompt cache's freed entries were before M2 (fixed in
+M4 below). With
+`--ctx-size` 16,384, 32,768 or 65,536 the footprint was identical to the megabyte: the context's
+KV cache costs memory only as it fills, so a smaller context saves nothing. The token embedding
+is 260 MiB (IQ3_S) and the output layer 417 MiB (Q5_K); the bf16 hyper-connection projections
+total 1.2 GB (B2).
+
+## Freed load and graph buffers (M4, uncommitted)
+
+Two large host buffers stayed charged to the worker for its whole life:
+
+- **The model loader's read buffer.** With `--no-mmap`, `load_all_data` reads each tensor into one
+  buffer and copies it to the GPU; the buffer grows to the largest tensor, Flash Next's output layer
+  (417 MiB). `malloc_history` on the freed region traced it there. macOS's allocator kept the freed
+  block as dirty memory: neither `shrink_to_fit` nor `malloc_zone_pressure_relief` returned it, and
+  under memory pressure it was compressed rather than released. The buffer now comes from
+  `ggml_aligned_malloc` (`vm_allocate` on macOS), whose pages go back to the system when freed.
+- **The graph metadata buffers.** Each `llm_graph_result` sizes its metadata for `max_nodes`
+  (245,760 for 6,144-token batches: about 100 MB), which a `std::vector` zero-filled, while Flash
+  Next's graphs have 8,274 nodes for one token and 10,449 for 6,144. The buffer also comes from
+  `ggml_aligned_malloc` now, so only the pages a graph uses are backed.
+
+Footprint (`footprint`, repository build, `config-source.json` settings without speculation):
+
+| Build | After load | After `short-ie.json` and `long-ie.json` | Freed but charged after load |
+|---|---:|---:|---:|
+| Before | 4,955 MB | 7,461 MB | 436 MB |
+| M4 | 4,356 MB (−599 MB) | 6,862 MB (−599 MB) | 19 MB |
+
+Three interleaved rounds, fresh server each, short, long, short and long requests (512 tokens each);
+medians, SSD reads per request; every response identical:
+
+| Build | First short / long | Second short / long | SSD per request (second pair) |
+|---|---:|---:|---:|
+| Before | 24.66 / 22.27 tok/s | 24.37 / 21.81 tok/s | 47 / 78 GB |
+| M4 | 24.71 / 22.41 tok/s | 24.61 / 22.11 tok/s (+1.0% / +1.4%) | 43 / 73 GB |
+
+About +1% once the file cache has settled, with 4–8% fewer SSD reads, as the measured price of a
+GB of file cache predicts (0.6 GB, about +1.5%); the ranges overlap. Also tried and dropped: turning
+off `--fit` for LES (it builds and frees a trial context; startup 0.75 s faster, footprint unchanged)
+and a `max_nodes` bound for Flash Next's architecture without the per-token term (smaller virtual
+reservations, footprint unchanged).
+
+## Q8_0 hyper-connection weights (B2, `hc-type`, uncommitted)
+
+A dev-only loader patch (worktree in `/Volumes/Data/moeshift-scratch/b2`, not in the repository)
+converts chosen bf16 tensors to another type in place after loading. A smaller type fits the bf16
+allocation, so that type's own Metal kernels run, with no GGUF copy. Quality was measured against
+today's bf16 build with `llama-perplexity --kl-divergence`:
+
+- **Text:** 11 chunks of 4,096 tokens (22.5k scored tokens): the model's own earlier answers in
+  chat format, this repository's documentation, `src/llama-moe-slot.cpp` and Python tools.
+- **Batches:** prompt batches of 2,048 rows, so this measures the matrix-matrix kernels.
+- **Reference perplexity:** 2.9495.
+
+| Change (against bf16) | Mean KLD | 99th pct KLD | Same top token | Perplexity |
+|---|---:|---:|---:|---:|
+| None, batches of 1,024 rows (identical arithmetic) | 0.00000 | 0.00004 | 99.996% | ±0 |
+| hc weights stored as f16 (identical values, other kernel) | 0.0044 | 0.051 | 97.7% | +0.25% |
+| hc and router as f16 | 0.0041 | 0.050 | 97.9% | +0.05% |
+| **Q8_0 hc** (`hc_{attn,ffn}_{down,up}`, 1.2 GB) | 0.0104 | 0.116 | 96.6% | +0.04% |
+| Q8_0 `hc_attn_down` only | 0.0052 | 0.057 | 97.6% | +0.06% |
+| Q8_0 `hc_attn_up` only | 0.0086 | 0.102 | 96.9% | +0.24% |
+| Q8_0 `hc_ffn_down` only | 0.0063 | 0.071 | 97.4% | +0.21% |
+| Q8_0 `hc_ffn_up` only | 0.0095 | 0.107 | 96.5% | +0.42% |
+| Q8_0 router (`ffn_gate_inp`, 120 MB) | 0.0074 | 0.085 | 97.1% | −0.03% |
+| Q8_0 hc and router (B2 as planned) | 0.0147 | 0.207 | 96.2% | **+1.0% ± 0.14** |
+| Q4_0 hc (scale check) | 0.126 | 1.31 | 88.5% | +2.7% |
+
+This model's next token is sensitive to arithmetic. Storing the same values as f16 changes only the
+kernel's rounding, and that alone flips 2.3% of top tokens, at about 40% of Q8_0's KLD. Each quarter
+of the hc weights alone does more than a quarter of the damage, since it flips the same near-ties.
+The rounding error itself is ordinary for Q8_0 (0.6–0.7% RMS in every tensor, block max/RMS about
+2.5, no outlier blocks), so another 8-bit layout would not help. KLD against bf16 therefore mixes
+damage with near-tie flips. Perplexity, scored against the actual text, separates them:
+
+- **Q8_0 hc:** within the f16 control's range.
+- **Q8_0 router:** saves only 60 MB per token for a KLD 1.7 times the control's.
+- **Both together:** +1.0% perplexity, the one change clearly above noise.
+
+Greedy generations on the 12 server prompts (the N5 set plus the N2 tasks), with the decode
+kernels:
+
+- **Identical to bf16:** 4 for Q8_0 hc, 3 for the f16 control.
+- **Divergence:** the rest diverge at similar points for both.
+- **The two scoreable tool-call edits:**
+  - Without thinking, all three builds produced the same edit.
+  - With thinking, only the Q8_0 build finished within the 1,500-token budget, with the intended
+    edit; the bf16 and f16 builds were still thinking when the budget ran out. That is one sample,
+    not evidence for Q8_0.
+
+### The option
+
+`hc-type: q8_0` in a profile (`--hc-type q8_0`; default `bf16`):
+
+- **At creation:** the loader creates the four hyper-connection projections of each layer as
+  Q8_0, so the bf16 size is never allocated. The router stays bf16.
+- **While loading:** it converts them from the GGUF's bf16, 256k values at a time.
+- **Constraint:** requires `no-mmap`; the router rejects other values and `q8_0` without it.
+
+Its quality matches the probe exactly (perplexity 2.950766, mean KLD 0.010375). Measured with the
+repository build and `config-source.json` settings without speculation:
+
+| | `bf16` | `q8_0` |
+|---|---:|---:|
+| Footprint after load | 4,356 MB | 3,792 MB (−564 MB) |
+| Load time | 1.74 s | 1.96 s |
+
+Generation speed, on the 12 prompts of the generation test, two interleaved rounds per build with a
+fresh server each:
+
+| Prompts where both builds wrote identical text | `bf16` (two rounds) | `q8_0` (two rounds) | Change of means |
+|---|---|---|---:|
+| config | 22.80 / 21.57 tok/s | 22.82 / 23.52 tok/s | +4.4% |
+| edit | 20.34 / 20.07 | 21.09 / 21.05 | +4.3% |
+| rewrite-fn | 18.82 / 17.86 | 19.04 / 19.68 | +5.6% |
+| whole-file | 18.02 / 17.73 | 18.44 / 19.05 | +4.9% |
+
+- **Identical text:** every `q8_0` run was faster than every `bf16` run. This is the like-for-like
+  comparison.
+- **All 12 prompts:** 20.95 → 21.51 tok/s (+2.7%), but there the two builds decode different text.
+- **Short and long A/B:** three rounds of M4's short and long prompts gave medians of +4.6% and
+  +3.1% for the first pair and +2.2% and +0.4% for the second. One `q8_0` round read about 30% more
+  from the SSD on the same prompts and was slow throughout.
+- **Repeatability:** every build's 12 outputs are identical between fresh servers, apart from
+  the random ids of tool calls. The default `bf16` build's outputs are also identical to those of the
+  build without the option.
+
+With your `config-source.json` speculation (`ngram-simple`, `spec-draft-n-max: 1`,
+`LLAMA_MOE_DECODE_ROWS: 2`), same 12 prompts:
+
+| | `bf16` | `q8_0` |
+|---|---:|---:|
+| All 12 prompts (two rounds each) | 24.39 / 24.24 tok/s | 25.48 / 25.58 tok/s (+5%) |
+| The 4 prompts whose output stayed identical | 24.64 tok/s | 25.94 tok/s (+5.3%) |
+| Drafts accepted | 1,332 of 1,353 | 1,449 of 1,474 |
+
+- **Gain from speculation:** +16% for `bf16`, from 20.95 tok/s without it.
+- **Identical-text prompts:** config +11.8% (one `bf16` round was low), edit +4.1%, rewrite-fn
+  +4.1%, whole-file +2.7%.
+- **Excluded round:** a first `q8_0` round, 20.82 tok/s, was left out. Its last four prompts ran
+  at half speed (`story` 12.6 against 28.5 tok/s) with identical output, and a rerun matched the
+  other round.
+- **Output changes from speculation:** speculation changes the output of 2 of the 12 prompts,
+  `edit-think` and `explain-quote`, with both builds and identically in every round. The 2-row
+  checks round differently from 1-row steps. N2's identical-output measurement did not include
+  these two prompts.
+
+**Not tested:**
+- **Ground truth.** Task accuracy on a benchmark large enough to resolve 1%.
+- **Perplexity bias.** A quarter of the scored text is the bf16 model's own output, which favours
+  bf16 in perplexity.
+
+## 2-row checks for K-quant weights (K1, uncommitted)
+
+A 2-row speculative check (`LLAMA_MOE_DECODE_ROWS: 2`) runs every dense mat-vec with two input
+rows. ggml-metal's small-batch kernel (`mul_mv_ext`), which reads each weight row once for several
+input rows, was used for bf16, Q8_0 and IQ4_NL from 2 rows but for the K-quants only from 4. Most
+of this model's quantized dense weights are K-quants (`gguf-py` dump of the first shard):
+
+| Weights | Types | Small-batch kernel at 2 rows, before |
+|---|---|---|
+| Output head (417 MiB) | Q5_K | No (from 4 rows) |
+| `attn_qkv`, `attn_gate`, `attn_q`, `attn_k`, `attn_v`, `attn_output`, `ssm_out`, some shared-expert gate and up | Q4_K, Q5_K, Q6_K | No (from 4 rows) |
+| The other attention and `ssm_out` tensors, most shared-expert gate and up | IQ4_XS, IQ3_S | No kernel |
+| Shared-expert down | IQ4_NL | Yes |
+| Hyper-connection projections (Q8_0 with `hc-type: q8_0`), router, PLE key, indexer | Q8_0, BF16 | Yes |
+
+**Microbenchmark** (`/Volumes/Data/moeshift-scratch/kq/kq_bench.cpp`): Gaussian weights quantized
+with ggml's quantizer, 1–3 input rows, enough copies of each matrix (up to 768 MB) that the
+weights stream from memory; 200 iterations, both settings in alternation twice. 2-row time against
+1 row:
+
+| Shapes (k × n) | Plain kernel (before) | Small-batch kernel |
+|---|---:|---:|
+| Q4_K, 2560 × 6144–12288 | 1.22–1.28× | 1.13–1.15× |
+| Q5_K, 2560 × 6144–12288 | 1.63–1.65× | 1.16–1.18× |
+| Q6_K, all shapes | 1.08–1.19× | 1.01–1.03× |
+| Q5_K output head, 2560 × 248320 | 1.55× (1,874 µs) | 1.15× (1,377 µs) |
+| 512- and 640-row matrices | within noise (4–6 µs either way) | |
+
+The plain kernels already do much better than twice the 1-row time, apparently because the second
+row's pass over the weights partly hits the GPU caches. Weighted by the model's tensor counts, the
+small-batch kernel saves about 1.0 ms per 2-row check (Q5_K 0.64 ms, most of it the output head;
+Q6_K 0.34 ms; Q4_K 0.06 ms), against about 7 ms if the second row had cost a full pass. For the
+untouched types, at 2 rows: IQ3_S 1.74–1.86× (it does read the weights twice), IQ4_XS 1.19–1.26×,
+IQ4_NL (small-batch kernel) 1.24–1.31×.
+
+**Q4_K accuracy bug.** Against exact results (dequantized weights, double-precision dot products,
+`kq_ref.cpp`), the Q4_K small-batch kernel was off by 4.5e-3 relative; the plain Q4_K kernel and the
+Q5_K and Q6_K small-batch kernels by 1–3e-7. `dequantize_q4_K` divides the block scale for the high
+nibbles by 16 in half precision (`xb->d / 16.h`); with typical weight scales the result is a half
+subnormal and loses precision. `dequantize_q5_K` divides in float. The ggml CPU backend is no
+reference here: it rounds the input to Q8_K for K-quant dot products (6–8e-3 for all three types).
+
+**Changes** (`ggml-metal-ops.cpp`, `ggml-metal.metal`):
+
+- Q4_K, Q5_K and Q6_K use the small-batch kernel from 2 rows. Q2_K and Q3_K keep 4 rows (not
+  measured).
+- The Q4_K small-batch kernels use `dequantize_q4_K_f`, a copy of `dequantize_q4_K` that divides in
+  float: 1.6e-7 against exact results. This also changes batches of 4–8 tokens, which used the
+  inaccurate kernel before.
+- The prompt matrix kernels (`mul_mm`, `mul_mm_id`) and `get_rows` keep `dequantize_q4_K`, so prompt
+  processing is unchanged. They have the same half-precision division; fixing it would change
+  prompt results and greedy output, which needs its own quality comparison (not done).
+
+**End to end** (`kq/e2e.sh`): `config-source.json` settings (2-row n-gram drafting, `hc-type:
+q8_0`), the N2 tasks, a fresh server per round, in the order old binary, new with the old gate,
+new with the 2-row gate, then the reverse:
+
+| Task (2-row checks / tokens) | Old binary | Old gate | 2-row gate | 2-row against old gate |
+|---|---:|---:|---:|---:|
+| Whole file (550 / 1,200) | 26.25 tok/s | 26.49 | 26.86 | +1.4% |
+| Config (373 / 778) | 28.92 | 29.11 | 29.46 | +1.2% |
+| Rewrite a function (222 / 700) | 24.33 | 24.38 | 24.39 | 0% |
+| Story (no drafts, control) | 25.86 | 25.72 | 25.74 | 0% |
+
+- **Output:** every response in all six rounds was identical to the old binary's.
+- **Gain:** +1.2–1.4% where most steps are checks, as predicted from the microbenchmark (about
+  1 ms over 550 checks in a 45 s reply); nothing on the story, which makes no checks.
+- **Only the first three rounds are used.** In the reverse rounds the machine ran 3–5% slower
+  (story control 24.4–25.1 tok/s, prompts up to 45% slower), with Apple's on-device inference
+  service and `aned` using about 38% CPU each for part of the time. Those rounds show the same
+  direction (+2–8% for the 2-row gate against the old gate run after it), more than the change can
+  explain. An earlier attempt was stopped when an iOS Simulator app took CPU and memory.
+- **Memory:** none.
+
+**Not tested:** IQ4_XS and IQ3_S small-batch kernels (about 0.5 ms more per check if they reach
+about 1.05×); 3-row steps end to end; Q2_K and Q3_K.
 
 ## Tool calling
 

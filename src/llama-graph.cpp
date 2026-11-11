@@ -899,6 +899,24 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
 // llm_graph_result
 //
 
+llm_graph_result::meta_buffer::~meta_buffer() {
+    if (data) {
+        ggml_aligned_free(data, size);
+    }
+}
+
+void llm_graph_result::meta_buffer::resize(size_t n) {
+    if (n == size) {
+        return;
+    }
+    if (data) {
+        ggml_aligned_free(data, size);
+    }
+    data = n ? ggml_aligned_malloc(n) : nullptr;
+    GGML_ASSERT(n == 0 || data != nullptr);
+    size = n;
+}
+
 llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
     reset();
 
@@ -933,8 +951,8 @@ void llm_graph_result::reset() {
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ buf_compute_meta.size,
+        /*.mem_buffer =*/ buf_compute_meta.data,
         /*.no_alloc   =*/ true,
     };
 

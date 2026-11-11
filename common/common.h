@@ -504,6 +504,7 @@ struct common_params {
 
     std::string moe_experts;
     int32_t moe_slot_bank = 0;
+    ggml_type hc_type = GGML_TYPE_COUNT; // hyper-connection projections (qwen4exp); COUNT keeps the file's type
     int32_t les_prefill_max_tokens = 3072;
     int32_t les_prefill_bank = 512;
     int32_t les_decode_bank = 0;

@@ -2274,6 +2274,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERTS"));
     add_opt(common_arg(
+        {"--hc-type"}, "TYPE",
+        "type for the bf16 hyper-connection weights, converted when loading: bf16 or q8_0 (q8_0 is faster and changes output; requires --no-mmap)\n"
+        "(default: bf16)",
+        [](common_params & params, const std::string & value) {
+            if (value == "bf16") params.hc_type = GGML_TYPE_COUNT;
+            else if (value == "q8_0") params.hc_type = GGML_TYPE_Q8_0;
+            else throw std::invalid_argument("hc-type must be bf16 or q8_0");
+        }
+    ).set_env("LLAMA_ARG_HC_TYPE"));
+    add_opt(common_arg(
         {"--moe-slot-bank"}, "N",
         "number of resident routed expert slots per layer",
         [](common_params & params, int value) {
