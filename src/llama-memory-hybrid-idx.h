@@ -75,6 +75,20 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // pooled indexer keys of layer il, F32 [indexer_head_size, blocks]: row b holds the block of
+    // positions [b*ratio, (b+1)*ratio), pooled, normed and rotated as build_qsa_top_k scores it.
+    // Each ubatch pools only the blocks its tokens touch, instead of every block on every token.
+    // A row is valid once its block's last cell was written; incomplete blocks are masked anyway.
+    // nullptr when there is no indexer or more than one sequence
+    ggml_tensor * get_pooled(int32_t il) const;
+
+    // true when the next graph must pool every block: the indexer cells changed outside a graph
+    bool get_pooled_stale() const { return pooled_stale; }
+    void set_pooled_valid() const { pooled_stale = false; }
+
+    // sizes the pooled keys to the indexer cache, which can have grown since the last call
+    void pooled_fit();
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -85,6 +99,19 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // see get_pooled; indexed by layer, nullptr for layers without a sparse indexer
+    std::vector<ggml_tensor *> pooled;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pooled_bufs;
+
+    // per layer: where its rows live and its block size (0: no pooled keys); empty: no pooled cache
+    std::vector<ggml_backend_buffer_type_t> pooled_buft;
+    std::vector<uint32_t> pooled_ratio;
+    int64_t  pooled_head_size = 0;
+    uint32_t pooled_cells     = 0; // indexer cells the rows were sized for
+
+    // set by every change to the indexer cells that no graph makes: restores, copies, shifts, clears
+    mutable bool pooled_stale = true;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -129,20 +156,34 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // see llama_memory_hybrid_idx::get_pooled
+    ggml_tensor * get_pooled(int32_t il) const;
+
+    // blocks a graph for ubatch pools into the pooled cache: all n_blocks for a full context, a stale
+    // cache or positions that are not contiguous, else at most the blocks contiguous tokens can touch,
+    // so that steps of one size share a graph
+    int64_t get_n_pool(const llama_ubatch & ubatch, uint32_t ratio, int64_t n_blocks) const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   blk_cells I32 [ratio*n_pool, ns]   cells making up each pooled block
+    //   blk_pos   I32 [4*n_pool*ns]        mrope position rows of each pooled block's first token
+    //   pool_blk  I32 [n_pool]             the pooled blocks, with the pooled cache only (else nullptr)
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // n_pool (get_n_pool) is n_blocks, every block in order, or the blocks the ubatch's tokens touch,
+    // repeated at the end to fill the graph's shape
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       ggml_tensor * pool_blk, ggml_tensor * bias, const llama_ubatch * ubatch,
+                       uint32_t ratio, bool blk_bias) const;
 
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    llama_memory_hybrid_idx * mem = nullptr;
+
+    // the reservation context, whose graph must pool every block to size the worst case
+    const bool full = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

@@ -505,7 +505,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, pool_blk, bias, ubatch, ratio, blk_bias);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -519,6 +519,7 @@ public:
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        const int64_t n_pool   = pool_blk ? mctx->get_n_pool(params.ubatch, ratio, n_blocks) : n_blocks;
 
         bool res = true;
 
@@ -527,8 +528,8 @@ public:
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
-        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+        res &= blk_cells->ne[0] == (int64_t) ratio*n_pool;
+        res &= blk_pos->ne[0]   == 4*n_pool*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
@@ -536,10 +537,12 @@ public:
     }
 
     // per stream: a cell index names a different token in each stream
+    // n_pool is n_blocks without the pooled cache (see llama_memory_hybrid_idx_context::get_n_pool)
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
-    ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
-    ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+    ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_pool, n_stream]
+    ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_pool*n_stream]
+    ggml_tensor * pool_blk  = nullptr;   // I32 [n_pool], with the pooled cache only
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
@@ -581,6 +584,12 @@ std::vector<ggml_tensor *> llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    // with the pooled cache, pool only the blocks this ubatch can change (get_n_pool), else all of them
+    ggml_tensor * pooled_cache = mctx_hyb->get_pooled(il);
+    GGML_ASSERT(pooled_cache == nullptr || n_stream == 1);
+
+    const int64_t n_pool = pooled_cache ? mctx_hyb->get_n_pool(ubatch, (uint32_t) r, n_blocks) : n_blocks;
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -592,8 +601,8 @@ std::vector<ggml_tensor *> llama_model_qwen4exp::graph::build_qsa_top_k(
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_pool, n_stream);
+        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_pool*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
@@ -601,10 +610,18 @@ std::vector<ggml_tensor *> llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
 
+        if (pooled_cache) {
+            qsa->pool_blk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+            ggml_set_input(qsa->pool_blk);
+        }
+
         inp = qsa.get();
         res->add_input(std::move(qsa));
         qsa_inps.emplace((uint32_t) r, inp);
     }
+
+    // the layers sharing an input set must agree on the cache, as get_n_pool sized it for all of them
+    GGML_ASSERT((pooled_cache != nullptr) == (inp->pool_blk != nullptr));
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
@@ -619,13 +636,14 @@ std::vector<ggml_tensor *> llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // gathers per stream: blk_cells row s indexes stream s's own cells
     ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_pool, n_stream);
 
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
     // add reads the strided slices directly, so no cont per slice.
+    // every op from here to the rotation works row by row, so a block pools to the same bits alone
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_pool, n_stream,
                 members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
@@ -636,12 +654,19 @@ std::vector<ggml_tensor *> llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(pooled, "indexer_k_pooled", il);
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool*n_stream);
     pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+
+    if (pooled_cache) {
+        // the scores read every block from the cache, through a view of the write so they follow it
+        pooled = ggml_set_rows(ctx0, pooled_cache, ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool), inp->pool_blk);
+        pooled = ggml_view_3d(ctx0, pooled, idx_dim, n_blocks, 1, pooled_cache->nb[1], pooled_cache->nb[1]*n_blocks, 0);
+    } else {
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+    }
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);

@@ -2682,17 +2682,19 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
     below.fill({ -1, LLAMA_TOKEN_NULL });
 
+    // only the window's cells are visited here: visiting every cell (testing each of its sequence
+    // bits) took 5-7 ms per generated token at 64k cells (MACM5MAX36GB.md, long-context generation)
     for (uint32_t s = 0; s < n_stream; ++s) {
         // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
+        v_cells[s].for_each_token_in(seqs, w0, p_max + 1,
             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
-                }
+                hist[key(seq_id, pos)] = tok;
             });
     }
+
+    // the cells before the window matter only when a lookup finds no cell in it, so they are
+    // scanned the first time that happens
+    bool have_below = false;
 
     // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
     const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
@@ -2701,6 +2703,17 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
             if (it != hist.end()) {
                 return it->second;
             }
+        }
+        if (!have_below) {
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                v_cells[s].for_each_token_in(seqs, 0, w0,
+                    [&](llama_seq_id sid, llama_pos pos, llama_token tok) {
+                        if (pos > below[sid].first) {
+                            below[sid] = { pos, tok };
+                        }
+                    });
+            }
+            have_below = true;
         }
         return below[seq_id].second;
     };
