@@ -6068,6 +6068,8 @@ constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_E
 // 0 -     masked (i.e. full of -INF, skip)
 // 1 - not masked (i.e. at least one element of the mask is not -INF)
 // 2 - all zero
+// the high byte has bit i set when columns [8*i, 8*i + 8) of a block of state 1 hold an element that
+// is not -INF in any of its Q rows: the kernel skips the other 8-column groups, which add exact zeros
 kernel void kernel_flash_attn_ext_blk(
         constant ggml_metal_kargs_flash_attn_ext_blk & args,
         device const char * mask,
@@ -6085,7 +6087,10 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t i1 = tgpig[1];
     const int32_t i0 = tgpig[0];
 
-    char res = i0*C + C > args.ne30 ? 1 : 0;
+    ushort res = i0*C + C > args.ne30 ? 1 : 0;
+
+    // every 8-column group is needed unless the detailed check below finds otherwise
+    uint sub = 0xFF;
 
     device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
 
@@ -6094,10 +6099,16 @@ kernel void kernel_flash_attn_ext_blk(
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
 
+        uint used = 0;
+
         FOR_UNROLL (short j = 0; j < Q; ++j) {
             FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
-                mmin = min(mmin, mask_src[ii*NW]);
-                mmax = max(mmax, mask_src[ii*NW]);
+                const half m = mask_src[ii*NW];
+
+                mmin = min(mmin, m);
+                mmax = max(mmax, m);
+
+                used |= m > -MAXHALF ? 1u << ((ii*NW + tiisg)/8) : 0u;
             }
 
             mask_src += args.nb31/2;
@@ -6111,6 +6122,8 @@ kernel void kernel_flash_attn_ext_blk(
                 res = 2;
             } else {
                 res = 1;
+                // one bit per 8-column group, so only for blocks of at most 64 columns
+                sub = C <= 64 ? simd_or(used) : 0xFF;
             }
         }
     }
@@ -6119,7 +6132,7 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t nblk0 = ((args.ne30 + C - 1)/C);
 
     if (tiisg == 0) {
-        dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
+        ((device ushort *) dst)[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res | (ushort) (sub << 8);
     }
 }
 
@@ -6247,7 +6260,8 @@ void kernel_flash_attn_ext_impl(
         const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
         const int32_t nblk0 = ((args.ne11 + C - 1)/C);
 
-        blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
+        // kernel_flash_attn_ext_blk writes 2 bytes per block
+        blk += 2*((((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0);
     }
 
     {
@@ -6355,9 +6369,16 @@ void kernel_flash_attn_ext_impl(
 
             char blk_cur = 1;
 
+            // 8-column groups of the block that some query row can see; the others are skipped below,
+            // since their scores become -INF and their probabilities exact zeros either way
+            uint sub = 0xFF;
+
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
+                const ushort blk_val = ((device const ushort *) blk)[ic0];
+
+                blk_cur = blk_val & 0xFF;
+                sub     = blk_cur == 1 ? (uint) (blk_val >> 8) : 0xFFu;
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -6427,6 +6448,15 @@ void kernel_flash_attn_ext_impl(
                 FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
+                    if (((sub >> (cc*NSG + sgitg)) & 1) == 0) {
+                        simdgroup_store(mqk, ps, SH, 0, false);
+
+                        pk += 8*(NSG*NS10);
+                        ps += 8*(NSG);
+
+                        continue;
+                    }
+
                     if (DK % 16 != 0) {
                         k8x8_t mk;
                         q8x8_t mq;
@@ -6477,6 +6507,11 @@ void kernel_flash_attn_ext_impl(
                     const short ty = tiisg/4;
 
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+
+                    if (((sub >> cc) & 1) == 0) {
+                        simdgroup_store(mqk, ss + 8*cc, SH, 0, false);
+                        continue;
+                    }
 
                     for (short ii = 0; ii < DK16; ii += 4) {
                         device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
@@ -6607,6 +6642,11 @@ void kernel_flash_attn_ext_impl(
 
                         if (DV <= 64) {
                             FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                                if (((sub >> cc) & 1) == 0) {
+                                    pv  += 8*NS20;
+                                    continue;
+                                }
+
                                 s8x8_t vs;
                                 simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
@@ -6626,6 +6666,11 @@ void kernel_flash_attn_ext_impl(
                             constexpr short NC = (C/8)/2;
 
                             FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                                if (((sub >> (2*cc)) & 3) == 0) {
+                                    pv  += 2*8*NS20;
+                                    continue;
+                                }
+
                                 s8x8_t vs[2];
 
                                 simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
@@ -6666,6 +6711,10 @@ void kernel_flash_attn_ext_impl(
                     const short ty = tiisg/4;
 
                     for (short cc = 0; cc < C/8; ++cc) {
+                        if (((sub >> cc) & 1) == 0) {
+                            continue;
+                        }
+
                         s8x8_t vs;
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
