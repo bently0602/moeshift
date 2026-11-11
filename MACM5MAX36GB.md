@@ -56,6 +56,11 @@ are not general benchmarks.
   streaming.
 - The user configuration now uses `prefill-max-tokens: 6144` and an `f16` KV
   cache.
+- Later (X1): with an `f16` KV cache the sparse-attention indexer's cache
+  overflowed at long context, raising perplexity 2.5–4% at 32k tokens. The
+  indexer cache is now always bf16, and the configuration is back on `q8_0` KV
+  for half the KV memory. A single 120k-token prompt ran in about 6 minutes at
+  about 19 GB peak memory, without swap (L1).
 
 ## Recommended configuration for this Mac
 
@@ -108,7 +113,7 @@ values on this Mac. See `configs/README.md` for the full reference.
 | Setting | Value here | Shipped default | Effect on this Mac |
 |---|---|---|---|
 | `args.prefill-max-tokens` | **`6144`** | `3072` | **Measured.** Prompt processing was 33% faster for a 6,060-token prompt, because the 40 GB of experts are read once per prompt instead of twice. Peak process memory was 0.3 GB higher. Prompts up to 6,144 tokens are processed in one batch; longer prompts are split. Larger values were not tested. |
-| `args.cache-type-k`, `args.cache-type-v` | **`f16`** | `q8_0` | **Measured.** Prompt processing was 3.2% faster; generation did not change. The KV cache uses 24 KiB per token instead of about 12.8 KiB: about 70 MiB more for a 6,000-token prompt, and about 0.7 GiB more at the full 65,536-token context. Output differs slightly from `q8_0`; quality was not compared. |
+| `args.cache-type-k`, `args.cache-type-v` | **`f16`** | `q8_0` | **Superseded: `config-source.json` uses `q8_0` again** ([X1](#kv-cache-type-and-the-indexer-cache-x1): with `f16` the indexer cache overflowed at long context; `q8_0` halves the KV memory). **Measured.** Prompt processing was 3.2% faster; generation did not change. The KV cache uses 24 KiB per token instead of about 12.8 KiB: about 70 MiB more for a 6,000-token prompt, and about 0.7 GiB more at the full 65,536-token context. Output differs slightly from `q8_0`; quality was not compared. |
 | `env.LLAMA_GPU_KEEPALIVE` | `1` | `1` | **Measured.** With `0`, prompt processing did not change, but generation was 22% slower. Keep `1`. It runs a small GPU job about 148 times per second while MoEShift runs, including when idle. |
 | `env.LLAMA_MOE_QUIET` | `1` | `1` | `0` prints expert-loading diagnostics (`prefill #…`, `pmgmt`, `pread_wall`) to the terminal. Use it for investigation only; diagnostics are not written to files. |
 | `args.moe-prefill-bank` | `512` | `512` | Not tested. The model has 512 experts per layer, and a long prompt uses almost all of them, so the bank holds a whole layer. |
@@ -405,7 +410,10 @@ setting. Medians of the measured requests:
   more at the full 65,536-token context, and about 70 MiB more for this prompt.
   The generated text differed from the `q8_0` run after the opening sentence,
   which is expected when the cache precision changes. Output quality was not
-  compared.
+  compared here; see
+  [KV cache type and the indexer cache](#kv-cache-type-and-the-indexer-cache-x1)
+  for the later comparison, which found the `f16` setting worse at long context
+  and moved the configuration back to `q8_0`.
 - **Keepalive off:** prompt processing did not change, but generation was 22%
   slower (11.52 tok/s against 14.71 tok/s), and requests took 51–60 s against
   43–46 s. Keep `LLAMA_GPU_KEEPALIVE: 1`.
@@ -3016,7 +3024,7 @@ With your `config-source.json` speculation (`ngram-simple`, `spec-draft-n-max: 1
 - **Perplexity bias.** A quarter of the scored text is the bf16 model's own output, which favours
   bf16 in perplexity.
 
-## 2-row checks for K-quant weights (K1, uncommitted)
+## 2-row checks for K-quant weights (K1)
 
 A 2-row speculative check (`LLAMA_MOE_DECODE_ROWS: 2`) runs every dense mat-vec with two input
 rows. ggml-metal's small-batch kernel (`mul_mv_ext`), which reads each weight row once for several
@@ -3093,6 +3101,150 @@ new with the 2-row gate, then the reverse:
 **Not tested:** IQ4_XS and IQ3_S small-batch kernels (about 0.5 ms more per check if they reach
 about 1.05×); 3-row steps end to end; Q2_K and Q3_K.
 
+## A 120k-token context (L1)
+
+The model's GGUF declares a trained context of 262,144 tokens (`qwen4exp.context_length`); the
+profiles' 65,536 is only the configured `ctx-size`, and nothing in the router or worker caps it.
+Only 12 of the 48 layers have full attention (2 KV heads of 256 dimensions), so the KV cache takes
+24 KiB per token at `f16` and 12.8 KiB at `q8_0`, and an indexer chooses 2,048 positions per query
+for those layers.
+
+**Test** (`/Volumes/Data/moeshift-scratch/ctx128/`): `config-source.json` settings with
+`--ctx-size 131072`, one request of 119,928 prompt tokens built from 283 repository source and
+Markdown files (`build_prompt.py`, sized with `llama-tokenize`), with three access codes planted at
+2%, 50% and 95% depth. The request asks for the codes and a 200-word description of the first file
+(300 tokens at most). Memory sampled every 200 ms with r2m's `memwatch` (footprint, and system-wide
+memory above the level before the worker started); a watchdog would have stopped the worker if swap
+grew by more than 1 GB. Run before the indexer-cache fix below, so the `f16` run had an `f16`
+indexer cache and the `q8_0` run a `q8_0` one.
+
+| KV cache | Prompt | Generation | Peak footprint | Peak system-wide | Swap | Recall |
+|---|---:|---:|---:|---:|---:|---|
+| `f16` | 353.4 s (339 tok/s) | 14.23 tok/s (279 tokens) | 17.1 GB | 19.2 GB (15–16.6 sustained) | unchanged | 3 of 3 |
+| `q8_0` | 385.2 s (311 tok/s) | 14.31 tok/s (295 tokens) | 15.4 GB | 19.0 GB (17–18.5 sustained) | unchanged | 3 of 3 |
+
+- **It fits:** about 19 GB at the peak, no swap growth, every code recalled, and both descriptions
+  of the first file (`src/llama-adapter.cpp`) accurate. The two texts diverge after a few sentences,
+  as expected when the cache type changes.
+- **Prompt:** about 6 minutes, faster than the extrapolation from the 6k and 42k prompts (about 8).
+  Every 6,144-token batch reads all experts, and attention and the indexer cost more per batch as
+  the context grows.
+- **Memory over the `f16` prompt:** footprint 9 → 17.1 GB, about 67 KB per token, more than the KV
+  cache's 24 KiB, so other buffers grow with the context too (not broken down; the attention mask
+  and per-batch scratch scale with context times batch). The system-wide peak of 19.2 GB was a
+  single spike at about 150 s. While generating: 9.8 GB footprint.
+- **Generation:** about 70 ms per token, against about 40 ms after a short prompt. The KV cache's
+  2.75 GiB taken from the file cache accounts for about 3 ms (2.5% per GB, see above), the indexer
+  key pooling for about 8 ms (I1 measured 4.5 ms at 64k, growing linearly); about 19 ms is not
+  accounted for, probably the indexer scoring every cached key per token. Not traced.
+- **Prompt cache:** an entry for this conversation is about 3.3 GB at `f16`, close to the whole
+  4,096 MiB `cache-ram`, so it would push out every other saved conversation.
+
+For comparison, anemll-forge 0.2.1 runs a dense Qwen3.8-27B to 192K on the Neural Engine of an M6
+with 32 GB: INT8 KV of 32.25 KiB per token, fixed context entries (the move from 128K to 192K holds
+both caches, +4.3 GB), and attention tiled above 64K because the ANE compiler limits one tensor
+axis to 65,536 (the reason its release 0.2 stopped at 64K). It reports 95 tok/s prefill and
+25.1 tok/s decode at 128K, and calls 128K the comfortable maximum on 32 GB.
+
+**Not tested:** `ctx-size` above 131,072; prompts of 120k tokens through the router with the prompt
+cache filling; a GPU trace of generation at long context.
+
+## KV cache type and the indexer cache (X1)
+
+The notes measured `f16` KV 3.2% faster than `q8_0` on prompts (see "KV cache type and GPU
+keepalive") without comparing quality. Compared now with `llama-perplexity --kl-divergence` against
+an `f16` reference (`/Volumes/Data/moeshift-scratch/kvq/kld.sh`), `hc-type` bf16 in all runs:
+
+- **4k context:** B2's corpus and reference logits (11 chunks of 4,096, 22.5k scored tokens).
+- **32k context:** the first 250,000 characters of L1's prompt (repository sources and docs,
+  74,517 tokens), 2 chunks of 32,768, 32.8k scored tokens; a new `f16` reference.
+
+| 4k context | Mean KLD | 99th pct KLD | Same top token | Perplexity |
+|---|---:|---:|---:|---:|
+| `f16` again (control) | 0.00000 | 0.00004 | 99.996% | ±0 |
+| `q8_0` | 0.0058 | 0.071 | 97.4% | −0.01% ± 0.09 |
+| `f16`, indexer cache `bf16` | 0.0027 | 0.034 | 98.3% | +0.12% ± 0.06 |
+
+At 4k, `q8_0` flips about as many near-tied tokens as other arithmetic changes on this model (B2:
+storing the hc weights as f16 gave 0.0044 and 97.7%), with perplexity unchanged.
+
+At 32k the comparison looked different: `q8_0` gave a mean KLD of 0.124 with a median of 0.0001
+(most tokens agree, a few disagree completely: 99.9th percentile 12.6), and perplexity **2.5%
+lower** than the `f16` reference. bf16 KV, which has f32's exponent range, behaved like `q8_0`.
+The `f16` control was identical to the reference (KLD 0, 100% same top token), so the runs are
+deterministic. The indexer stores its keys in a cache of its own, created with `cache-type-k`
+(`llama-memory-hybrid-idx.cpp`), and caches them raw, before their RMS norm; a temporary switch
+gave that cache its own type:
+
+| 32k context, against `f16` / `f16` | Attention cache | Indexer cache | Perplexity | Mean KLD | 99th pct KLD | Same top token |
+|---|---|---|---:|---:|---:|---:|
+| Reference (the old `f16` setting) | `f16` | `f16` | 4.331 | — | — | — |
+| Control | `f16` | `f16` | 4.331 (±0) | 0.0000 | 0.00003 | 100% |
+| | `bf16` | `f16` | 4.445 (+2.9%) | 0.131 | 3.55 | 94.0% |
+| The old `q8_0` setting | `q8_0` | `q8_0` | 4.214 (−2.5%) | 0.124 | 3.17 | 93.7% |
+| | `bf16` | `bf16` | 4.180 (−3.3%) | 0.135 | 3.69 | 93.7% |
+| | `f16` | `bf16` | 4.142 (−4.1%) | 0.097 | 1.93 | 94.0% |
+| | `f16` | `f32` | 4.206 (−2.7%) | 0.082 | 1.72 | 95.1% |
+| **Now with `q8_0`** | `q8_0` | `bf16` | 4.273 (−1.1%) | 0.122 | 3.26 | 93.7% |
+
+Perplexity standard errors are about ±0.5–0.6% against the reference.
+
+- **An `f16` indexer cache is the fault.** The two runs with one are the worst; every other
+  indexer type improves perplexity by 1–4%, whatever the attention cache uses.
+- **Range, not precision:** bf16 has fewer mantissa bits than f16 but f32's exponent range, and it
+  fixes the problem. The raw indexer keys most likely exceed f16's largest value (65,504) on some
+  tokens, which spoils the block scores, so those queries attend to the wrong positions. Not
+  confirmed by dumping the keys.
+- **Why only at long context:** the indexer selects 2,048 positions per query, so below about 2k
+  tokens of context it selects everything, and at 4k about half; the longer the context, the more
+  its choices decide the result.
+- **Among the fixes the differences are within noise.** The spread is about 1.5% and the order is
+  not consistent (f32, the exact type, scored worse than bf16) on two chunks of one kind of text.
+  The runs with an `f16` attention cache average about 4.17, those with `q8_0` about 4.24, which
+  looked like a cost of up to 1.5% for `q8_0`. Every row here is measured against the old `f16`
+  setting, whose indexer was broken, so the KLD tails are distances from a broken reference. X2
+  below compares against the fixed `f16` setting and finds no cost.
+- **The chunk-1 perplexity is high** (about 14 for the `f16` reference, 13 for the others): the
+  first half of the 32k text is harder for every setting; chunk 2 is about 1.3.
+
+**Changes:**
+
+- `llama-memory-hybrid-idx.cpp` creates the indexer cache as bf16 whatever `cache-type-k` says.
+  bf16 takes the same memory as f16 (3 KiB per token over the 12 layers). **Changes output** above
+  a few thousand tokens of context with `f16` KV (the fix) and slightly with `q8_0` KV.
+- `config-source.json` uses `q8_0` KV again, for the memory: 12.8 against 24 KiB per token (about
+  0.7 GiB less at 64k tokens, 1.4 GiB at 120k), worth about 2.5% of generation per GB returned to
+  the file cache at long context. Costs: prompts 3.2% slower at 6k tokens and 9% at 120k (the
+  flash-attention kernel unpacks every key and value); generation the same, since the sparse
+  attention reads only about 48 MiB of KV per token at `f16`. The shipped Flash Next profile in
+  `configs/moeshift.json` already used `q8_0`.
+
+**Verified** with the fixed build (no override): `q8_0` at 32k reproduced the `q8_0` / bf16 row
+exactly (perplexity 4.273238, mean KLD 0.121807). The N2 tasks through a server with
+`config-source.json` and `q8_0` KV (one round): whole file 27.43, config 30.10, rewrite a function
+27.02, story 27.36 tok/s, with the same drafts accepted as before (548 of 550, 365 of 373, 220 of
+222). The three drafting tasks wrote the same text as K1's `f16` run, the story differed. Every
+task, the story included, ran 2–11% faster than K1's `f16` round, although generation should not
+depend on the KV type; a single round at another time, so this is not a speed result.
+
+**Prose at 32k (X2).** Wilkie Collins's *The Moonstone* from Project Gutenberg (header and licence
+removed, 266,404 tokens), 8 chunks of 32,768 tokens, 131k scored tokens; the reference is the
+fixed build with `f16` KV (attention cache `f16`, indexer cache bf16), perplexity 6.4376:
+
+| 32k context, prose | Perplexity | Mean KLD | Median KLD | 99.9th pct KLD | Same top token |
+|---|---:|---:|---:|---:|---:|
+| `q8_0` against `f16` (both with the bf16 indexer cache) | 6.4331 (**−0.05% ± 0.04**) | 0.0064 | 0.0026 | 0.15 | 96.4% |
+
+- **No cost at 32k on prose:** perplexity is unchanged to within 0.1%, every chunk within ±0.15%
+  with no trend from the first to the eighth.
+- **No heavy tail:** the KLD is the size of `q8_0` at 4k (0.0058), rounding that flips near-ties.
+- So `q8_0` KV saves its memory for nothing measurable in quality. The prompt cost (3–9%) remains.
+- The reference logits are 65 GB, in `/Volumes/Data/moeshift-scratch/x2/` (deletable).
+
+**Not tested:** a chat transcript or code against the fixed `f16` setting; contexts of 64–128k in this comparison;
+the key magnitudes themselves; a speed comparison of the bf16 indexer cache (it takes part in a
+`get_rows` and a mat-vec per layer, so no measurable change is expected).
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the
@@ -3114,6 +3266,7 @@ Multiple tools, parallel calls and `tool_choice` were not tested.
 - Prompt lengths other than 313–6,060 and 12,121 tokens (see the P1 and P2
   section). Prompts under 3,072 tokens fit in one batch either way; prompts over
   6,144 tokens still split, into half as many batches.
-- Long conversations or contexts near the 65,536-token limit.
+- Long conversations or contexts near the 65,536-token limit (a single 120k-token
+  prompt was measured later, see [L1](#a-120k-token-context-l1)).
 - Output agreement between the two settings.
 - The Homebrew build (the source build at the same commit was used).
