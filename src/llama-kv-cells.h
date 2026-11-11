@@ -34,8 +34,11 @@ class llama_kv_cells {
 public:
     template<typename F>
     void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
-        for (const auto & i : used) {
-            if (pos[i] < p0 || pos[i] >= p1) {
+        // a linear scan visits the used cells in the same (ascending) order as walking `used`, but
+        // reads contiguous memory instead of one tree node per cell
+        const uint32_t n = used_max_p1();
+        for (uint32_t i = 0; i < n; ++i) {
+            if (pos[i] == -1 || pos[i] < p0 || pos[i] >= p1) {
                 continue;
             }
 

@@ -61,6 +61,11 @@ are not general benchmarks.
   indexer cache is now always bf16, and the configuration is back on `q8_0` KV
   for half the KV memory. A single 120k-token prompt ran in about 6 minutes at
   about 19 GB peak memory, without swap (L1).
+- Later (L2, uncommitted): generation slowed with context because the per-layer
+  embedding input visited every cached cell for each token, and the indexer pooled
+  every cached block for each token. With both fixed, generation is 12% faster at
+  32k tokens of context, 20% at 64k and 30% at 120k (14.4 → 18.6 tok/s), with
+  identical output and about 1.5 KiB more memory per token of context.
 
 ## Recommended configuration for this Mac
 
@@ -1392,6 +1397,7 @@ same microbenchmark, pooling only the newest block (as a cache of pooled keys, I
 would) saves 0.26 ms per token at 6,656 cells, 1.0 ms at 16,384, 2.1 ms at 32,768 and 4.5 ms at
 65,536. That cache (I1) was not built: under 1% below about 10k tokens of context, for persistent
 state that every rollback, removal, shift and state load must invalidate, and about 96 MB at 64k.
+It was built later, with long-context use in view: see [L2](#long-context-generation-l2).
 
 ## Delta-net state read from the cache (C1b, uncommitted)
 
@@ -3136,7 +3142,8 @@ indexer cache and the `q8_0` run a `q8_0` one.
 - **Generation:** about 70 ms per token, against about 40 ms after a short prompt. The KV cache's
   2.75 GiB taken from the file cache accounts for about 3 ms (2.5% per GB, see above), the indexer
   key pooling for about 8 ms (I1 measured 4.5 ms at 64k, growing linearly); about 19 ms is not
-  accounted for, probably the indexer scoring every cached key per token. Not traced.
+  accounted for, probably the indexer scoring every cached key per token. Not traced. Traced and
+  mostly fixed later: see [long-context generation (L2)](#long-context-generation-l2).
 - **Prompt cache:** an entry for this conversation is about 3.3 GB at `f16`, close to the whole
   4,096 MiB `cache-ram`, so it would push out every other saved conversation.
 
@@ -3244,6 +3251,109 @@ fixed build with `f16` KV (attention cache `f16`, indexer cache bf16), perplexit
 **Not tested:** a chat transcript or code against the fixed `f16` setting; contexts of 64–128k in this comparison;
 the key magnitudes themselves; a speed comparison of the bf16 indexer cache (it takes part in a
 `get_rows` and a mat-vec per layer, so no measurable change is expected).
+
+## Long-context generation (L2)
+
+L1 found generation at 120k tokens of context taking about 70 ms per token, and most of the growth
+unexplained. Uncommitted changes, identical output.
+
+**Method** (`/Volumes/Data/moeshift-scratch/l2/`): one worker per run with `config-source.json`
+settings, `--ctx-size 131072`, no speculative decoding (one token per step) and no prompt cache;
+prompts of 8k, 32k, 64k and 120k tokens built from repository files as in L1, plus a 29-token
+story prompt; 320 tokens generated with `ignore_eos`, timed from their arrival over tokens 40–320.
+Runs of the same build agreed within 0.5 ms per token. A first sweep that also ran macOS `sample`
+during generation was about 25% slower throughout and is not used for timings; its profile pointed
+at the right function, but at the wrong cause.
+
+**Where the time went.** Temporary timers (the `LES_BLOCK_DIAG` phase log, a timer per graph input,
+and the GPU time of every Metal command buffer), per decode step:
+
+| Per step, PLE fix not yet in | 8k | 64k |
+|---|---:|---:|
+| Input setup on the CPU, before the GPU starts | 1.2 ms | 6.4 ms |
+| of which the per-layer embedding (PLE) input | 1.0 ms | 5.5–7.1 ms |
+| GPU busy (command buffers) | 25.5 ms | 33.0 ms |
+| Expert misses / bytes read | 172 / 291 MiB | 164 / 275 MiB |
+
+- **PLE input.** The n-gram embedding needs the two tokens before each new one.
+  `llama_kv_cache::get_prev_tokens` found them by visiting every used cell and testing each of
+  its 256 sequence bits, so its cost grew with the context.
+- **GPU.** A microbenchmark of one token's attention-layer work (`l2_bench.cpp`, 12 layers, `q8_0`
+  KV, random keys and selections), in ms per token:
+
+  | Cells | Pool keys | Score, expand | Top-k | Mask | Attention | Total |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 8k | 0.96 | 0.13 | 0.51 | 0.06 | 2.11 | 3.8 |
+  | 32k | 1.88 | 0.72 | 0.90 | 0.18 | 4.40 | 8.1 |
+  | 64k | 4.04 | 1.11 | 1.73 | 0.00 | 5.10 | 12.0 |
+  | 128k | 8.42 | 2.11 | 3.68 | 0.23 | 5.35 | 19.8 |
+
+  The indexer pooled, normed and rotated every cached block's key on every token (I1, see
+  C1c above). Attention skips 32-cell chunks with no selected cell, but scattered selections touch
+  many chunks: 5.5 ms at 128k for random selections, 1.35 ms if the 2,051 cells were adjacent.
+- **Not the cause:** expert reads per step did not change with context.
+
+**Changes:**
+
+- **PLE window** (`src/llama-kv-cache.cpp`, `src/llama-kv-cells.h`): `get_prev_tokens` visits only
+  the cells with positions in the window it looks up, `[p_min − 2, p_max]`. The cells before it are
+  visited only when a lookup finds no cell in the window (M-RoPE position gaps). `for_each_token_in`
+  scans the cell array instead of walking the set of used cells, in the same order. PLE input:
+  0.33–0.49 ms per step at both 8k and 64k.
+- **Pooled indexer keys (I1)** (`src/llama-memory-hybrid-idx.*`, `src/models/qwen4exp.cpp`): an F32
+  row per block of 4 positions and attention layer, as the scores read it (pooled, normed, rotated).
+  Each ubatch pools only the blocks its tokens can touch (one per decode step, two for a 2-row
+  check, 1,537 for a 6,144-token prompt batch) and writes them with `set_rows`; the scores read
+  every row from the cache. Every op of the pooling chain works row by row, so a block pools to
+  the same bits alone as among all of them.
+  - Rows are indexed by position, so the cache exists only with one sequence (the worker's case).
+  - Rollbacks need nothing: an incomplete block is already masked, and its row is recomputed when
+    its last cell is written.
+  - State loads, sequence copies, shifts and clears mark the rows stale; the next graph pools every
+    block once. Rows are not saved with the state.
+  - The worker's KV cache grows (`LLAMA_KV_GROW`, starting at 2,048 cells). The rows follow the
+    indexer cache's size: a growth reallocates them (no copy) and marks them stale. A first version
+    sized them for a fixed cache only, and was silently off in the worker.
+  - Memory: 512 bytes per block per attention layer, 1.5 KiB per token of context: 96 MiB at 64k
+    cells, 192 MiB at 128k.
+
+**Result.** Interleaved A/B, two rounds in opposite orders (HEAD, the PLE fix alone, both), steady
+ms per generated token, means of the two rounds (each pair within 0.5 ms):
+
+| Context | HEAD | PLE window | PLE window + I1 | Change |
+|---|---:|---:|---:|---:|
+| 29 tokens | 35.8 | 35.9 | 35.7 | none |
+| 8k | 41.2 | 39.8 | 39.6 | −4% |
+| 32k | 47.2 | 45.1 | 42.1 | −11% (20.4 → 22.9 tok/s) |
+| 64k | 54.5 | 52.3 | 45.4 | −17% (17.7 → 21.2 tok/s) |
+| 120k (one run each) | 66.6 | | 51.4 | −23% (14.4 → 18.6 tok/s) |
+
+- Generation now loses about 6 ms per token from 8k to 64k (39.6 → 45.4 ms), against 13 ms
+  before. With I1 the GPU time per step at 64k fell from 33.0 to 28.6 ms.
+- The PLE fix moved part of its time into waiting, since the next step's expert reads take as long
+  as before: input setup fell by 5.7 ms at 64k, the step by 2.2 ms.
+- Prompts: unchanged (64k: 152.8 s against 151.7 s).
+- Peak footprint: +100 MB at 64k (12.21 → 12.31 GB), +230 MB at 120k (15.42 → 15.65 GB).
+
+**Verification:** output identical to HEAD in every request:
+
+- all 5 prompts above, in both rounds and at 120k;
+- the 9 n-gram tasks with 2-row checks (`config-source.json` settings, prompt cache on), with the
+  same drafts accepted;
+- a prompt-cache restore (an 8k request, a short one, the 8k request again with 8,015 tokens
+  restored, then a second turn on it);
+- perplexity at 32k context (X1's `q8_0` run): 4.273238, as before.
+
+On the 9 tasks (1–5k tokens of context) the two builds were level: whichever ran second was 0.2–8%
+slower, in both orders.
+
+**What is left** (L3 in `TODO.md`): from 8k to 64k the GPU still takes 3.4 ms more per step,
+mostly attention over scattered chunks, the top-k over every cell and the scoring. Attending only
+the gathered 2,051 cells and selecting 512 blocks instead of 2,051 cells would remove most of it,
+but both change rounding or the boundary cells, so they need a quality comparison.
+
+**Not tested:** more than one sequence (the pooled rows are then off); context shifts; images,
+whose M-RoPE gaps take the PLE fallback scan.
 
 ## Tool calling
 
