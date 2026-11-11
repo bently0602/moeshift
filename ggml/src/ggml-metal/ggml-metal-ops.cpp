@@ -2943,7 +2943,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
     const int64_t ne1 = (ne01 + nqptg - 1)/nqptg;
     const int64_t ne0 = (ne30 + ncpsg - 1)/ncpsg;
 
-    res += GGML_PAD(ggml_type_size(GGML_TYPE_I8)*ne0*ne1*ne32*ne33, 32);
+    // 2 bytes per block: its state and its 8-column groups (kernel_flash_attn_ext_blk)
+    res += GGML_PAD(ggml_type_size(GGML_TYPE_I16)*ne0*ne1*ne32*ne33, 32);
 
     return res;
 }

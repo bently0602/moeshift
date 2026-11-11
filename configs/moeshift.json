@@ -6,7 +6,7 @@
       "args": {
         "model": "/path/to/model-00001-of-00002.gguf",
         "moe-experts": "/path/to/experts",
-        "ctx-size": 65536,
+        "ctx-size": 131072,
         "ctx-checkpoints": 1,
         "cache-ram": 4096,
         "prefill-max-tokens": 3072,

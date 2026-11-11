@@ -68,7 +68,7 @@ half-life; it does not change routing top-k, expert weights or precision.
 | `host`, `port` | `127.0.0.1`, `8080`; localhost only |
 | `args.model`, `args.moe-experts` | First GGUF shard and matching expert directory/manifest; required paths |
 | `args.alias` | Model ID; must equal its key under `models` |
-| `args.ctx-size`, `args.ctx-checkpoints` | `65536` tokens; `1` checkpoint |
+| `args.ctx-size`, `args.ctx-checkpoints` | `131072` tokens for Flash Next, `65536` for Qwen3.6; `1` checkpoint. The worker grows its caches as a conversation does, so a larger limit costs nothing until used: on the M5 Max 36 GB, 131072 against 65536 changed neither memory after load nor speed, and a 120k-token conversation through the router peaked at 17.6 GB system-wide, with later turns restored from the prompt cache in 3–5 s ([measurements](../MACM5MAX36GB.md#a-128k-context-limit-l4)) |
 | `args.cache-ram` | `4096` MiB for Flash Next; unset (`8192`) for Qwen3.6. Saved states of earlier conversations, restored when a request continues one instead of reprocessing it. Above the limit, the oldest entry under a quarter of the largest entry's tokens is dropped first (short side requests before the long conversation they interrupt), then the oldest; the newest is always kept. `0` disables it. A Flash Next entry takes about 225 MiB plus 27 KiB per token with `f16` KV (about 16 KiB per token with `q8_0`, estimated from the cache sizes) ([measurements](../MACM5MAX36GB.md#prompt-cache-limit-m2-uncommitted)) |
 | `args.threads` | `10` CPU threads |
 | `args.prefill-max-tokens` | `3072` tokens per prefill microbatch |

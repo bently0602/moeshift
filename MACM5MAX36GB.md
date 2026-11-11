@@ -66,6 +66,10 @@ are not general benchmarks.
   every cached block for each token. With both fixed, generation is 12% faster at
   32k tokens of context, 20% at 64k and 30% at 120k (14.4 → 18.6 tok/s), with
   identical output and about 1.5 KiB more memory per token of context.
+- Later (L4, L5, uncommitted): `ctx-size` is 131072, since the worker's caches grow with the
+  conversation; a 120k conversation through the router peaked at 17.6 GB. Flash attention in
+  prompts now skips 8-cell column groups the sparse mask hides from all 8 rows of a tile:
+  prompts 13% faster at 32k, 16% at 64k, 19% at 120k (6.4 → 5.2 minutes), identical output.
 
 ## Recommended configuration for this Mac
 
@@ -123,7 +127,7 @@ values on this Mac. See `configs/README.md` for the full reference.
 | `env.LLAMA_MOE_QUIET` | `1` | `1` | `0` prints expert-loading diagnostics (`prefill #…`, `pmgmt`, `pread_wall`) to the terminal. Use it for investigation only; diagnostics are not written to files. |
 | `args.moe-prefill-bank` | `512` | `512` | Not tested. The model has 512 experts per layer, and a long prompt uses almost all of them, so the bank holds a whole layer. |
 | `args.moe-decode-bank` | `0` | `0` | Not tested. |
-| `args.ctx-size`, `args.ctx-checkpoints` | `65536`, `1` | same | Not tested near the limit. The KV cache starts small and grows as needed, so a large `ctx-size` costs memory only when it is used. |
+| `args.ctx-size`, `args.ctx-checkpoints` | `65536`, `1` | same | Not tested near the limit. The KV cache starts small and grows as needed, so a large `ctx-size` costs memory only when it is used. **Later raised to `131072`** ([L4](#a-128k-context-limit-l4)). |
 | `args.threads` | `10` | `10` | Not tested. The M5 Max has 18 CPU cores. Most prompt-processing work runs on the GPU. |
 | `args.n-gpu-layers`, `args.flash-attn` | `99`, `on` | same | Required: expert execution needs Metal. |
 | `args.no-mmap` | `true` | `true` | Not tested. Weights are read explicitly instead of memory-mapped. |
@@ -3105,7 +3109,9 @@ new with the 2-row gate, then the reverse:
 - **Memory:** none.
 
 **Not tested:** IQ4_XS and IQ3_S small-batch kernels (about 0.5 ms more per check if they reach
-about 1.05×); 3-row steps end to end; Q2_K and Q3_K.
+about 1.05×); 3-row steps end to end; Q2_K and Q3_K. Tested later (K2 in `TODO.md`, not kept): the
+small-batch kernel was slower for IQ4_XS at every shape and saved about 0.17 ms per check for IQ3_S,
+but changed output in 4 of 9 n-gram tasks.
 
 ## A 120k-token context (L1)
 
@@ -3347,13 +3353,120 @@ ms per generated token, means of the two rounds (each pair within 0.5 ms):
 On the 9 tasks (1–5k tokens of context) the two builds were level: whichever ran second was 0.2–8%
 slower, in both orders.
 
-**What is left** (L3 in `TODO.md`): from 8k to 64k the GPU still takes 3.4 ms more per step,
-mostly attention over scattered chunks, the top-k over every cell and the scoring. Attending only
-the gathered 2,051 cells and selecting 512 blocks instead of 2,051 cells would remove most of it,
-but both change rounding or the boundary cells, so they need a quality comparison.
+**What is left** (L3 in `TODO.md`): from 8k to 64k the GPU still takes 3.4 ms more per step.
+Attending only the gathered 2,051 cells in decode steps (L3a: `get_rows` of the selected K, V and
+mask values, then flash attention over them) was built and gained nothing: 45.2 against 45.4 ms
+per token at 64k, 39.6 against 39.6 at 8k, with output changed late at 64k. The microbenchmark's
+attention cost assumed randomly scattered selections; the model's selections are clustered enough
+that the masked kernel already skips most chunks. Selecting 512 blocks instead of 2,051 cells (top-k
+1.7 ms at 64k in the microbenchmark) remains, at most about 4%, with up to 3 boundary cells
+changed.
 
 **Not tested:** more than one sequence (the pooled rows are then off); context shifts; images,
 whose M-RoPE gaps take the PLE fallback scan.
+
+## A 128k context limit (L4)
+
+The worker grows its KV, indexer and pooled-key caches as a conversation grows (`LLAMA_KV_GROW`,
+from 2,048 cells), and releases the reserved compute buffers after reserving (R2). So `ctx-size`
+should cost nothing until a conversation uses it. Checked with the L2 build
+(`/Volumes/Data/moeshift-scratch/l2/`):
+
+**Unused limit.** One worker per run, `config-source.json` settings, prompt cache off, prompts of
+29 tokens, 8k and 32k and the 29-token one again, two rounds:
+
+| `ctx-size` | Footprint after load | After the 4 requests | Peak footprint | ms per token, 29 / 8k / 32k |
+|---|---:|---:|---:|---|
+| 65,536 | 3,955–3,957 MB | 6,924 MB | 9,889 MB | 34.6–35.2 / 39.0 / 41.2–41.5 |
+| 131,072 | 3,957 MB | 6,932 MB | 9,891 MB | 34.6 / 38.8–39.0 / 41.2 |
+
+Prompt times were the same to 0.1 s, and every output was identical.
+
+**Used limit.** A 120k conversation through the router (`moeshift --config`,
+`config-source.json` with `ctx-size: 131072`, prompt cache 4,096 MiB): turn 1 with L1's
+119,928-token prompt, a short side request, turn 2 on turn 1's conversation, another side
+request, turn 3:
+
+| Request | Time | Prompt processed | Generation |
+|---|---:|---:|---:|
+| Turn 1 | 397.0 s | 119,928 tokens in 383.3 s | 17.70 tok/s |
+| Side request | 5.2 s | 22 tokens | 24.46 tok/s |
+| Turn 2 | 4.8 s | 235 tokens (119,924 restored) | 17.55 tok/s |
+| Side request | 3.6 s | 42 tokens | 24.43 tok/s |
+| Turn 3 | 2.7 s | 50 tokens (120,155 restored) | 16.24 tok/s |
+
+- Peak 17.6 GB system-wide above the level before start, 7.6 GB after the conversation; swap
+  unchanged. All answers were right (the three codes, and the file that defines
+  `llama_adapter_lora_init`).
+- The prompt cache held the 120k conversation through each side request.
+
+**Setting:** `ctx-size: 131072` in `config-source.json` and the Flash Next profile of
+`configs/moeshift.json` (Qwen3.6 stays at 65,536, not measured). The model's trained context is
+262,144; 131,072 was the largest measured here.
+
+**Not tested:** `ctx-size` above 131,072; a long agent session that fills the prompt cache with
+several long conversations (M3, S1).
+
+## Long-prompt attention (L5)
+
+Prompts slow down with depth: 660 tok/s at 8k, 509 at 32k, 418 at 64k, 313 at 120k (L2's runs).
+With `LES_BLOCK_DIAG`, the graph compute of a 6,144-token batch grew from 6.9 s at depth 0 to
+19.4 s at 57k, about 0.2 s per 1k tokens of depth. Uncommitted change, identical output.
+
+**Where the time went.** A microbenchmark of one batch's context-dependent sparse-attention work
+(`/Volumes/Data/moeshift-scratch/l2/l2p_bench.cpp`: 12 layers, `q8_0` KV, the batch's rows in
+`qsa_chunks`' chunks, a causal mask, random keys), cumulative seconds per batch:
+
+| Cells | Score | +expand | +top-k | +mask | +attention | Attention alone: all causal cells | adjacent 2,051 | random 512 blocks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8k | 0.19 | 0.36 | 0.66 | 0.78 | 2.4 | 1.64 | 0.68 | 1.64 |
+| 32k | 0.75 | 1.43 | 2.79 | 2.95 | 12.6 | 9.6 | 0.73 | 9.7 |
+| 64k | 1.50 | 2.90 | 5.83 | 6.04 | 26.7 | 20.8 | 0.80 | 20.7 |
+
+- Flash attention runs at about 5.5 TFLOPS on all causal cells. With scattered selections it costs as
+  much as attending every cell: ggml-metal's prompt kernel skips a tile of 8 query rows by 64
+  cells only when the mask hides all of it, and 8 rows choosing 512 blocks each leave few such
+  tiles. The real model's selections are more clustered: about 7 s of its 12.5 s growth at 57k.
+- Scoring, expanding the scores to cells, the top-k over every cell and the mask take the rest,
+  about 6 s per batch at 64k.
+
+**Change** (`ggml/src/ggml-metal/ggml-metal.metal`, `ggml-metal-ops.cpp`): the mask pre-pass
+(`kernel_flash_attn_ext_blk`) also records, for each tile with some visible cells, which of its
+eight 8-cell column groups any of the 8 rows can see, in a second byte per tile. The prompt
+kernel skips the Q·Kᵀ products (writing zeros), the K and V dequantization and the P·V products
+of the other groups. Their scores become −inf with the mask either way, so their probabilities
+are exact zeros and nothing they would add changes the result. Decode steps use the vector kernel
+and are unaffected.
+
+**Result.** In the microbenchmark, attention with random selections: 9.7 → 7.0 s per batch at
+32k, 20.7 → 10.6 s at 64k; all-cell and adjacent selections unchanged. Interleaved A/B against
+commit `44b8828` (L2), two rounds in opposite orders, `config-source.json` settings with
+`--ctx-size 131072`:
+
+| Prompt | Before | After | Change |
+|---|---:|---:|---:|
+| 29 tokens | 1.2–1.3 s | 1.2–1.3 s | none |
+| 8k | 11.7–11.8 s | 11.4–11.5 s | −2.5% |
+| 32k | 62.6–64.8 s | 54.8–54.9 s | −13% |
+| 64k | 150.8–150.9 s | 126.0–126.1 s | −16% |
+| 120k (one run each) | 382.1 s | 309.5 s | −19% (6.4 → 5.2 minutes) |
+
+- Output identical to the previous build in every request, generation unchanged.
+- Perplexity at 32k context (X1's `q8_0` run): 4.273238, as before, with every KLD statistic
+  against the old reference the same; the pass took 142.5 s against 151.3–153.8 s.
+- The 9 n-gram tasks with 2-row checks (`config-source.json` settings, prompt cache on): output
+  identical to L2's.
+- `test-backend-ops -o FLASH_ATTN_EXT` on Metal: 4,752 of 4,752 passed (this also covers the f16
+  and other head-size branches the model does not use).
+- Memory: the pre-pass buffer takes 2 bytes per tile instead of 1, a few MB at most.
+
+**What is left:** the indexer's per-cell work (about 6 s per batch at 64k), and attention, which
+still computes whole 8-cell groups for 8 rows when one row selected one 4-cell block of them.
+Expanding the block scores with one `ggml_repeat` instead of two transposes and a gather, exact
+when cells are in position order, was built (L6a) and gained nothing: the 64k prompt took 128.5
+and 126.7 s with it, 126.4 and 126.3 s without, with identical output. A top-k over blocks instead
+of cells would shrink the top-k fourfold and drop the expansion; it changes output (see
+`TODO.md`, L6).
 
 ## Tool calling
 
@@ -3377,6 +3490,7 @@ Multiple tools, parallel calls and `tool_choice` were not tested.
   section). Prompts under 3,072 tokens fit in one batch either way; prompts over
   6,144 tokens still split, into half as many batches.
 - Long conversations or contexts near the 65,536-token limit (a single 120k-token
-  prompt was measured later, see [L1](#a-120k-token-context-l1)).
+  prompt was measured later, see [L1](#a-120k-token-context-l1), and a 120k conversation
+  through the router with a 131,072 limit, see [L4](#a-128k-context-limit-l4)).
 - Output agreement between the two settings.
 - The Homebrew build (the source build at the same commit was used).
