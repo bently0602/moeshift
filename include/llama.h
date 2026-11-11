@@ -320,6 +320,10 @@ extern "C" {
         const char * moe_experts_path;
         int32_t moe_slot_bank;
 
+        // Type for the bf16 hyper-connection projections (qwen4exp), converted when loading.
+        // GGML_TYPE_COUNT keeps the type stored in the file.
+        enum ggml_type hc_type;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible

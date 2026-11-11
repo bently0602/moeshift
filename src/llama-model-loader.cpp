@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1259,6 +1260,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(hparams, buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        apply_hc_type(tn.tensor, ret);
         return ret;
     }
 
@@ -1293,6 +1295,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+    apply_hc_type(tn.tensor, tensor);
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1301,6 +1304,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+void llama_model_loader::apply_hc_type(llm_tensor tensor, ggml_tensor * t) const {
+    if (hc_type == GGML_TYPE_COUNT || t->type != GGML_TYPE_BF16 || t->ne[0] % ggml_blck_size(hc_type) != 0) {
+        return;
+    }
+    if (tensor != LLM_TENSOR_HC_ATTN_DOWN && tensor != LLM_TENSOR_HC_ATTN_UP &&
+        tensor != LLM_TENSOR_HC_FFN_DOWN  && tensor != LLM_TENSOR_HC_FFN_UP) {
+        return;
+    }
+    if (use_mmap) {
+        throw std::runtime_error("hc-type requires --no-mmap");
+    }
+    t->type  = hc_type;
+    t->nb[0] = ggml_type_size(hc_type);
+    t->nb[1] = ggml_row_size(hc_type, t->ne[0]);
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+    }
 }
 
 ggml_tensor * llama_model_loader::create_tensor_alloc(
@@ -1591,7 +1613,30 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
-    std::vector<no_init<uint8_t>> read_buf;
+    // grows to the largest tensor read (Flash Next's output layer, 417 MiB); macOS's allocator keeps
+    // a freed block that large charged to the process, so the pages come from ggml_aligned_malloc,
+    // which returns them to the system when freed
+    struct read_buffer {
+        uint8_t * data = nullptr;
+        size_t    size = 0;
+
+        ~read_buffer() {
+            if (data) {
+                ggml_aligned_free(data, size);
+            }
+        }
+        void reserve(size_t n) {
+            if (n <= size) {
+                return;
+            }
+            if (data) {
+                ggml_aligned_free(data, size);
+            }
+            data = (uint8_t *) ggml_aligned_malloc(n);
+            GGML_ASSERT(data != nullptr);
+            size = n;
+        }
+    } read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1707,6 +1752,29 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        if (cur->type != weight->tensor->type) {
+            // --hc-type: converted from the file's bf16 a block of rows at a time
+            GGML_ASSERT(weight->tensor->type == GGML_TYPE_BF16 && !use_mmap);
+            const auto & file = files.at(weight->idx);
+            const int64_t n_per_row = cur->ne[0];
+            const int64_t n_rows    = ggml_nrows(cur);
+            const int64_t step      = std::max<int64_t>(1, (1 << 18) / n_per_row);
+            const size_t  row_size  = ggml_row_size(cur->type, n_per_row);
+            std::vector<ggml_bf16_t> src(step * n_per_row);
+            std::vector<float> f32(src.size());
+            std::vector<uint8_t> dst(row_size * step);
+            file->seek(weight->offs, SEEK_SET);
+            for (int64_t r = 0; r < n_rows; r += step) {
+                const int64_t n = std::min(step, n_rows - r);
+                file->read_raw(src.data(), n * n_per_row * sizeof(ggml_bf16_t));
+                ggml_bf16_to_fp32_row(src.data(), f32.data(), n * n_per_row);
+                const size_t size = ggml_quantize_chunk(cur->type, f32.data(), dst.data(), 0, n, n_per_row, nullptr);
+                ggml_backend_tensor_set(cur, dst.data(), r * row_size, size);
+            }
+            size_done += ggml_nbytes(weight->tensor);
+            continue;
+        }
+
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
@@ -1801,11 +1869,11 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    read_buf.resize(n_size);
+                    read_buf.reserve(n_size);
                     file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    file->read_raw(read_buf.data, n_size);
+                    ggml_backend_tensor_set(cur, read_buf.data, 0, n_size);
+                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data, n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
                 }

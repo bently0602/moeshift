@@ -241,6 +241,11 @@ void validate_config(const json & config, const std::filesystem::path & base, st
             }
         }
         for (const auto & value : env.items()) { scalar(value.value()); }
+        if (args.contains("hc-type")) {
+            const auto type = scalar(args.at("hc-type"));
+            require(type == "bf16" || type == "q8_0", "hc-type must be bf16 or q8_0");
+            require(type == "bf16" || (args.contains("no-mmap") && args.at("no-mmap").get<bool>()), "hc-type q8_0 requires no-mmap");
+        }
         if (env.contains("LLAMA_MOE_PROTECTED_SLOTS") && scalar(env.at("LLAMA_MOE_PROTECTED_SLOTS")) != "0") {
             const auto depth = env.contains("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")
                 ? std::atoi(scalar(env.at("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")).c_str()) : 0;

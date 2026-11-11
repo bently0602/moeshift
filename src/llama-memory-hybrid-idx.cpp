@@ -52,8 +52,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // the indexer caches its keys raw, before the norm, so they need f32's range rather than
+        // cache-type-k: an f16 cache raised perplexity 2.5-4% at 32k context against bf16, f32 or
+        // q8_0 (MACM5MAX36GB.md, indexer cache type). bf16 takes the same memory as f16.
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, GGML_TYPE_BF16, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             filter_idx, nullptr, "idx_", /*key_only=*/true);
     }()) {}

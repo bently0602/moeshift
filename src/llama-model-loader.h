@@ -92,6 +92,10 @@ struct llama_model_loader {
     bool no_alloc;
     bool partial_load = false;
 
+    // --hc-type: the bf16 hyper-connection projections are created as this type and converted while
+    // loading (GGML_TYPE_COUNT keeps the file's type)
+    ggml_type hc_type = GGML_TYPE_COUNT;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -194,6 +198,9 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // switches a new hyper-connection projection to hc_type (see hc_type)
+    void apply_hc_type(llm_tensor tensor, ggml_tensor * t) const;
 
     /// 在**指定的 buft** 上新建一个空张量（不读 gguf、不进 weights_map）。
     ///

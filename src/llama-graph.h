@@ -764,7 +764,21 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // the graph metadata is sized for the largest graph (about 100 MB for 6,144-token batches) but a
+    // graph uses only part of it; ggml_aligned_malloc's pages are backed only once used and go back
+    // to the system when freed (a std::vector zero-filled every page)
+    struct meta_buffer {
+        void * data = nullptr;
+        size_t size = 0;
+
+        meta_buffer() = default;
+        meta_buffer(const meta_buffer &) = delete;
+        meta_buffer & operator=(const meta_buffer &) = delete;
+        ~meta_buffer();
+
+        void resize(size_t n);
+    };
+    meta_buffer buf_compute_meta;
 
     ggml_cgraph * gf;
 
