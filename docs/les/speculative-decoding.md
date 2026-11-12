@@ -24,7 +24,7 @@ the model profile:
   prefill phase.) Prompt tails are 4 tokens, so with 2 rows they still use prefill. The context,
   the graph and the expert runtime share this decision (`llama_moe_slot_runtime::decode_step`).
 - The profile also accepts `spec-draft-model` (resolved like `model`), `spec-draft-n-max`,
-  `spec-draft-n-min` and `spec-draft-ngl`.
+  `spec-draft-n-min`, `spec-draft-p-min` and `spec-draft-ngl`.
 
 ## Rollback
 

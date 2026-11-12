@@ -171,3 +171,29 @@ the break-even for Proposal 1 barely moves.
    steps, to choose `p-min`.
 4. **ANE drafter**, only if step 3 meets the decision point above.
 5. **S1**, counting side requests, before any work on Proposal 3.
+
+**Steps 2 and 3 result:** step 2 (K2) was built and not kept: the IQ4_XS small-batch kernel was
+slower, and IQ3_S's saved about 0.17 ms per check but changed output. Step 3: the offline sweep
+passed at 1.6 steps per check (+4.5–11% on prose at 93–98% acceptance). On the GPU the draft model
+lost 13–22% end to end, but a control run (draft model loaded, no drafts checked) showed why: its
+context takes about 7.5 GB system-wide from the file cache, which slows single steps 9–33% without
+any check, and drafting costs about 4 ms per call. With that held equal, a gated 2-row check cost
+about 1.7 single steps and the big model's time per token fell 5.5–13%. That settles the dispute
+above mostly on the memory side. With the draft context's batch capped (1.7 GB instead of 7.5), a
+gated check costs 1.59–1.66 single steps like for like, and the big model's time per token is 1–9%
+below the baseline's even with the draft model on the GPU; end to end the GPU drafter still loses
+3–15% to its own serial GPU time, which is the part the ANE takes over. Step 3 meets the decision
+point, so step 4 is open to build (`MACM5MAX36GB.md`, confidence-gated draft model).
+
+**Step 4, first two parts:** the full 0.8B model (24 layers, norm, tied output head in 16 parts)
+runs on the Neural Engine at 4-bit: 379 MB, 10.1 ms per step. Its top token agrees with Flash
+Next's at 64.9%, against 71.8% for the Q8_0 model (fp16 arithmetic, 4-bit weights and the 4k
+attention window each cost a few points), and running it alongside costs the big model about
+1–2%. Net estimate: about +1% on chat prose, +5–6% on explanations and summaries, +10–15% on
+code; not measured end to end.
+
+**Long-context check:** on a 25k-token coding conversation the 4-bit model's agreement falls to
+53.6%, against 74.3% for the Q8_0 model with the full context. The 4k attention window costs 11
+points, 4-bit weights 8, fp16 arithmetic 1.5. The net estimate becomes about +5–6% on new code
+and nothing on prose, so the drafter is parked; a longer window and 6- or 8-bit weights are the
+untested ways back.
