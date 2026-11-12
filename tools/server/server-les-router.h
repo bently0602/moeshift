@@ -8,7 +8,7 @@ inline const std::set<std::string> moeshift_model_options{
     "model", "moe-experts", "ctx-size", "ctx-checkpoints", "cache-ram", "prefill-max-tokens",
     "moe-prefill-bank", "moe-decode-bank", "n-gpu-layers", "flash-attn",
     "cache-type-k", "cache-type-v", "threads", "no-mmap", "alias", "hc-type",
-    "spec-type", "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min", "spec-draft-ngl"};
+    "spec-type", "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min", "spec-draft-p-min", "spec-draft-ngl"};
 
 inline constexpr int invalid_router_config = 2;
 

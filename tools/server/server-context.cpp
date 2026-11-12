@@ -835,6 +835,9 @@ private:
                 common_params params_dft = params_base;
                 bool measure_model_bytes = true;
 
+                // as for the draft context below
+                params_dft.n_ubatch = std::min(params_dft.n_ubatch, 512);
+
                 if (has_draft) {
                     const auto & params_spec = params_base.speculative.draft;
                     params_dft.devices               = params_spec.devices;
@@ -933,6 +936,12 @@ private:
             SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
             auto params_dft = params_base;
+
+            // the draft context takes the target's batches (n_batch), but its compute buffers are
+            // sized by n_ubatch and stay allocated: at the worker's 6,144-token prefill batch a
+            // Qwen3.5-0.8B draft context held about 7.5 GB (MACM5MAX36GB.md, confidence-gated draft
+            // model). A small draft model loses nothing by taking its prompt 512 tokens at a time.
+            params_dft.n_ubatch = std::min(params_dft.n_ubatch, 512);
 
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams;

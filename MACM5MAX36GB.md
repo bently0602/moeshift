@@ -3468,6 +3468,197 @@ and 126.7 s with it, 126.4 and 126.3 s without, with identical output. A top-k o
 of cells would shrink the top-k fourfold and drop the expansion; it changes output (see
 `TODO.md`, L6).
 
+## Confidence-gated draft model (ANE drafter decision)
+
+`ANE-2.md` set a decision point for drafting with Qwen3.5-0.8B on the Neural Engine: build it
+only if a model-drafted 2-row check costs about 1.6 single steps or less; near 1.9 the idea is
+dead. Tools and results in `/Volumes/Data/moeshift-scratch/n5/`.
+
+**Offline sweep** (`agree_p`, N5's agreement tool plus the draft's top-token probability, and
+`sim.py`). On N5's six greedy Flash Next answers (2,624 tokens), replayed with 1-token drafts made
+only when the draft's probability is at least a threshold; an accepted check yields 2 tokens, a
+rejected one 1. The drafter is assumed to run ahead on its own guesses and to skip drafting for one
+step when its previous guess was wrong (waiting about 6 ms to resynchronize was worse in every
+case). Probabilities over the top 10 candidates, as the server's sampler computes them; best
+threshold per sample:
+
+| Sample | Ungated agreement | Threshold | Drafted positions | Accepted | Gain at 1.6 steps per check | at 1.8 | at 2.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Story | 54% | 0.6 | 42% | 86% | +4.5% | about +2% | ≤ 0 |
+| `short.json` | 59% | 0.7 | 37% | 90% | +5.0% | about +2% | ≤ 0 |
+| Explanation | 70% | 0.8 | 54% | 94% | +10.1% | about +4% | ≤ 0 |
+| `long.json` | 74% | 0.6 | 70% | 92% | +11.4% | about +5% | ≤ 0 |
+| All six | 72% | 0.7 | 59% | 93% | +10.2% | +4.0% | −1.5% |
+
+Gating works (93–98% of drafts accepted at 0.7–0.8), and the prose samples reach `ANE.md`'s stop
+rule (about 5%) only at 1.6 steps per check.
+
+**On the GPU.** The worker with the 0.8B model as a 1-token draft model (`spec-type: draft-simple`,
+`spec-draft-p-min: 0.8`, `LLAMA_MOE_DECODE_ROWS: 2`, context 16k) on the six N5 prompts, against
+two other configurations, two runs each (`gpu.sh`, `gpu2.sh`; the second runs of each were
+interleaved):
+
+- **Baseline:** `config-source.json`'s n-gram drafting, no draft model.
+- **Control:** the draft model loaded and drafting at every step, with `spec-draft-p-min: 1.01`,
+  so no draft is ever checked. This holds the draft model's own cost equal.
+
+Memory after load: 5.7 GB footprint and 6.3 GB system-wide for the baseline; 7.1 GB and
+13.8–13.9 GB with the draft model. The draft context takes about 7.5 GB system-wide (the server
+estimated 6.8 GB), most of it outside the footprint, and all of it from the expert file cache.
+
+Step times from the `LES_BLOCK_DIAG` phase log (graph, inputs and compute of the big model's
+steps), ranges over the two runs:
+
+| Prompt | Baseline, 1-row step | Control, 1-row step | Draft run, 1-row step | Draft run, 2-row check | Drafts accepted |
+|---|---:|---:|---:|---:|---:|
+| Story | 34.1–35.0 ms | 38.1–38.2 ms | 36.2–37.8 ms | 60.5–63.9 ms | 72 of 77 |
+| `short.json` | 33.4–34.6 | 43.5–45.4 | 38.5–41.5 | 65.9–73.8 | 102 of 112 |
+| Explanation | 34.7–35.9 | 42.4–43.2 | 41.0–44.6 | 67.4–73.8 | 130 of 134 |
+| `long.json` | 36.9–37.9 | 47.8–48.0 | 45.7–49.0 | 73.9–80.8 | 178 of 179 |
+| Writing code | 36.3–38.2 | 46.8–46.9 | 44.0–46.7 | 71.3–79.1 | 159 of 168 |
+| Editing code | 38.1–40.9 | 50.9–52.3 | 48.2–51.0 | 79.7–87.3 | 176 of 180 |
+
+- **The draft model's presence slows every step, with no checks at all:** the control's single
+  steps are 9–33% slower than the baseline's. The checks do not slow the single steps further (the
+  draft run's are level with or faster than the control's). An earlier reading of the first draft
+  run blamed the checks for evicting experts; the control rules that out.
+- **A check costs about 1.7 single steps like for like:** 1.66–1.72 of the control's single step
+  in the interleaved run (1.48–1.58 for the first draft run, made when the machine ran 2–7%
+  faster). The baseline's few n-gram checks cost 1.58–1.75 of its own single steps.
+
+The big model's graph time per generated token, and end to end:
+
+| Prompt | Baseline | Control | Draft run | Draft against control (interleaved run) | tok/s end to end, baseline → draft |
+|---|---:|---:|---:|---:|---|
+| Story | 35.3–36.1 ms | 39.3–39.4 ms | 35.5–37.2 ms | −5.5% | 26.9–27.5 → 22.3–23.3 |
+| `short.json` | 33.7–35.0 | 44.1–46.0 | 37.3–40.9 | −9.3% | 27.5–28.5 → 20.7–22.4 |
+| Explanation | 34.8–36.0 | 43.1–44.0 | 37.2–40.5 | −6.9% | 26.9–27.7 → 21.3–22.9 |
+| `long.json` | 37.5–38.5 | 48.6–48.8 | 40.1–43.5 | −10.6% | 25.1–25.8 → 19.9–21.3 |
+| Writing code | 37.1–39.0 | 47.8–47.9 | 38.5–42.3 | −11.7% | 24.8–26.1 → 20.7–22.5 |
+| Editing code | 37.8–40.4 | 51.3–52.6 | 41.5–45.2 | −13.1% | 23.9–25.6 → 19.6–21.1 |
+
+- **With the draft model's cost held equal, checking its gated drafts cut the big model's time
+  per token by 5.5–13%** (6–15% more tokens per second), in line with the offline sweep near 1.6–1.7
+  steps per check. The first draft run, against the same controls, gives 10–20%.
+- **A draft model on the GPU is still a clear loss end to end** (13–22% slower than the baseline):
+  about 7.5 GB of file cache, and 6–9 ms per token outside the big model's steps, against
+  1.1–1.4 ms in the baseline. Drafting takes about 4 ms of that per draft call (the server's
+  counter: 1,320–1,586 ms over 326–398 calls on the story; the phase log's 0.7–0.9 ms is only the
+  time to queue the draft model's GPU work). The other 4 ms per step is a second draft-model pass
+  (see below).
+- Output differed from the baseline's on five of six prompts in the first draft run, as in phase
+  D: frequent 2-row checks round differently at near-ties.
+
+**With the draft context's memory capped.** The 7.5 GB was the draft context's compute buffer: it
+inherited the worker's 6,144-token prefill batch as its `n_ubatch`, and the buffer release after
+reserving applies only to the expert-streaming context. The server now caps a draft context's
+`n_ubatch` at 512 (`tools/server/server-context.cpp`); it still accepts the target's batches. The
+draft model then costs about 1.7 GB system-wide (8.0 GB after load against 6.3 GB; the server's
+estimate fell from 6,843 to 1,464 MiB), and the 6,060-token prompt took the same 8.0 s with it.
+Two interleaved runs each of baseline, control and draft run; the two runs of each agreed within
+1–3%, and their outputs were identical:
+
+| Prompt | Big model's ms per token: baseline | Control | Draft run | Draft against baseline | against control | Check / control's single step | tok/s end to end, baseline → draft |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Story | 36.1 | 38.8 | 35.9 | −0.8% | −7.6% | 1.59 | 26.8 → 22.9 (−15%) |
+| `short.json` | 35.2 | 37.5 | 35.0 | −0.7% | −6.7% | 1.63 | 27.4 → 23.6 (−14%) |
+| Explanation | 36.2 | 38.2 | 34.5 | −4.9% | −9.7% | 1.66 | 26.7 → 24.4 (−9%) |
+| `long.json` | 38.6 | 41.8 | 37.2 | −3.6% | −10.9% | 1.65 | 25.1 → 22.6 (−10%) |
+| Writing code | 39.2 | 41.3 | 35.7 | −9.0% | −13.7% | 1.63 | 24.7 → 24.0 (−3%) |
+| Editing code | 40.9 | 43.9 | 37.7 | −7.8% | −14.2% | 1.65 | 23.6 → 23.0 (−3%) |
+
+- **The big model now spends less time per token than the baseline on every prompt**, 1–9% less,
+  while still carrying the GPU draft model: the control's single steps are 3–8% slower than the
+  baseline's (1.7 GB less file cache and the draft model's GPU work between steps).
+- **A gated check costs 1.59–1.66 of a single step like for like** (1.71–1.79 of the baseline's),
+  at the plan's mark for building.
+- **End to end the GPU drafter still loses 3–15%**, all of it the draft model's own GPU time, which
+  runs in series with the big model: 6–8 ms per token outside the big model's steps, against
+  1.1–1.5 ms in the baseline. `draft-simple` runs the draft model twice per step, once to take in
+  the target's batch and once to draft (653 draft decodes over 327 steps on the story); the
+  drafting pass is about 4.2 ms (the server's counter), and the other accounts for the rest.
+- Output still differs from the baseline's on five of six prompts.
+
+**Decision at this point (superseded by the long-context test below): the Neural Engine drafter
+passes the plan's test.** Its drafting runs
+beside the GPU, so the 6–8 ms per token of draft-model time leaves the critical path, and it holds
+about 250 MB (stage 3: 0.4–0.7% cost to the big model). What the GPU test bounds:
+
+- **Upper bound:** the draft run against the control, 7–14% less time per token (+7–17% tokens
+  per second), reached by a drafter that is always in step with the big model.
+- **Lower bound:** the sweep with a drafter that skips a step whenever its run-ahead guess was
+  wrong, at 1.6–1.7 steps per check: about +3–5% on the story and short answer, +7–11% on the
+  explanation and summary, +10–15% on new code.
+
+Neither is a measurement of the Neural Engine drafter itself.
+
+**Not tested:** whether the 4-bit Neural Engine model agrees as often as the Q8_0 one (the sweep
+can be rerun on its logits); the step time of its remaining layers and output head; quality of
+the changed outputs, which every scheme with frequent 2-row checks needs; a GPU drafter with one
+draft pass per step. `spec-draft-p-min` is now accepted as a profile option
+(`tools/server/server-les-router.h`), which this test needed.
+
+**The full draft model on the Neural Engine (steps 1 and 2 of the build).** All 24 layers, the
+final norm and the tied output head (16 parts of 15,520 tokens), 4k ring buffer
+(`/Volumes/Data/moeshift-scratch/ane/draft/`). The PyTorch step matched llama.cpp's Q8_0 model at
+every position of two samples (top probability within 0.004). In Core ML every operation is
+placed on the Neural Engine:
+
+| Version | Compiled size | Step on CPU + Neural Engine | Agreement with Flash Next, six samples | Sweep gain at 1.6 / 1.8 steps per check, all six |
+|---|---:|---:|---:|---:|
+| Q8_0 in llama.cpp (reference) | — | — | 71.8% | +10.2% / +4.3% |
+| fp16 | 1,506 MB | 15.0 ms | 67.4% | +8.9% / +3.7% |
+| 4-bit palettized | 379 MB | 10.1 ms (plus 0.4 ms for the top token on the CPU) | 64.9% | +8.0% / +3.2% |
+
+4-bit, best threshold per sample, at 1.6 steps per check (skip policy): story +2.9%, `short.json`
++3.0%, explanation +7.1%, `long.json` +8.1%, writing code +12.9%, editing code +17.4%. Three
+losses against the reference: the Neural Engine's fp16 arithmetic (3–5 points), 4-bit weights
+(2–3 more), and on the 6k-token prompt the 4k attention window (73.8% → 69.7% in exact
+arithmetic). So chat prose falls to about the stop mark (3%), and code stays well above it.
+
+**Running alongside the big model** (`conc2.sh`): the 4-bit step every 25 ms (about 1.5 per
+generated token, with the embedding lookup and the top token on the CPU) during the six N5
+prompts with `config-source.json` settings, two interleaved rounds. The big model generated 0.3%
+faster to 2.2% slower (story +0.3%, `short.json` −0.8%, explanation −1.9%, `long.json` −0.8%,
+writing code −1.9%, editing code −2.2%); the off runs differ by up to 4% on the story and 1–2%
+elsewhere, so this is about 1–2%. The step took 11.3 ms alongside (p99 17–18 ms), against 10.1 ms
+alone.
+
+**Where this leaves the drafter:** from the sweep's lower bound less about 1–2% for running
+alongside and about 1% for 0.4 GB of memory (estimated from the file-cache figure), a 4-bit
+Neural Engine drafter would give about nothing on chat prose (+1%), +5–6% on explanations and
+summaries and +10–15% on code. Not measured end to end.
+
+**At 25k tokens of context** (`ane/draft/long/`): one coding conversation, 25,000 tokens of
+repository sources in a user message, with three requests at its end (a new function, a prose
+explanation of one in the context, a change plan with snippets); Flash Next's greedy answers
+without speculation, 1,421 tokens. The draft model four ways, teacher-forced through the whole
+conversation; sweep gain at 1.6 steps per check with the best threshold:
+
+| Draft model | Agreement: new code | Explanation | Change plan | All | Sweep gain: new code | Explanation | Change plan |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Q8_0 in llama.cpp, full context | 86.6% | 56.3% | 77.2% | 74.3% | +16.9% | +4.4% | +11.9% |
+| Exact arithmetic (PyTorch), 4k window | 75.6% | 42.5% | 68.8% | 63.4% | +12.3% | +2.0% | +9.4% |
+| Neural Engine fp16, 4k window | 71.4% | 44.7% | 66.8% | 61.9% | +10.1% | +1.6% | +8.3% |
+| Neural Engine 4-bit, 4k window | 63.0% | 36.6% | 58.6% | 53.6% | +8.3% | +1.0% | +6.9% |
+
+- **The 4k attention window is the largest loss at this depth:** 11 points of agreement, against 4
+  at 6k tokens. What the answer needs is often further back than the window.
+- **4-bit weights cost 8 points here**, against 2–3 on the short samples.
+- **The Neural Engine's fp16 arithmetic costs 1.5 points**, so fp16-friendly norms would recover
+  little.
+
+**Decision: parked.** At the context of an agent session, the 4-bit model with a 4k window would
+give, less about 2–3% for running alongside and its memory, about +5–6% on new code, +4% on a
+plan with snippets and nothing on prose (estimates from the sweep's lower bound, not measured end
+to end), for several days of work and changed output. The short samples' +10–15% on code does not
+hold at depth. What would have to change to revisit: a longer attention window (the step grows
+with it: 15 ms for 18 layers at 20k cells in stage 3d) and 6- or 8-bit weights (more memory and
+step time), which together could approach the exact 4k row or better; neither is tested.
+
+**Not tested:** a 16k or 32k window; 6- or 8-bit weights; contexts beyond 25k; other
+conversations (one conversation, three answers); the drafter end to end.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the
