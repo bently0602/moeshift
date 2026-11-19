@@ -3029,6 +3029,11 @@ With your `config-source.json` speculation (`ngram-simple`, `spec-draft-n-max: 1
   checks round differently from 1-row steps. N2's identical-output measurement did not include
   these two prompts.
 
+Applied: `config-source.json` and the Flash Next profile in `configs/moeshift.json` now set
+`"hc-type": "q8_0"`. The engine's own default stays `bf16`, so `--hc-type bf16` or removing the
+setting restores the GGUF's weights. The main `config.json` keeps `bf16`, for comparisons with the
+Homebrew build.
+
 **Not tested:**
 - **Ground truth.** Task accuracy on a benchmark large enough to resolve 1%.
 - **Perplexity bias.** A quarter of the scored text is the bf16 model's own output, which favours
@@ -3470,9 +3475,33 @@ of cells would shrink the top-k fourfold and drop the expansion; it changes outp
 
 ## Confidence-gated draft model (ANE drafter decision)
 
-`ANE-2.md` set a decision point for drafting with Qwen3.5-0.8B on the Neural Engine: build it
-only if a model-drafted 2-row check costs about 1.6 single steps or less; near 1.9 the idea is
-dead. Tools and results in `/Volumes/Data/moeshift-scratch/n5/`.
+**Status: on hold** (N5 in `TODO.md`). In order of what was learned:
+
+1. Gating 1-token drafts on the draft model's confidence works: 93–98% of drafts accepted.
+2. On the GPU a draft model loses 3–15% end to end, because it runs in series with the big model.
+3. Like for like, a gated 2-row check costs about 1.6 single steps and cuts the big model's time
+   per token 7–14%.
+4. The full Qwen3.5-0.8B runs on the Neural Engine at 4-bit (379 MB, 10.1 ms per step) and costs
+   the big model 1–2% alongside.
+5. At 25k tokens of context its guesses agree with Flash Next's far less often, mostly because of
+   its 4k attention window: the estimate falls to about +5–6% on new code and nothing on prose.
+
+Not built into the engine. Kept from this work: a draft context's `n_ubatch` capped at 512
+(`tools/server/server-context.cpp`; 1.7 GB instead of 7.5 GB) and `spec-draft-p-min` as a profile
+option (`tools/server/server-les-router.h`).
+
+**To resume:** test a 16–32k attention window and 6- or 8-bit weights on the 25k-token
+conversation (`ane/draft/README.md` lists every script and its command). Only if new code gets
+near the exact-arithmetic row below (+12% in the sweep) at a step under about 20 ms, go on to
+`ANE-2.md`'s remaining parts:
+- a drafter interface for an out-of-process model;
+- an end-to-end run;
+- a quality comparison of the changed outputs.
+
+The history follows. `ANE-2.md` set a decision point for drafting with Qwen3.5-0.8B on the Neural
+Engine: build it only if a model-drafted 2-row check costs about 1.6 single steps or less; near
+1.9 the idea is dead. Tools and results in `/Volumes/Data/moeshift-scratch/n5/` and
+`/Volumes/Data/moeshift-scratch/ane/draft/`.
 
 **Offline sweep** (`agree_p`, N5's agreement tool plus the draft's top-token probability, and
 `sim.py`). On N5's six greedy Flash Next answers (2,624 tokens), replayed with 1-token drafts made
@@ -3592,10 +3621,10 @@ about 250 MB (stage 3: 0.4–0.7% cost to the big model). What the GPU test boun
 
 Neither is a measurement of the Neural Engine drafter itself.
 
-**Not tested:** whether the 4-bit Neural Engine model agrees as often as the Q8_0 one (the sweep
-can be rerun on its logits); the step time of its remaining layers and output head; quality of
-the changed outputs, which every scheme with frequent 2-row checks needs; a GPU drafter with one
-draft pass per step. `spec-draft-p-min` is now accepted as a profile option
+**Not tested at this point** (the first two were tested below): whether the 4-bit Neural Engine
+model agrees as often as the Q8_0 one; the step time of its remaining layers and output head;
+quality of the changed outputs, which every scheme with frequent 2-row checks needs; a GPU drafter
+with one draft pass per step. `spec-draft-p-min` is now accepted as a profile option
 (`tools/server/server-les-router.h`), which this test needed.
 
 **The full draft model on the Neural Engine (steps 1 and 2 of the build).** All 24 layers, the
@@ -3624,7 +3653,8 @@ writing code −1.9%, editing code −2.2%); the off runs differ by up to 4% on 
 elsewhere, so this is about 1–2%. The step took 11.3 ms alongside (p99 17–18 ms), against 10.1 ms
 alone.
 
-**Where this leaves the drafter:** from the sweep's lower bound less about 1–2% for running
+**Where this left the drafter, on the short samples** (superseded by the long-context test
+below): from the sweep's lower bound less about 1–2% for running
 alongside and about 1% for 0.4 GB of memory (estimated from the file-cache figure), a 4-bit
 Neural Engine drafter would give about nothing on chat prose (+1%), +5–6% on explanations and
 summaries and +10–15% on code. Not measured end to end.
@@ -3648,7 +3678,7 @@ conversation; sweep gain at 1.6 steps per check with the best threshold:
 - **The Neural Engine's fp16 arithmetic costs 1.5 points**, so fp16-friendly norms would recover
   little.
 
-**Decision: parked.** At the context of an agent session, the 4-bit model with a 4k window would
+**Decision: on hold.** At the context of an agent session, the 4-bit model with a 4k window would
 give, less about 2–3% for running alongside and its memory, about +5–6% on new code, +4% on a
 plan with snippets and nothing on prose (estimates from the sweep's lower bound, not measured end
 to end), for several days of work and changed output. The short samples' +10–15% on code does not
@@ -3658,6 +3688,387 @@ step time), which together could approach the exact 4k row or better; neither is
 
 **Not tested:** a 16k or 32k window; 6- or 8-bit weights; contexts beyond 25k; other
 conversations (one conversation, three answers); the drafter end to end.
+
+## Qwen3.6-35B-A3B profile (A1)
+
+The Qwen3.6 profile in `configs/moeshift.json` had never been measured on this Mac: it still used
+24 protected slots, prediction depth 3 (read 2), 3,072-token prefill batches and a 65,536-token
+context. Measured on 2026-11-15 for the planned Qwen3.6 app. Tools, configurations and every run's
+outputs are in `/Volumes/Data/moeshift-scratch/a3b/` (`mkcfg.py` writes one router configuration
+per variant, `run.sh` runs one fresh router, `sweep.sh` interleaves variants).
+
+**Model:** `unsloth/Qwen3.6-35B-A3B-GGUF` UD-Q6_K_XL, architecture `qwen35moe`: 40 layers (full
+attention in every fourth, delta-net in the rest), 256 experts with 8 used per token, a
+262,144-token trained context. The experts are 29.15 GB (about 2.85 MB per expert and layer) and
+the other weights 2.69 GB. The GGUF was on the external drive and the experts on the internal SSD.
+
+**Method:** the router (`build/bin/moeshift --config`), a fresh server per run, variants
+interleaved in each round. Per run: a warmup (the short benchmark prompt, which includes loading),
+the short prompt twice, the 4,000-token prompt (`p4000`, 16 output tokens) and the 6,060-token
+long prompt, 512 output tokens each, greedy. Memory sampled every 200 ms with r2m's `memwatch`.
+Output compared by a hash of each reply. Every variant below wrote the same text as the old profile
+on every prompt, unless stated otherwise.
+
+**Cache settings** (two rounds each; tok/s after the short and the long prompt):
+
+| Variant | Short | Long | 6k prompt | 4k prompt | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| Old profile (24 protected, depth 3, read 2) | 39.83 | 36.47 | 5.41 s | 5.08 s | 7.8 GB |
+| No protected slots, depth 3 | 38.64 | 35.35 | 4.99 s | 4.55 s | 5.0 GB |
+| No protected slots, depth 4 | 39.43 | 36.24 | 5.05 s | 4.61 s | 5.2 GB |
+| No protected slots, depth 5 | 39.99 | 36.81 | 5.03 s | 4.59 s | 5.3 GB |
+| No protected slots, depth 6 | 40.33 | 37.08 | 5.13 s | 4.68 s | 5.4 GB |
+| No protected slots, depth 6, read 4 | 40.68 | 37.39 | 5.06 s | 4.60 s | 5.4 GB |
+| No protected slots, depth 7 | 40.20 | 37.06 | 5.06 s | 4.63 s | 5.5 GB |
+| No protected slots, depth 8 | 39.88 | 36.80 | 5.06 s | 4.63 s | 5.6 GB |
+| Depth 6, window 10 | 39.71 | 36.78 | 5.07 s | 4.59 s | 5.2 GB |
+| Depth 6, window 8 | 39.67 | 36.50 | 5.09 s | 4.56 s | 5.0 GB |
+| Depth 8, window 16 | 39.35 | 36.98 | 5.19 s | 4.83 s | 6.1 GB |
+
+- **Protected slots:** as for Flash Next (P0), turning them off makes prompts faster and saves
+  2.4–2.8 GB, since the file cache holds those experts anyway; at depth 3 it costs 3% of generation.
+- **Depth:** 5–7 are within about 1% of each other, close to the run-to-run spread; depth 6 with
+  read 4 was best. Smaller or larger windows were slower.
+
+**Prefill batch size and context** (on depth 6, read 4; two rounds each):
+
+| Variant | Short | Long | 6k prompt | 4k prompt | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| `prefill-max-tokens` 3072 | 40.87 | 37.72 | 4.98 s | 4.55 s | 5.4 GB |
+| `prefill-max-tokens` 6144 | 41.51 | 38.15 | 3.25 s | 2.54 s | 5.5 GB |
+| `ctx-size` 131072 | 41.35 | 38.11 | 4.89 s | 4.46 s | 5.4 GB |
+
+- **6,144-token batches:** the 4k prompt fits one batch instead of two, the 6k prompt one instead of
+  two, and every batch reads all of a layer's experts. The system-wide peak rose about 2 GB (compute
+  buffers for twice the rows, which only the GPU writes).
+- **42,389-token prompt** (`ctx-size` 131072, 64 output tokens): 43.8 s at 6,144 (967 tok/s), 45.0 s
+  at 8,192 and 44.7 s at 12,288, with peak footprints of 6.9, 7.3 and 8.2 GB. At this length
+  attention, not expert reads, sets the time, so larger batches do not help.
+- **131k context:** no measurable cost, as for Flash Next (L4).
+
+**Final A/B** (three interleaved rounds; ranges over the six short and three long runs):
+
+| | Old profile | Tuned profile |
+|---|---:|---:|
+| Generation after the short prompt | 43.31 tok/s (43.10–43.63) | 42.90 (42.80–43.04), −0.9% |
+| Generation after the long prompt | 38.57 (38.46–38.62) | 39.70 (39.59–39.77), +2.9% |
+| 6,060-token prompt | 4.85 s | 3.21 s, −34% |
+| 4,000-token prompt | 4.52 s | 2.30 s, −49% |
+| Peak footprint | 7.8 GB | 5.5 GB, −2.3 GB |
+
+The tuned profile (now in `configs/moeshift.json`): no protected slots, depth 6, read 4,
+`prefill-max-tokens` 6144, `ctx-size` 131072 and `cache-ram` 4096, plus n-gram drafting (below),
+which this A/B did not include. Without it, output was identical on every prompt. The machine ran about 8% faster during this A/B than during the sweeps above, so compare
+only within a table. The protected tier is worth about 1% after short prompts here, for 2.3 GB; it
+stays off to leave that memory to the file cache, which matters more for this model: its 29 GB of
+experts nearly fit in the file cache of a 36 GB Mac.
+
+**n-gram drafting** (`spec-type: ngram-simple`, `spec-draft-n-max: 1`, `LLAMA_MOE_DECODE_ROWS: 2`,
+which the 18-slot window allows), on N2's 8 generation tasks, two rounds each:
+
+| Task | Without | With | Change | Drafts accepted | Output |
+|---|---:|---:|---:|---:|---|
+| config | 28.67 | 35.53 | +24% | 365 of 373 | identical |
+| whole-file | 26.90 | 31.81 | +18% | 549 of 550 | identical |
+| edit-call | 25.79 | 30.26 | +17% | 143 of 145 | identical |
+| rewrite-fn | 27.20 | 30.40 | +12% | 295 of 296 | changed |
+| edit-think | 31.06 | 31.96 | +3% | 198 of 211 | changed |
+| explain-quote | 29.69 | 29.81 | 0% | 44 of 48 | changed |
+| story | 38.05 | 37.90 | 0% | — | identical |
+| summary | 36.56 | 36.64 | 0% | — | identical |
+
+As on Flash Next, 2-row checks round differently from 1-row steps, so 3 of the 8 outputs change.
+It is in the profile (as in the Flash Next profile), since it speeds up agent-style output.
+
+**Stripped GGUF:** the same settings with the GGUF written by `moeshift experts strip` (2.69 GB
+instead of 31.8 GB) gave identical output at the same speed (40.08 / 37.11 against 40.33 / 37.08).
+
+**Not tested:** the protected tier together with depth 6; `cache-ram` (set to 4096 as for Flash
+Next, without a session measurement; see M3 in `TODO.md`); contexts beyond 42k tokens; quality of
+the outputs that n-gram drafting changes; tool calling with this model.
+
+## Qwen3.6 decode profile and attention (A2)
+
+Where a generated Qwen3.6 token's time goes, and a change to decode attention that it pointed to.
+Measured on 2026-11-16. Scripts and every run's output are in `/Volumes/Data/moeshift-scratch/`:
+`a3b/w/` (the worker started directly, since the router does not pass shell `LLAMA_MOE_*`
+variables; `run.sh`, `fa-matrix.sh`, `fn-check.sh`), `prof/` (the profiling build and `tools/`),
+`fa/` (reference and development builds, `kld/`).
+
+**Method.** The A1 profile without n-gram drafting, the worker started directly, `ignore_eos`,
+greedy: the short prompt (72 tokens) and the long one (6,060), 512 tokens each, and a
+42,389-token prompt with 128 tokens.
+
+**Expert reads.** With reads skipped (`LLAMA_MOE_SKIP_READ=1`, timing only, output invalid),
+generation rose from 42.8–43.1 to 54.2 tok/s after the short prompt and from 39.3 to 52.0 after the
+long one (two interleaved rounds). Reads cost about 5–6 ms of a 23–25 ms token. Fewer misses do not
+recover it: a window holding all 256 of layer 0's experts (`LLAMA_MOE_LAYER_WINDOWS=0:248`, about
+0.7 GB) cut its misses from 7.25 to 0.44 per token (about 10% of all misses) and changed nothing
+(42.9–43.0 and 39.3 tok/s, identical output). The file cache holds most of the 29 GB of experts,
+so a miss is a cheap copy.
+
+**Timeline per token** (temporary timers in `ggml_backend_sched_compute_splits` and a completion
+handler on every Metal command buffer, as in G6; 2,040 tokens; the timers did not change speed):
+
+| Per token, short prompt | Normal | Expert reads skipped |
+|---|---:|---:|
+| Total | 23.48 ms | 18.40 ms |
+| GPU busy | 15.54 ms | 13.97 ms |
+| GPU idle between the 41 graph splits | 5.83 ms | 4.10 ms |
+| GPU idle inside splits (waiting for reads) | about 2.4 ms | 0 |
+| Splits per token | 82 (41 Metal, 41 expert steps) | 82 |
+
+With reads skipped, about 100 µs of idle GPU at each layer boundary, as for Flash Next (G6, where
+one command buffer per token recovered only 0.5 ms).
+
+**GPU time by part** (each part in its own command buffer, which added 5%; reads skipped):
+
+| Part | ms per token | Share |
+|---|---:|---:|
+| Mixer: delta-net (30 layers) and attention (10 layers) | 6.46 | 44% |
+| Routed experts | 3.83 | 26% |
+| Router, including the next-layer prefetch guess | 1.92 | 13% |
+| Output head | 1.21 | 8% |
+| Shared expert | 0.76 | 5% |
+| Combine | 0.49 | 3% |
+
+One command buffer per kernel ranked the kernels (2–3 µs of overhead each; the sum was 19.6 instead
+of 14.0 ms). The dense Q8_0 mat-vecs run near what this GPU reaches (B1): attention and delta-net
+input projections about 371 GB/s (48 µs per layer for 2048×8192), `z` and the delta-net output 365
+GB/s, the Q8_0 output head (540 MB) 447 GB/s. The routed experts (Q6_K gate and up, Q8_0 down)
+reach about 237 GB/s. The delta-net state (2 MB of f32 per layer) is gathered and copied back every
+step, about 1.3 ms per token in this count. Decode flash attention took 38 µs per attention layer
+after the short prompt, 124 µs at 6k tokens and 718 µs at 42k.
+
+**At 42k tokens** a token took 38–40 ms (26 tok/s). With reads skipped, 25.6 ms: attention added
+about 6 ms of GPU time. With reads, the gaps between splits grew to 14.0 ms (4.3 with reads skipped)
+and Metal encoding to 9.4 ms (2.1), although the experts read per token (about 470 MB) and the
+misses were the same as after a short prompt, and the time did not fall over the 128 tokens. Not
+explained.
+
+### Decode attention kernel
+
+`kernel_flash_attn_ext_vec` gives each query head a threadgroup. Qwen3.6 has 16 query heads on 2 KV
+heads, so every cached key and value is read and unpacked 8 times. `test-backend-ops perf` at its
+shape (head size 256, one query row, mask, 32 workgroups):
+
+| Cache | Qwen3.6 shape (2 × 8 heads) | 16 KV heads (8× the data) | 2 heads alone (⅛ of the work) |
+|---|---:|---:|---:|
+| `q8_0`, 42,496 cells | 641 µs | 1,044 µs | 207 µs |
+| `f16`, 42,496 cells | 414 µs | 1,706 µs | — |
+| `q8_0`, 6,144 cells | 100 µs | 154 µs | — |
+| `f16`, 6,144 cells | 55 µs | 253 µs | 24 µs |
+
+Reads alone do not set the time: `f16` moves twice the bytes of `q8_0` and is 35% faster, since
+`q8_0` is unpacked per element and per head. Three kernels that keep every head's arithmetic, and so
+the output, exactly as before (each checked bit for bit):
+
+- **G heads per simdgroup** (each block unpacked once for 4 or 8 heads): `q8_0` at 42k 790 µs
+  instead of 647. It has 4–8 times fewer simdgroups, and this kernel needs them to hide memory
+  latency. Not kept.
+- **The simdgroups of 4 or 8 heads in one threadgroup** (each still does the regular kernel's work,
+  but the heads read each block through the same core's cache): `f16` 414 → 318 µs at 42k and 55 →
+  39 µs at 6k; `q8_0` 641 → 704 µs and 100 → 107 µs. **Kept for `f16`** as
+  `kernel_flash_attn_ext_vec_gqa`, behind `GGML_METAL_FA_GROUP_HEADS` (heads per threadgroup: 8 when
+  shared memory allows, else 4).
+- **`q8_0` unpacked with two 2-byte loads instead of four 1-byte loads** (same values): 702 µs, no
+  change. Not kept.
+
+`tests/test-metal-fa-group` compares the grouped kernel with the regular one bit for bit (16 and 24
+query heads on 2 KV heads, 100 to 42,389 cells, 1 and 2 rows, padded and fully masked chunks).
+
+### `f16` KV for Qwen3.6
+
+Interleaved, two rounds (42k: three), reference build against the development build:
+
+| | After short prompt | After 6k prompt | 6k prompt | 42k prompt | After 42k prompt | Footprint, 42k |
+|---|---:|---:|---:|---:|---:|---:|
+| `q8_0` (reference build) | 41.9–42.4 tok/s | 38.6 | 3.23 s | 43.9 s | 23.3–23.6 | 5.68 GB (peak 6.16) |
+| `q8_0` (development build) | 42.1–42.3 | 38.6 | | 43.9 s | 23.5 | 5.68 GB |
+| `f16` | 41.5–41.8 | 38.7 | 3.13 s | 38.8 s | 29.4–29.7 | 6.13 GB |
+| `f16`, grouped heads | 41.1–41.7 | 38.7–39.1 | | 38.8 s | 30.8–31.9 | 6.13 GB (peak 6.61) |
+
+- **Output:** the development build wrote the reference build's text with `q8_0`, and the grouped
+  kernel wrote the same text as plain `f16`. `f16` itself changes output against `q8_0`.
+- **Speed:** `f16` with grouped heads generates **33% faster at 42k tokens** (31.3 against 23.5
+  tok/s), the same at 6k and about 1% slower after a short prompt; the 42k prompt is 12% faster.
+- **Memory:** the KV cache grows with the conversation; `f16` takes 20 KiB per token against
+  10.6, about 0.45 GB more at 42k tokens and 1.2 GB at 128k.
+
+**Quality** (`llama-perplexity --kl-divergence`, *The Moonstone* as in X2, 8 chunks of 32,768
+tokens, 131k scored tokens; reference `f16`, perplexity 6.7252):
+
+| 32k context, prose | Perplexity | Mean KLD | Median KLD | 99.9th pct KLD | Same top token |
+|---|---:|---:|---:|---:|---:|
+| `q8_0` against `f16` | 6.7272 (+0.03% ± 0.02) | 0.0014 | 0.0004 | 0.040 | 98.3% |
+
+`q8_0` costs nothing measurable here either, so the choice is speed against memory. **The Qwen3.6
+profile now uses `f16` KV and `GGML_METAL_FA_GROUP_HEADS: 1`. Changes output** (the KV type).
+
+**Flash Next is unchanged.** Its profile does not set the variable, and the regular kernel is the
+same code. With `config-source.json`, the reference and development builds wrote the same text on
+the short and long prompts and two n-gram tasks, in two interleaved rounds, at the same speed
+(28.6/28.8 tok/s short, 25.2/25.4 long, 28.4/28.4 config, 27.3/27.3 whole-file in round two).
+
+### Speed by context length (both models)
+
+Each shipped profile as it is now (Qwen3.6: `configs/moeshift.json`, `f16` KV with grouped heads;
+Flash Next: `config-source.json`, `q8_0` KV), `build/bin/moeshift` after this change, measured on
+2026-11-16. A fresh worker per size (`a3b/w/ctx-sweep.sh`, `ctx-sweep-fn.sh`), a warmup request,
+then the start of *The Moonstone* cut to the size with "Summarize the story so far in a few
+paragraphs.", 256 tokens, `ignore_eos`, greedy. Both tokenizers gave the same prompt lengths. One
+run per size; prose, so n-gram drafting probably did little. Footprint is the worker's `footprint -p`
+at the end and its lifetime peak (`phys_footprint_peak`).
+
+| Context (prompt tokens) | Qwen3.6 prompt | Qwen3.6 generation | Qwen3.6 footprint, end / peak | Flash Next prompt | Flash Next generation | Flash Next footprint, end / peak |
+|---|---:|---:|---:|---:|---:|---:|
+| 16k (16,539) | 10.1 s (1,637 tok/s) | 40.2 tok/s | 5.7 / 5.7 GB | 24.0 s (689 tok/s) | 20.5 tok/s | 6.5 / 8.6 GB |
+| 32k (32,583) | 26.3 s (1,237 tok/s) | 36.0 tok/s | 6.2 / 6.7 GB | 56.2 s (580 tok/s) | 19.8 tok/s | 6.9 / 9.8 GB |
+| 64k (64,972) | 77.7 s (837 tok/s) | 24.7 tok/s | 7.2 / 8.7 GB | 136.4 s (476 tok/s) | 18.9 tok/s | 7.8 / 12 GB |
+| 96k (98,008) | 157.7 s (622 tok/s) | 21.7 tok/s | 7.2 / 8.9 GB | 241.7 s (406 tok/s) | 17.3 tok/s | 7.8 / 13 GB |
+| 124k (126,402) | 249.5 s (507 tok/s) | 19.8 tok/s | 7.8 / 11 GB | 350.3 s (361 tok/s) | 16.7 tok/s | 8.3 / 15 GB |
+
+- **Qwen3.6** generates twice as fast as Flash Next at 16k and about 20% faster at 124k. Its
+  generation falls most between 32k and 64k: dense attention in 10 layers reads the whole cache
+  every token.
+- **Flash Next** loses only 18% from 16k to 124k: its indexer attends to 2,048 selected positions,
+  so attention barely grows with context.
+- **Prompts:** Qwen3.6 processes them 1.4–2.4 times faster; both slow down with length, Qwen3.6
+  more (attention over the whole prompt).
+- **Memory peaks grow with the prompt:** Flash Next peaked at 15 GB at 124k (8.3 GB at the end),
+  Qwen3.6 at 11 GB (7.8 GB). The footprint misses prefill's GPU-written compute buffer
+  ([R2](#prefill-peak-memory-r2-uncommitted)); measured system-wide, Flash Next's peak at 124k is
+  about 18 GB ([IQ3_S](#flash-next-iq3_s-against-iq3_xxs)).
+- **No swapping:** swap use stayed at the 3.3 GB already in use before the runs.
+- Not compared here with Qwen3.6's earlier `q8_0` setting (at 42k: 23.5 against 31.3 tok/s, above).
+
+**Not tested:** Qwen3.6 contexts above 42k with `q8_0`; the n-gram tasks on Qwen3.6 with `f16`;
+the delta-net state copies and the routed-expert kernels (the next candidates above); why reads cost
+more at 42k.
+
+## Flash Next IQ3_S against IQ3_XXS
+
+ISTA-DASLab's GSQ-RCO repository has no 4-bit GGUF; its largest build is IQ3_S (3.5 bits per
+weight, 83.6 GB), which its model card recommends: task average 93.26 against 92.57 for IQ3_XXS
+over AIME25, GPQA-Diamond and LiveCodeBench v6 (+1.5 on GPQA-Diamond, +0.6 on LiveCodeBench).
+Quality was not measured here.
+
+**Files.** Shard 2 (the per-layer n-gram table, IQ4_NL) is the same file in every build (same
+SHA-256), so only shard 1 (54.8 GB) was downloaded, to `/Volumes/Data`, with shard 2 linked to the
+IQ3_XXS copy on the internal SSD. The prepared experts were 50.3 GB against 42.9 GB (+17%), on
+the internal SSD. The extra size mostly moves `down` from `Q2_0` to `IQ4_NL` and `gate`/`up` from
+IQ2_XXS/IQ2_XS to IQ2_S and IQ3_XXS:
+
+| Expert tensors (layers) | IQ3_XXS | IQ3_S |
+|---|---|---|
+| `down` | 30 `Q2_0`, 18 `IQ4_NL` | 9 `Q2_0`, 39 `IQ4_NL` |
+| `gate`, `up` (each) | 9 IQ2_XXS, 10 IQ2_XS, 10 IQ2_S, 6 IQ3_XXS, 13 IQ3_S | 20 IQ2_S, 17 IQ3_XXS, 10 IQ3_S, 1 IQ4_XS |
+
+**Method.** `config-source.json` with only `model` and `moe-experts` changed, the same build, the
+worker started directly (`a3b/w/run.sh`, `iq3s-compare.sh`, `ctx-sweep-both.sh`), measured on
+2026-11-16. Memory was sampled every 2 s (`memlog.sh`): the worker's footprint and, because the
+footprint misses prefill's GPU-written compute buffer ([R2](#prefill-peak-memory-r2-uncommitted)),
+the system-wide change in active + inactive − file-backed + wired + compressed memory from just
+before the worker started (highest 3-sample median; other processes are included).
+
+**Short and 6k prompts, n-gram tasks**, two interleaved rounds; each build repeated its own text
+and speed in both rounds:
+
+| | IQ3_XXS | IQ3_S | Change |
+|---|---:|---:|---:|
+| Generation after a short prompt | 27.0–27.2 tok/s | 24.3–24.5 | −10% |
+| 6k prompt | 7.4 s | 12.1 s | +64% |
+| Generation after the 6k prompt | 23.9–24.1 | 19.5 | −19% |
+| `config` / `whole-file` (n-gram drafting) | 28.4 / 25.4 | 24.0 / 20.7 | −15% / −19% |
+| Peak, system-wide | +9.7–9.9 GB | +9.7–9.8 GB | same |
+| During generation, system-wide | +7.7 GB | +8.8 GB | +1.1 GB |
+| Worker footprint at the end | 7.13 GB | 7.78 GB | +0.66 GB |
+
+**Context sweep**, a fresh worker per size, IQ3_XXS and IQ3_S alternating, the requests of
+[Speed by context length](#speed-by-context-length-both-models) (one run each):
+
+| Context | Prompt, IQ3_XXS / IQ3_S | Generation | Peak, system-wide | During generation, system-wide |
+|---|---:|---:|---:|---:|
+| 16k | 24.2 / 37.6 s (+55%) | 23.4 / 21.1 tok/s (−10%) | +11.1 / +10.9 GB | +7.1 / +8.2 GB |
+| 32k | 56.9 / 84.5 s (+49%) | 22.0 / 20.8 (−5%) | +12.6 / +12.3 GB | +7.5 / +8.3 GB |
+| 64k | 137.4 / 191.5 s (+39%) | 20.4 / 19.7 (−3%) | +13.8 / +14.7 GB | +6.7 / +9.0 GB |
+| 96k | 242.6 / 322.4 s (+33%) | 18.5 / 17.8 (−4%) | +16.1 / +16.4 GB | +7.8 / +9.4 GB |
+| 124k | 350.7 / 459.5 s (+31%) | 18.4 / 17.4 (−5%) | +18.0 / +17.4 GB | +8.8 / +9.4 GB |
+
+- **Generation** costs 10–19% up to 6k tokens and 3–5% from 32k on, where attention takes a larger
+  share of each token.
+- **Prompts** cost 31–64%, far more than the 17% more bytes: the 6k prompt's experts take about
+  1 s longer to read at 7.2 GB/s, but it took 4.7 s longer. The likely cause is the move from
+  `Q2_0` to lookup-table formats, which ISTA-DASLab's card reports as much slower for prompts
+  (not profiled here).
+- **Memory:** the peak, set by prefill, is the same within the 0.3 GB run-to-run spread at every
+  size; during generation IQ3_S holds about 1 GB more. The worker's footprint peak was about 1 GB
+  *lower* for IQ3_S at every size (8.6 against 7.6 GB at 16k, 15 against 14 GB at 124k), so it is
+  not a reliable comparison here. Flash Next's real peak at 124k is about 18 GB.
+- **No swapping:** no pages were swapped out in any run, and compressed memory stayed below 1.8 GB.
+- Single sweep runs vary: IQ3_XXS generated 23.4 tok/s at 16k here against 20.5 earlier the same
+  day.
+
+**Decision: Flash Next stays on IQ3_XXS.** For about a point of benchmark score, IQ3_S makes prompts
+31–64% slower and short-context generation 10–19% slower, with the same memory peak. The IQ3_S
+files (shard 1 on `/Volumes/Data` and its prepared experts) were deleted after these runs; the
+scripts and results stay in `/Volumes/Data/moeshift-scratch/a3b/w/` (`out/q3*`).
+
+**Not tested:** quality on this machine (the card's numbers only); the router and apps with the
+IQ3_S files; a profile of the IQ3_S prompt kernels.
+
+## Reasoning effort
+
+`args.reasoning-effort` (the apps' Thinking setting) and a request's `reasoning_effort` map an
+OpenAI-style effort to Qwen's thinking switch and a thinking budget: `none`/`minimal` turn thinking
+off, `low` and `medium` cap it at 1,024 and 4,096 tokens, and `high`, `xhigh` and `max` leave it
+unlimited, as before. One Qwen3.6-35B-A3B run per level through the router (greedy, `max_tokens`
+12,000, prompt "Find all pairs of integers (x, y) with x^2 - y^2 = 2024. How many are there?";
+the answer is 16):
+
+| Effort | Output tokens | Thinking | Answer | Time |
+|---|---:|---:|---|---:|
+| `none` | 1,366 | none | 16 (correct) | 44.6 s |
+| `low` | 1,761 | 2,816 chars | 12 (wrong) | 50.2 s |
+| `medium` | 4,737 | 9,287 chars | 16 (correct) | 140.1 s |
+| `high` | 12,000 | 25,016 chars | none: still thinking at the limit | 369.4 s |
+| unset | 12,000 | 25,016 chars | as `high` (same output) | 383.7 s |
+
+- `high` gives the same output as no effort at all, so the default does not change output.
+- The OpenAI Responses API (`reasoning.effort: low`) and Anthropic Messages
+  (`output_config.effort: low`; `thinking: {"type": "disabled"}`) gave exactly the output of
+  chat `low` and `none`. `chat_template_kwargs.enable_thinking: false` overrides `low`, and an
+  unknown effort is refused with HTTP 400.
+- A profile default of `none` was overridden by a request's `high`.
+- One prompt is not a quality comparison: here thinking off answered correctly and `low` did not.
+
+Flash Next (IQ3_XXS, the app profile through the router, greedy, `max_tokens` 16,384) on 16
+problems with checked answers, each ending "ANSWER: <answer>": eight easier ones (integer pairs,
+inclusion-exclusion, digit sum of 2^50, stair climbing, Python list aliasing, trailing zeros of 125!,
+derangements of 6, 3^100 mod 7) and eight harder ones (numbers up to 10,000 with digit sum 20, the
+smallest n with 100 trailing zeros, two-pair poker hands, bounded a+b+c=20, the last three digits of
+7^2024, differences of squares up to 1,000, subsets of 1..15 without neighbours, Python closures
+in a loop). Off is `reasoning_effort: none`; the caps are `thinking_budget_tokens`:
+
+| Thinking | Correct | Output tokens | Time (16 problems) | Slowest problem | Generation |
+|---|---:|---:|---:|---:|---:|
+| Off | 16/16 | 17,907 | 803 s | 117 s | 23.1 tok/s |
+| 1,024-token cap (`low`) | 16/16 | 10,703 | 534 s | 68 s | 21.2 tok/s |
+| 4,096-token cap (`medium`) | 16/16 | 14,084 | 722 s | 158 s | 20.0 tok/s |
+| 8,192-token cap | 16/16 | 14,084 | 731 s | 162 s | 20.0 tok/s |
+| Unlimited (`high`, the default) | 16/16 | 14,084 | 728 s | 158 s | 20.1 tok/s |
+
+- Every level answered every problem. These problems do not separate the levels by quality.
+- Flash Next ended its thinking on its own in under 4,096 tokens on all 16, so the 4,096 and
+  8,192 caps gave exactly the unlimited output; at 1,024 the cap cut four of them (integer pairs,
+  digit sum 20, 100 trailing zeros, differences of squares), which still came out right.
+- The 1,024 cap was the fastest: 27% less time than unlimited, and 33% less than thinking off,
+  whose answers work the problem through at length instead.
+- No swapping: 8 swap-ins and no swap-outs over the 80 requests.
+- The Flash Next app therefore defaults to `medium`; A3B stays at `high` (unlimited).
+- Not tested: prompts that need long thinking (where `low` and `medium` cut it), coding and
+  agent tasks, long contexts, and sampling other than greedy. Scripts and results are in
+  `/Volumes/Data/moeshift-scratch/effort/`.
 
 ## Tool calling
 

@@ -532,7 +532,15 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         if (thinking_type == "enabled") {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
+        } else if (thinking_type == "disabled") {
+            oai_body["reasoning_effort"] = "none";
         }
+    }
+
+    // Anthropic's effort (low, medium, high, xhigh or max), unless thinking is disabled
+    if (!oai_body.contains("reasoning_effort") && body.contains("output_config") && body.at("output_config").is_object()
+            && body.at("output_config").contains("effort")) {
+        oai_body["reasoning_effort"] = body.at("output_config").at("effort");
     }
 
     // Handle Anthropic-specific metadata param

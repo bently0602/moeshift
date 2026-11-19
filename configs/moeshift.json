@@ -9,7 +9,7 @@
         "ctx-size": 131072,
         "ctx-checkpoints": 1,
         "cache-ram": 4096,
-        "prefill-max-tokens": 3072,
+        "prefill-max-tokens": 6144,
         "moe-prefill-bank": 512,
         "moe-decode-bank": 0,
         "n-gpu-layers": 99,
@@ -18,6 +18,9 @@
         "cache-type-v": "q8_0",
         "threads": 10,
         "no-mmap": true,
+        "hc-type": "q8_0",
+        "spec-type": "ngram-simple",
+        "spec-draft-n-max": 1,
         "alias": "qwen-3.8-flash-next-rco-gsq-iq3-xxs"
       },
       "env": {
@@ -25,27 +28,31 @@
         "LLAMA_GPU_KEEPALIVE": 1,
         "LLAMA_MOE_DECODE_WINDOW": 12,
         "LLAMA_MOE_LOOKAHEAD_PREFETCH": 1,
-        "LLAMA_MOE_PREFETCH_READ": 2,
-        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 3,
+        "LLAMA_MOE_PREFETCH_READ": 8,
+        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 8,
         "LLAMA_MOE_PREFILL_PIPELINE": 1,
-        "LLAMA_MOE_PROTECTED_SLOTS": 0
+        "LLAMA_MOE_PROTECTED_SLOTS": 0,
+        "LLAMA_MOE_DECODE_ROWS": 2
       }
     },
     "qwen-3.6-35b-a3b-q6-xl": {
       "args": {
         "model": "/path/to/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
         "moe-experts": "/path/to/experts",
-        "ctx-size": 65536,
+        "ctx-size": 131072,
         "ctx-checkpoints": 1,
-        "prefill-max-tokens": 3072,
+        "cache-ram": 4096,
+        "prefill-max-tokens": 6144,
         "moe-prefill-bank": 256,
         "moe-decode-bank": 0,
         "n-gpu-layers": 99,
         "flash-attn": "on",
-        "cache-type-k": "q8_0",
-        "cache-type-v": "q8_0",
+        "cache-type-k": "f16",
+        "cache-type-v": "f16",
         "threads": 10,
         "no-mmap": true,
+        "spec-type": "ngram-simple",
+        "spec-draft-n-max": 1,
         "alias": "qwen-3.6-35b-a3b-q6-xl"
       },
       "env": {
@@ -53,10 +60,12 @@
         "LLAMA_GPU_KEEPALIVE": 1,
         "LLAMA_MOE_DECODE_WINDOW": 12,
         "LLAMA_MOE_LOOKAHEAD_PREFETCH": 1,
-        "LLAMA_MOE_PREFETCH_READ": 2,
-        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 3,
+        "LLAMA_MOE_PREFETCH_READ": 4,
+        "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH": 6,
         "LLAMA_MOE_PREFILL_PIPELINE": 1,
-        "LLAMA_MOE_PROTECTED_SLOTS": 24
+        "LLAMA_MOE_PROTECTED_SLOTS": 0,
+        "LLAMA_MOE_DECODE_ROWS": 2,
+        "GGML_METAL_FA_GROUP_HEADS": 1
       }
     }
   }

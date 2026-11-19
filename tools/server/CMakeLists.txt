@@ -83,6 +83,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ui.h"
 
 add_executable(moeshift
     server-les.cpp
+    server-les-experts.cpp
     server-les-router.cpp
     server-models.cpp
     server-http.cpp

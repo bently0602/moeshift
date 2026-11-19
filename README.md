@@ -86,6 +86,13 @@ The first launch opens the setup wizard. You just choose the model: it will down
 
 **Prefer to configure it yourself or try your own model?** Choose **Manual configuration**. See the [configuration reference](configs/README.md).
 
+### Or build the Mac apps
+
+`apps/build.sh` builds two apps from this repository, one for Flash Next and one for Qwen3.6 35B
+A3B. Each downloads and prepares its model, keeps only what the engine reads (29 GB less for
+Qwen3.6, 43 GB less for Flash Next than the GGUF plus experts), and starts the engine with the
+tuned settings, optionally shared on the local network with an API key. See [apps](apps/README.md).
+
 ### Try a message from Terminal
 
 Open another Terminal and run:
@@ -105,7 +112,13 @@ In any client that supports an OpenAI-compatible API, enter:
 | Base URL | `http://127.0.0.1:8080/v1` |
 | Model | `qwen-3.8-flash-next-rco-gsq-iq3-xxs` |
 
-MoEShift handles one inference request at a time and listens only on localhost.
+The API serves `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (OpenAI
+Responses) and `/v1/messages` with `/v1/messages/count_tokens` (Anthropic Messages); other paths
+answer `File Not Found`, and the log names them (`no endpoint for POST …`). When the configuration
+has one model, requests that name another model or none use it; with several, an unknown name
+answers `Unknown model`. MoEShift handles one
+inference request at a time and listens only on localhost unless the configuration sets another
+`host`, which requires an `api-key` or `no-api-key` (see [configuration](configs/README.md)).
 
 
 ## Architecture

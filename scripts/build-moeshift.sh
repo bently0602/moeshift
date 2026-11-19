@@ -73,7 +73,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
 cmake --build build --target moeshift -j "$jobs"
 
 if [ "$test" = 1 ]; then
-  checks="test-les-protected-cache test-les-active-ranges test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-ssd-rows"
+  checks="test-les-protected-cache test-les-active-ranges test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-metal-fa-group test-ssd-rows"
   # shellcheck disable=SC2086
   cmake --build build --target $checks -j "$jobs"
   ctest --test-dir build -R "^($(echo $checks | tr ' ' '|'))\$" --output-on-failure

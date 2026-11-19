@@ -190,7 +190,7 @@ void apply_overrides(json & config, int argc, char ** argv) {
 
 void validate_config(const json & config, const std::filesystem::path & base, std::string & binary,
                      common_params & params, std::set<std::string> & aliases) {
-    check_keys(config, {"binary", "host", "port", "models"});
+    check_keys(config, {"binary", "host", "port", "api-key", "no-api-key", "models"});
     if (config.contains("binary")) binary = resolve_path(base, config.at("binary"));
     else {
 #ifdef __APPLE__
@@ -206,8 +206,24 @@ void validate_config(const json & config, const std::filesystem::path & base, st
     require(access(binary.c_str(), X_OK) == 0, "Worker binary is not executable: " + binary);
     require(config.at("host").is_string(), "host must be a string");
     params.hostname = scalar(config.at("host"));
-    require(params.hostname == "127.0.0.1" || params.hostname == "::1" || params.hostname == "localhost",
-            "MoEShift only accepts localhost addresses");
+    params.api_keys.clear();
+    if (config.contains("api-key")) {
+        require(config.at("api-key").is_string(), "api-key must be a string");
+        const auto key = config.at("api-key").get<std::string>();
+        require(key.size() >= 16, "api-key must have at least 16 characters");
+        params.api_keys.push_back(key);
+    }
+    bool no_key = false;
+    if (config.contains("no-api-key")) {
+        require(config.at("no-api-key").is_boolean(), "no-api-key must be true or false");
+        no_key = config.at("no-api-key").get<bool>();
+        require(!no_key || params.api_keys.empty(), "Set api-key or no-api-key, not both");
+    }
+    // Other machines can reach any address but loopback, so serving one requires a key unless the
+    // configuration explicitly opens it to everyone with no-api-key.
+    const bool loopback = params.hostname == "127.0.0.1" || params.hostname == "::1" || params.hostname == "localhost";
+    require(loopback || !params.api_keys.empty() || no_key,
+            "Serving on " + params.hostname + " (reachable from the network) requires an api-key, or no-api-key: true");
     require(config.at("port").is_number_integer(), "port must be an integer");
     require(config.at("port") > 0 && config.at("port") <= 65535, "port must be in 1..65535");
     params.port = config.at("port").get<int>();
@@ -215,7 +231,7 @@ void validate_config(const json & config, const std::filesystem::path & base, st
     const auto & models = config.at("models");
     require(models.is_object() && !models.empty(), "models must be a nonempty object");
     const std::set<std::string> allowed_env{
-        "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_ROWS", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LATE_MIX",
+        "GGML_METAL_FA_GROUP_HEADS", "LLAMA_GPU_KEEPALIVE", "LLAMA_MOE_DECODE_ROWS", "LLAMA_MOE_DECODE_WINDOW", "LLAMA_MOE_LATE_MIX",
         "LLAMA_MOE_LATE_PREFETCH", "LLAMA_MOE_LATE_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH",
         "LLAMA_MOE_PREFETCH_READ", "LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH",
         "LLAMA_MOE_PREFILL_PIPELINE", "LLAMA_MOE_PROTECTED_SLOTS", "LLAMA_MOE_QUIET"};
@@ -312,11 +328,22 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
             return reply(200, {{"object", "list"}, {"data", data}});
         });
         const auto infer = [&](const server_http_req & req) -> server_http_res_ptr {
-            const auto body = json::parse(req.body, nullptr, false);
-            if (!body.is_object() || !body.contains("model") || !body["model"].is_string()) {
+            auto body = json::parse(req.body, nullptr, false);
+            if (!body.is_object()) {
                 return error(400, "A JSON object with a string model field is required");
             }
-            const auto name = body["model"].get<std::string>();
+            const bool named = body.contains("model") && body["model"].is_string();
+            std::string name = named ? body["model"].get<std::string>() : "";
+            // With one model, any or no model name means that model, so clients need not know its ID.
+            std::string forwarded = req.body;
+            if (!models.contains(name) && models.size() == 1) {
+                name = models.begin().key();
+                body["model"] = name;
+                forwarded = body.dump();
+            }
+            if (!named && name.empty()) {
+                return error(400, "A JSON object with a string model field is required");
+            }
             if (!models.contains(name)) {
                 return error(404, "Unknown model: " + name);
             }
@@ -335,7 +362,7 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
             try {
                 worker.load(binary, name, models.at(name), base, cancelled);
                 auto proxy = std::make_unique<server_http_proxy>("POST", "http", "127.0.0.1", worker.port,
-                        req.path, req.headers, req.body, req.files, cancelled, 600, 600);
+                        req.path, req.headers, forwarded, req.files, cancelled, 600, 600);
                 proxy->next = [next = std::move(proxy->next), lease](std::string & output) { return next(output); };
                 return proxy;
             } catch (const std::exception & e) {
@@ -344,6 +371,9 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
         };
         http.post("/v1/chat/completions", infer);
         http.post("/v1/completions", infer);
+        http.post("/v1/responses", infer);
+        http.post("/v1/messages", infer);
+        http.post("/v1/messages/count_tokens", infer);
         require(http.start(), "HTTP startup failed");
         http.is_ready.store(true);
         if (isatty(STDERR_FILENO)) {

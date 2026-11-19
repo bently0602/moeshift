@@ -131,8 +131,10 @@ bool server_http_context::init(const common_params & params) {
         SRV_ERR("got exception: %s\n", message.c_str());
     });
 
-    srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
+    srv->set_error_handler([](const httplib::Request & req, httplib::Response & res) {
         if (res.status == 404) {
+            // Shows which endpoint a client expected that the server does not have.
+            SRV_WRN("no endpoint for %s %s\n", req.method.c_str(), req.path.c_str());
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {

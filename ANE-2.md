@@ -195,5 +195,5 @@ code; not measured end to end.
 **Long-context check:** on a 25k-token coding conversation the 4-bit model's agreement falls to
 53.6%, against 74.3% for the Q8_0 model with the full context. The 4k attention window costs 11
 points, 4-bit weights 8, fp16 arithmetic 1.5. The net estimate becomes about +5–6% on new code
-and nothing on prose, so the drafter is parked; a longer window and 6- or 8-bit weights are the
-untested ways back.
+and nothing on prose, so the drafter is on hold; a longer window and 6- or 8-bit weights are the
+untested ways back (`MACM5MAX36GB.md`, confidence-gated draft model: status and how to resume).

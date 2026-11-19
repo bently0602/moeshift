@@ -60,7 +60,7 @@ def fake_worker():
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({
-                    "pid": os.getpid(), "args": args, "path": self.path,
+                    "pid": os.getpid(), "args": args, "path": self.path, "model": body.get("model"),
                     "env": {key: value for key, value in os.environ.items() if key.startswith(("LLAMA_", "GGML_", "LES_", "MB_"))},
                 }).encode())
             log("request_end")
@@ -133,11 +133,11 @@ class RouterTest(unittest.TestCase):
                 self.proc.wait()
                 raise
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
         try:
             conn.request(method, path, None if body is None else json.dumps(body),
-                         {"Content-Type": "application/json"})
+                         {"Content-Type": "application/json", **(headers or {})})
             response = conn.getresponse()
             return response.status, json.loads(response.read())
         finally:
@@ -161,6 +161,72 @@ class RouterTest(unittest.TestCase):
             result = subprocess.run([BINARY, "--config", str(self.path), *args],
                                     capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
+
+    def test_network_host_requires_api_key(self):
+        self.stop()
+        path = self.root / "network.json"
+        for extra, message in (({}, b"requires an api-key"), ({"api-key": "short"}, b"at least 16 characters"),
+                               ({"no-api-key": "yes"}, b"no-api-key must be true or false"),
+                               ({"no-api-key": False}, b"requires an api-key"),
+                               ({"api-key": "router-test-key-0123456789", "no-api-key": True}, b"not both")):
+            path.write_text(json.dumps(dict(self.config, host="0.0.0.0", **extra)))
+            result = subprocess.run([BINARY, "--config", str(path)], capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+        key = "router-test-key-0123456789"
+        path.write_text(json.dumps(dict(self.config, host="0.0.0.0", **{"api-key": key})))
+        self.proc = subprocess.Popen([BINARY, "--config", str(path)], stdout=self.log, stderr=self.log,
+                                     env=dict(os.environ, MOESHIFT_ROUTER_TEST_LOG=str(self.events)))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if self.request("GET", "/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        self.assertEqual(self.request("GET", "/v1/models")[0], 200)
+        request = {"model": "a", "messages": []}
+        self.assertEqual(self.request("POST", "/v1/chat/completions", request)[0], 401)
+        self.assertEqual(self.request("POST", "/v1/chat/completions", request,
+                                      {"Authorization": "Bearer wrong-key-0123456789"})[0], 401)
+        self.assertEqual(self.request("POST", "/v1/chat/completions", request,
+                                      {"Authorization": f"Bearer {key}"})[0], 200)
+        self.assertEqual(self.request("POST", "/v1/chat/completions", request, {"X-Api-Key": key})[0], 200)
+
+    def test_network_host_without_api_key(self):
+        self.stop()
+        path = self.root / "open.json"
+        path.write_text(json.dumps(dict(self.config, host="0.0.0.0", **{"no-api-key": True})))
+        self.proc = subprocess.Popen([BINARY, "--config", str(path)], stdout=self.log, stderr=self.log,
+                                     env=dict(os.environ, MOESHIFT_ROUTER_TEST_LOG=str(self.events)))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if self.request("GET", "/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        self.assertEqual(self.request("POST", "/v1/chat/completions", {"model": "a", "messages": []})[0], 200)
+
+    def test_single_model_accepts_any_name(self):
+        self.stop()
+        path = self.root / "single.json"
+        path.write_text(json.dumps(dict(self.config, models={"a": self.config["models"]["a"]})))
+        self.proc = subprocess.Popen([BINARY, "--config", str(path)], stdout=self.log, stderr=self.log,
+                                     env=dict(os.environ, MOESHIFT_ROUTER_TEST_LOG=str(self.events)))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if self.request("GET", "/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.05)
+        for body in ({"model": "gpt-4o", "messages": []}, {"messages": []}, {"model": "a", "messages": []}):
+            status, reply = self.request("POST", "/v1/chat/completions", body)
+            self.assertEqual(status, 200, reply)
+            self.assertEqual(reply["args"]["--alias"], "a")
+            self.assertEqual(reply["model"], "a")
+        self.assertEqual(self.request("POST", "/v1/chat/completions", [])[0], 400)
 
     def test_worker_rejects_speculative_options(self):
         for option in ("--spec-type", "--model-draft", "--parallel"):
@@ -207,6 +273,8 @@ class RouterTest(unittest.TestCase):
         self.assertNotEqual(a["pid"], b["pid"])
         self.assertEqual(b["args"]["--ctx-size"], "4096")
         self.assertEqual(b["path"], "/v1/completions")
+        for path in ("/v1/responses", "/v1/messages", "/v1/messages/count_tokens"):
+            self.assertEqual(self.infer("b", path)["path"], path)
         self.assertEqual(b["env"]["LLAMA_MOE_DECODE_WINDOW"], "4")
         self.assertEqual(self.request("POST", "/v1/completions", {"model": "fail"})[0], 503)
         recovered = self.infer("a")

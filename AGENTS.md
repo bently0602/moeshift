@@ -4,9 +4,11 @@ This repository started from `davide-troiani/moeshift`. Its goal is now the best
 model on one machine:
 
 - **Model:** Qwen 3.8 Flash Next, ISTA-DASLab GSQ-RCO IQ3_XXS (GGUF plus prepared experts).
+- **Second model:** Qwen3.6-35B-A3B, unsloth UD-Q6_K_XL, for its own app. Changes for it are
+  welcome when they do not make Flash Next slower or change its output.
 - **Machine:** Mac Studio, Apple M5 Max, 36 GB unified memory, 512 GB internal SSD.
 
-Changes may specialize for this model and machine. Other models, chips and platforms are not
+Changes may specialize for these models and this machine. Other models, chips and platforms are not
 targets. Code for them may be simplified or removed when that helps the target, in its own commit.
 Measurements and the current configuration are in [MACM5MAX36GB.md](MACM5MAX36GB.md).
 

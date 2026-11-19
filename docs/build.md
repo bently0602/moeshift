@@ -14,7 +14,8 @@ cmake --build build --target moeshift -j 8
 cmake --install build --component moeshift
 ```
 
-`scripts/build-moeshift.sh` runs the same configuration and build. Add
+`scripts/build-moeshift.sh` runs the same configuration and build. `apps/build.sh` runs it and
+then builds the two Mac apps into `build/apps/` (see [apps](../apps/README.md)). Add
 `--test` to run the focused checks below, `--install [PREFIX]` to install
 (default `$HOME/.local`), or `--run [ARGS...]` to start `build/bin/moeshift`
 afterwards with the remaining arguments. The router check uses `PYTHON` when set, otherwise
@@ -42,8 +43,9 @@ Keep the original shards alongside the generated files.
 
 ```sh
 cmake --build build --target test-les-protected-cache test-les-active-ranges \
-  test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-ssd-rows -j 8
-ctest --test-dir build -R '^(test-les-protected-cache|test-les-active-ranges|test-metal-moe-phases|test-indexer-keys|test-kv-grow|test-metal-hc-fusion|test-ssd-rows)$' --output-on-failure
+  test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-metal-fa-group \
+  test-ssd-rows -j 8
+ctest --test-dir build -R '^(test-les-protected-cache|test-les-active-ranges|test-metal-moe-phases|test-indexer-keys|test-kv-grow|test-metal-hc-fusion|test-metal-fa-group|test-ssd-rows)$' --output-on-failure
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test-moeshift-router.py build/bin/moeshift
 .venv/bin/python tests/test-moeshift-onboarding.py
 ```

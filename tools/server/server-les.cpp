@@ -4,6 +4,7 @@
 
 #include "server-context.h"
 #include "server-http.h"
+#include "server-les-experts.h"
 #include "server-les-router.h"
 
 #include "arg.h"
@@ -55,9 +56,13 @@ int main(int argc, char ** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
+    if (argc > 1 && std::string(argv[1]) == "experts") {
+        return run_les_experts(argc - 2, argv + 2);
+    }
     if (argc < 2 || std::string(argv[1]) != "--worker") {
         if (argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
             std::cout << "Usage: moeshift [--config FILE] [--model GGUF] [--moe-experts DIR] [--port N]\n"
+                      << "       moeshift experts extract|verify|strip ... (prepare a model's experts)\n"
                       << "Profile options override the configuration file; inference parallelism is always 1.\n";
             return 0;
         }
@@ -228,6 +233,22 @@ int main(int argc, char ** argv) {
             http.post(
                 "/v1/completions",
                 routes.post_completions_oai
+            );
+
+            // OpenAI Responses and Anthropic Messages, converted to chat completions.
+            http.post(
+                "/v1/responses",
+                routes.post_responses_oai
+            );
+
+            http.post(
+                "/v1/messages",
+                routes.post_anthropic_messages
+            );
+
+            http.post(
+                "/v1/messages/count_tokens",
+                routes.post_anthropic_count_tokens
             );
 
             // Load the model through the existing

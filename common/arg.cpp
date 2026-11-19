@@ -3319,6 +3319,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
+        {"--reasoning-effort"}, "LEVEL",
+        "reasoning effort for chat requests that set none: none or minimal (thinking off), low (1024-token thinking budget), "
+        "medium (4096), high, xhigh or max (unlimited) (default: unset, thinking unlimited)",
+        [](common_params & params, const std::string & value) {
+            bool thinking;
+            int budget;
+            if (!common_chat_reasoning_effort(value, thinking, budget)) {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --reasoning-effort: '%s'\n", value.c_str()));
+            }
+            params.reasoning_effort = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
         [](common_params & params, const std::string & value) {

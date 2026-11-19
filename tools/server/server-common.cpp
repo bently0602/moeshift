@@ -1083,6 +1083,29 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    // A reasoning effort (the request's, else the server's) turns thinking off or caps it, unless the
+    // request sets enable_thinking or a thinking budget itself. Responses requests carry it as
+    // reasoning.effort.
+    int effort_budget = -1;
+    {
+        std::string effort = opt.reasoning_effort;
+        const json reasoning = json_value(body, "reasoning", json::object());
+        if (body.contains("reasoning_effort") && body.at("reasoning_effort").is_string()) {
+            effort = body.at("reasoning_effort").get<std::string>();
+        } else if (reasoning.is_object() && reasoning.contains("effort") && reasoning.at("effort").is_string()) {
+            effort = reasoning.at("effort").get<std::string>();
+        }
+        bool effort_thinking = true;
+        if (!effort.empty() && !common_chat_reasoning_effort(effort, effort_thinking, effort_budget)) {
+            throw std::invalid_argument("unknown reasoning effort \"" + effort + "\" (expected none, minimal, low, medium, high, xhigh or max)");
+        }
+        if (enable_thinking_kwarg.empty() && !body.contains("thinking_budget_tokens")) {
+            inputs.enable_thinking = inputs.enable_thinking && effort_thinking;
+        } else {
+            effort_budget = -1;
+        }
+    }
+
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
@@ -1125,6 +1148,9 @@ json oaicompat_chat_params_parse(
         int reasoning_budget = opt.reasoning_budget;
         if (reasoning_budget == -1 && body.contains("thinking_budget_tokens")) {
             reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        }
+        if (reasoning_budget == -1) {
+            reasoning_budget = effort_budget;
         }
 
         if (!chat_params.thinking_end_tag.empty()) {

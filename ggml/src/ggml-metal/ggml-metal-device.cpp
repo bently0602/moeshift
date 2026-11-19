@@ -1528,6 +1528,62 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_gqa(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        bool    has_kvpad,
+        int32_t nsg,
+        int32_t nwg,
+        int32_t ngh) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    char base[256];
+    char name[256];
+
+    const int32_t dk = (int32_t) op->src[1]->ne[0];
+    const int32_t dv = (int32_t) op->src[2]->ne[0];
+
+    const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
+    const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
+
+    snprintf(base, 256, "kernel_%s%d_%s_dk%d_dv%d",
+            "flash_attn_ext_vec_gqa",
+            ngh,
+            ggml_type_name(op->src[1]->type),
+            dk,
+            dv);
+
+    snprintf(name, 256, "%s_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+            base,
+            has_kvpad,
+            ns10,
+            ns20,
+            nsg, nwg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        // the grouped kernel is only used with a mask and without sinks, ALiBi or softcap
+        ggml_metal_cv_set_bool(cv, true,      FC_FLASH_ATTN_EXT_VEC + 0);
+        ggml_metal_cv_set_bool(cv, false,     FC_FLASH_ATTN_EXT_VEC + 1);
+        ggml_metal_cv_set_bool(cv, false,     FC_FLASH_ATTN_EXT_VEC + 2);
+        ggml_metal_cv_set_bool(cv, false,     FC_FLASH_ATTN_EXT_VEC + 3);
+        ggml_metal_cv_set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT_VEC + 4);
+
+        ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT_VEC + 20);
+        ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
+        ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_VEC + 22);
+        ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
