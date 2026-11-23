@@ -10,5 +10,6 @@ let package = Package(
         .target(name: "MoEShiftAppKit"),
         .executableTarget(name: "FlashNextApp", dependencies: ["MoEShiftAppKit"]),
         .executableTarget(name: "A3BApp", dependencies: ["MoEShiftAppKit"]),
+        .executableTarget(name: "FlashNextCoderApp", dependencies: ["MoEShiftAppKit"]),
     ]
 )

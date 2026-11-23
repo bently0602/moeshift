@@ -299,6 +299,9 @@ struct server_chat_params {
     std::string media_path;
     bool force_pure_content = false;
     std::string reasoning_effort; // for requests that set no effort, thinking switch or budget
+    int reasoning_budget_low    = 1024; // thinking tokens for effort low, medium and high (-1 = unlimited)
+    int reasoning_budget_medium = 4096;
+    int reasoning_budget_high   = -1;
 };
 
 // used by /completions endpoint

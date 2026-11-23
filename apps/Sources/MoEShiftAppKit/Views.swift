@@ -77,10 +77,18 @@ struct MainView: View {
             }
 
             Section("Connect a client") {
-                CopyRow(label: "API URL", value: model.localURL)
+                CopyRow(label: "OpenAI URL", value: model.localURL)
+                CopyRow(label: "Anthropic URL", value: model.localBaseURL)
                 if model.settings.shareOnNetwork {
-                    ForEach(model.networkURLs, id: \.self) { CopyRow(label: "Network URL", value: $0) }
+                    ForEach(model.networkBaseURLs, id: \.self) { base in
+                        CopyRow(label: "Network, OpenAI", value: base + "/v1")
+                        CopyRow(label: "Network, Anthropic", value: base)
+                    }
                 }
+                Text(model.settings.engineAPIKey != nil
+                     ? "OpenAI clients (chat completions, Responses) use the OpenAI URL; Anthropic clients (Messages) use the Anthropic URL. Send the key as an API key: Authorization: Bearer or x-api-key."
+                     : "OpenAI clients (chat completions, Responses) use the OpenAI URL; Anthropic clients (Messages) use the Anthropic URL. Any API key a client insists on is accepted.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if model.settings.engineAPIKey != nil {
                     CopyRow(label: "API key", value: model.settings.apiKey, monospaced: true) {
                         Button("New key") { model.settings.apiKey = newAPIKey() }.disabled(locked)
@@ -96,18 +104,31 @@ struct MainView: View {
                         Button("Show") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: model.settings.modelFolder) }
                     }
                 }
-                Text("\(model.spec.displayName) (\(model.spec.tagline)), 128k-token context, with settings measured on a Mac Studio M5 Max with 36 GB. One request runs at a time.")
+                Text("\(model.spec.displayName) (\(model.spec.tagline)), with settings measured on a Mac Studio M5 Max with 36 GB. One request runs at a time.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Thinking", selection: Binding(
                     get: { model.settings.reasoningEffort ?? model.spec.defaultReasoningEffort },
                     set: { model.settings.reasoningEffort = $0 })) {
                     Text("Off").tag("none")
-                    Text("Low (up to 1,024 tokens)").tag("low")
-                    Text("Medium (up to 4,096 tokens)").tag("medium")
-                    Text("High (no limit)").tag("high")
+                    Text("Low (\(budgetLabel(model.settings.lowBudget ?? AppSettings.defaultLowBudget)))").tag("low")
+                    Text("Medium (\(budgetLabel(model.settings.mediumBudget ?? AppSettings.defaultMediumBudget)))").tag("medium")
+                    Text("High (\(budgetLabel(model.settings.highBudget)))").tag("high")
                 }
                 .disabled(locked)
                 Text("How long the model may think before answering. A client that sets its own reasoning effort or thinking budget overrides this.")
+                    .font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("Thinking limits") {
+                    ThinkingLimits(settings: $model.settings).disabled(locked)
+                }
+                Picker("Context", selection: Binding(
+                    get: { model.settings.contextSize ?? AppSettings.contextSizes.last! },
+                    set: { model.settings.contextSize = $0 })) {
+                    ForEach(AppSettings.contextSizes, id: \.self) { size in
+                        Text("\(size / 1024)k tokens").tag(size)
+                    }
+                }
+                .disabled(locked)
+                Text("The longest conversation the engine accepts: prompt, thinking and answer together. Longer requests are refused, and an answer that reaches the limit is cut off. Memory grows with the conversation, so a lower limit caps it.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Change model files…") { model.showingSetup = true }.disabled(locked)
             }
@@ -142,6 +163,92 @@ struct MainView: View {
         case .starting, .loading, .stopping: return .orange
         case .failed: return .red
         case .stopped: return .gray
+        }
+    }
+}
+
+/// "up to N tokens", or "no limit" for nil.
+func budgetLabel(_ tokens: Int?) -> String {
+    guard let tokens else { return "no limit" }
+    return "up to \(tokens.formatted()) tokens"
+}
+
+/// The thinking tokens that Low, Medium and High stand for, for this app's Thinking setting and for
+/// clients that send that reasoning effort.
+struct ThinkingLimits: View {
+    @Binding var settings: AppSettings
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            BudgetField(label: "Low", value: binding(\.lowBudget, default: AppSettings.defaultLowBudget))
+            BudgetField(label: "Medium", value: binding(\.mediumBudget, default: AppSettings.defaultMediumBudget))
+            LabeledContent("High") {
+                HStack {
+                    Toggle("Limit", isOn: Binding(
+                        get: { settings.highBudget != nil },
+                        set: { settings.highBudget = $0 ? max(settings.mediumBudget ?? AppSettings.defaultMediumBudget, 16_384) : nil }))
+                    if settings.highBudget != nil {
+                        TokenField(value: Binding(get: { settings.highBudget ?? 16_384 }, set: { settings.highBudget = $0 }))
+                    } else {
+                        Text("no limit").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let warning {
+                Text(warning).font(.caption).foregroundStyle(.orange)
+            }
+            HStack {
+                Text("Tokens of thinking, from \(AppSettings.budgetRange.lowerBound.formatted()) to \(AppSettings.budgetRange.upperBound.formatted()). Extra high and Max stay unlimited.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Restore defaults") {
+                    settings.lowBudget = nil
+                    settings.mediumBudget = nil
+                    settings.highBudget = nil
+                }
+                .disabled(settings.lowBudget == nil && settings.mediumBudget == nil && settings.highBudget == nil)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    /// A budget equal to the engine's default is stored as nil, so the configuration stays default.
+    private func binding(_ key: WritableKeyPath<AppSettings, Int?>, default value: Int) -> Binding<Int> {
+        Binding(get: { settings[keyPath: key] ?? value },
+                set: { settings[keyPath: key] = $0 == value ? nil : $0 })
+    }
+
+    private var warning: String? {
+        let low = settings.lowBudget ?? AppSettings.defaultLowBudget
+        let medium = settings.mediumBudget ?? AppSettings.defaultMediumBudget
+        if low > medium { return "Low allows more thinking than Medium." }
+        if let high = settings.highBudget, medium > high { return "Medium allows more thinking than High." }
+        return nil
+    }
+}
+
+struct BudgetField: View {
+    let label: String
+    @Binding var value: Int
+
+    var body: some View {
+        LabeledContent(label) { TokenField(value: $value) }
+    }
+}
+
+/// A token count, kept within AppSettings.budgetRange.
+struct TokenField: View {
+    @Binding var value: Int
+
+    var body: some View {
+        HStack(spacing: 4) {
+            TextField("", value: Binding(
+                get: { value },
+                set: { value = min(max($0, AppSettings.budgetRange.lowerBound), AppSettings.budgetRange.upperBound) }),
+                format: .number)
+                .frame(width: 80)
+                .multilineTextAlignment(.trailing)
+            Text("tokens").foregroundStyle(.secondary)
         }
     }
 }

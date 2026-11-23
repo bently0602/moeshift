@@ -641,6 +641,9 @@ struct common_params {
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     std::string reasoning_effort; // effort for chat requests that set none: none, minimal, low, medium, high, xhigh or max
+    int reasoning_budget_low    = 1024; // thinking tokens for effort low, medium and high (-1 = unlimited)
+    int reasoning_budget_medium = 4096;
+    int reasoning_budget_high   = -1;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 

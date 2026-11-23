@@ -70,6 +70,11 @@ are not general benchmarks.
   conversation; a 120k conversation through the router peaked at 17.6 GB. Flash attention in
   prompts now skips 8-cell column groups the sparse mask hides from all 8 rows of a tile:
   prompts 13% faster at 32k, 16% at 64k, 19% at 120k (6.4 → 5.2 minutes), identical output.
+- Later (C1): Flash Next Coder (ISTA-DASLab's expert-pruned Flash Next, 256 of 512 experts) runs
+  with Flash Next's profile and a 256-slot prefill bank, in its own app. Against Flash Next: prompts
+  4–5% faster, generation the same after a short prompt and 4–5% faster after a 6k prompt, 40–47%
+  less read from the SSD, 0.5 GB lower peak; 31 of 32 reasoning answers right against 32
+  ([measurements](#flash-next-coder-c1)).
 
 ## Recommended configuration for this Mac
 
@@ -4070,6 +4075,27 @@ in a loop). Off is `reasoning_effort: none`; the caps are `thinking_budget_token
   agent tasks, long contexts, and sampling other than greedy. Scripts and results are in
   `/Volumes/Data/moeshift-scratch/effort/`.
 
+### Configurable caps (T1)
+
+`reasoning-budget-low`, `reasoning-budget-medium` and `reasoning-budget-high` (profile arguments,
+also `--reasoning-budget-low` etc.) set the caps that `low`, `medium` and `high` stand for, whether
+the effort comes from `reasoning-effort` (the apps' Thinking setting) or from the request; `xhigh`
+and `max` stay unlimited, and a request's own thinking budget still overrides them. The defaults
+(1,024, 4,096, unlimited) are the previous caps, and with them the output is unchanged: on Flash
+Next Coder, greedy, `reasoning_effort: low`, the previous engine and this one gave byte-identical
+replies on four problems of the set above (`pairs`, `diffsq`, `zeros100`, `digit20`; the 1,024
+cap was reached on the first two), and on `noconsec` at `low` and `medium`.
+
+- With `reasoning-budget-low: 256`, `digit20` thought 731 characters instead of 1,836 and still
+  answered 633; a request with `thinking_budget_tokens: 2000` on the same server got the
+  uncapped reply.
+- Through an app's generated configuration (Low 256, Medium 2,048, High 8,192), the worker logged
+  budgets of 256, 2,048 and 8,192 tokens for requests at `low`, `medium` and `high`.
+- `0` or less than `-1` is refused by the worker ("use N>0, or -1 for unlimited"), which the router
+  reports only as a failed model load; the apps accept 64–131,072 tokens.
+- Not tested: quality at caps other than the defaults. Scripts and results are in
+  `/Volumes/Data/moeshift-scratch/budgets/`.
+
 ## Tool calling
 
 MoEShift forwards `/v1/chat/completions` request bodies unchanged to the
@@ -4085,6 +4111,80 @@ the Flash Next template supports tools. A test with one `get_weather` function
   `tool_calls` deltas, ending with `finish_reason: tool_calls`.
 
 Multiple tools, parallel calls and `tool_choice` were not tested.
+
+## Flash Next Coder (C1)
+
+[ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
+is Flash Next with half of its routed experts removed (256 of 512 per layer, chosen with RCO for
+code, agentic tool use and vision), and the rest quantized with GSQ. The `IQ1_M` in its file names
+is the average over the original 512 experts. Its allocation file lists the experts it keeps as
+IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS (gate and up) and IQ4_NL or Q2_0 (down), more precise than Flash
+Next's, so each expert is larger: 1.95 MiB against 1.67 MiB. Its second shard has the same SHA-256
+as Flash Next's (`316b46f3…`), so the per-layer n-gram table is the same. It is a different model,
+so its output differs from Flash Next's. Flash Next's profile, files and output are unchanged by it.
+
+The engine needed no changes: it takes the expert count from the GGUF. The profile
+`qwen-3.8-flash-next-coder-rco-gsq-iq1-m` is Flash Next's with `moe-prefill-bank: 256` (one layer's
+experts) and was not tuned further. It runs in its own app, MoEShift Flash Next Coder (port 8082).
+
+| Files | Flash Next | Coder |
+|---|---:|---:|
+| Download | 75.8 GB | 58.4 GB (28.8 GB of it the same as Flash Next's shard 2) |
+| Prepared experts | 42.9 GB | 25.1 GB |
+| Stripped GGUF | (original shards used) | 33.3 GB |
+
+Speed, from `benchmarks/run.py` (fresh server, one warmup and three measured requests per prompt;
+medians), on the build at `209d655` plus this change, with each model's tracked profile, in the
+internal SSD's `~/.moeshift/models/`. The two models ran alternately, twice:
+
+| Measurement | Flash Next, round 1 / 2 | Coder, round 1 / 2 |
+|---|---:|---:|
+| Short prompt (72 tokens): generation | 28.90 / 28.66 tok/s | 29.14 / 27.10 tok/s |
+| Long prompt (6,060 tokens): prompt time | 7.39 / 7.42 s | 7.07 / 7.09 s |
+| Long prompt: prompt throughput | 820.6 / 817.2 tok/s | 856.9 / 854.4 tok/s |
+| Long prompt: generation | 25.91 / 25.22 tok/s | 26.91 / 26.54 tok/s |
+| Internal SSD read, whole run (8 requests) | 274 / 305 GB | 145 / 186 GB |
+| Peak worker footprint | 7.41 GB | 6.89 GB |
+
+- Every request produced 512 tokens (`finish_reason: length`). There was no swapping (swap stayed
+  at 883 MB, as it was before the runs).
+- Prompt processing was 4–5% faster, and generation after the long prompt 4–5% faster. Generation
+  after the short prompt was the same within run-to-run variation (+0.8% in round 1, −5.4% in
+  round 2).
+- The Coder read 40–47% less from the internal SSD and peaked 0.5 GB lower.
+- The gain is much smaller than half the expert data suggests. On this build Flash Next already
+  generates about 29 tok/s, against 21–22 tok/s when expert reads were measured at 12 ms per token
+  ([decode limits](#prefetch-use-cache-size-and-handshake-cost-g1a-g2-g5-probe)), so less of each
+  token waits on reads. The Coder's larger experts also make each miss cost more. Neither cause was
+  measured separately.
+- The internal SSD wrote 21–184 MB in rounds 1 and 1.6–1.9 GB in rounds 2, for the whole system.
+  That includes other programs; the cause of the larger round-2 figures was not looked into.
+
+Quality, on the 16 problems of [reasoning effort](#reasoning-effort) (same script, greedy, a
+fresh Coder server), with thinking off and with the 4,096-token cap that the apps' default
+`medium` sets, against Flash Next's results from that section:
+
+| Level | Flash Next: correct, tokens, tok/s | Coder: correct, tokens, tok/s |
+|---|---:|---:|
+| Off (8 + 8 problems) | 16/16, 17,907, 22.9–23.2 | 16/16, 17,638, 25.5–27.6 |
+| 4,096 cap (`medium`) | 16/16, 14,084, 19.5–20.6 | 15/16, 12,987, 24.2–25.1 |
+
+- The miss: subsets of {1, …, 15} with no two consecutive integers, 1591 instead of 1597, after a
+  short think (435 tokens). Flash Next answered it right with the same cap (460 tokens), and the
+  Coder answered it right with thinking off.
+- These are arithmetic and counting problems, outside what the Coder was pruned for. They are a
+  small sanity check, not a quality comparison for code, and one miss in 32 does not separate the
+  two models.
+- The generation rates in this table are not comparable with each other: Flash Next's were measured
+  on 2026-11-19 on an earlier build.
+- No swapping (swap unchanged at 883 MB). Two hand-checked requests were also right: a
+  `merge_intervals` function with three correct asserts (thinking off), and a `get_weather` tool
+  call with arguments `{"city":"Vienna"}`.
+
+Scripts and results are in `/Volumes/Data/moeshift-scratch/coder/`. Not tested: coding or agent
+benchmarks of our own (the model card reports SWE-bench Verified 79.20 against 82.80 for BF16, and
+LiveCodeBench v6 87.43 for both, at xhigh effort), vision, long contexts, tuning the profile for the
+Coder (prefetch depth, decode window), and prepared files on an external drive.
 
 ## Not tested
 

@@ -1096,7 +1096,8 @@ json oaicompat_chat_params_parse(
             effort = reasoning.at("effort").get<std::string>();
         }
         bool effort_thinking = true;
-        if (!effort.empty() && !common_chat_reasoning_effort(effort, effort_thinking, effort_budget)) {
+        if (!effort.empty() && !common_chat_reasoning_effort(effort, effort_thinking, effort_budget, opt.reasoning_budget_low,
+                                                             opt.reasoning_budget_medium, opt.reasoning_budget_high)) {
             throw std::invalid_argument("unknown reasoning effort \"" + effort + "\" (expected none, minimal, low, medium, high, xhigh or max)");
         }
         if (enable_thinking_kwarg.empty() && !body.contains("thinking_budget_tokens")) {

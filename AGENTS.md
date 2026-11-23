@@ -21,9 +21,8 @@ Measurements and the current configuration are in [MACM5MAX36GB.md](MACM5MAX36GB
 - **Licenses.** Code borrowed from other projects (for example the MIT-licensed Strata engine)
   keeps its copyright and license notice. Preserve existing licenses and notices.
 - **Commits.** Commit or push only when explicitly authorized. Use separate focused commits with an
-  author-matching Signed-off-by (`git commit -s`). Do not rewrite history or change repository
-  visibility without explicit permission. Do not commit models, expert files, binaries or
-  credentials.
+  author-matching Signed-off-by (`git commit -s`). Do not change repository visibility without
+  explicit permission. Do not commit models, expert files, binaries or credentials.
 - Include documentation with the corresponding changes, and match the surrounding code style.
 
 See [configuration](configs/README.md) and the runtime documents under

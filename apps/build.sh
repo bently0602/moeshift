@@ -1,7 +1,8 @@
 #!/bin/sh
-# Build the engine and both MoEShift apps into build/apps/ (at the repository root):
-#   MoEShift Flash Next.app   Qwen 3.8 Flash Next, port 8080
-#   MoEShift A3B.app          Qwen3.6 35B A3B, port 8081
+# Build the engine and the three MoEShift apps into build/apps/ (at the repository root):
+#   MoEShift Flash Next.app         Qwen 3.8 Flash Next, port 8080
+#   MoEShift A3B.app                Qwen3.6 35B A3B, port 8081
+#   MoEShift Flash Next Coder.app   Qwen 3.8 Flash Next Coder, port 8082
 # Each bundle holds the moeshift binary and a copy of configs/moeshift.json, the tuned profiles.
 # Needs only the Apple Command Line Tools and CMake (no Xcode). The apps are signed for this Mac
 # only (ad hoc); copy them to /Applications if you like.
@@ -58,3 +59,4 @@ EOF
 
 make_app FlashNextApp "MoEShift Flash Next" local.moeshift.flashnext
 make_app A3BApp "MoEShift A3B" local.moeshift.a3b
+make_app FlashNextCoderApp "MoEShift Flash Next Coder" local.moeshift.flashnextcoder

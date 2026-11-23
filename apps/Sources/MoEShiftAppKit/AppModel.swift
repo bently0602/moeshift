@@ -84,8 +84,11 @@ final class AppModel: ObservableObject {
 
     /// The engine's port while it runs, otherwise the one it will start on.
     var activePort: Int { engine.port ?? settings.port }
-    var localURL: String { "http://127.0.0.1:\(activePort)/v1" }
-    var networkURLs: [String] { localNetworkAddresses().map { "http://\($0):\(activePort)/v1" } }
+    /// Anthropic clients take the server's base URL and add `/v1/messages` themselves; OpenAI
+    /// clients take the URL with `/v1`.
+    var localBaseURL: String { "http://127.0.0.1:\(activePort)" }
+    var localURL: String { localBaseURL + "/v1" }
+    var networkBaseURLs: [String] { localNetworkAddresses().map { "http://\($0):\(activePort)" } }
 }
 
 func copyToPasteboard(_ text: String) {

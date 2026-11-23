@@ -15,6 +15,24 @@ public struct AppSettings: Codable, Equatable {
     /// Reasoning effort for requests that set none: none, low, medium or high (thinking unlimited).
     /// nil until the user picks one: the model's default.
     public var reasoningEffort: String?
+    /// Context limit in tokens (`ctx-size`), one of `contextSizes`. nil until the user picks one:
+    /// the profile's (131,072).
+    public var contextSize: Int?
+
+    /// The limits offered. The engine grows its caches with the conversation, so a lower limit
+    /// caps memory and refuses longer requests rather than saving memory up front.
+    public static let contextSizes = [16_384, 32_768, 65_536, 131_072]
+
+    /// Thinking tokens for Low, Medium and High (`reasoning-budget-low`/`-medium`/`-high`), for
+    /// the Thinking setting and for clients that send that effort. nil: the engine's default
+    /// (1,024, 4,096, unlimited).
+    public var lowBudget: Int?
+    public var mediumBudget: Int?
+    public var highBudget: Int?
+
+    public static let defaultLowBudget = 1_024
+    public static let defaultMediumBudget = 4_096
+    public static let budgetRange = 64...131_072
 
     static func defaults(for spec: ModelSpec) -> AppSettings {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -27,7 +45,11 @@ public struct AppSettings: Codable, Equatable {
             requireAPIKey: true,
             apiKey: newAPIKey(),
             deleteDownload: true,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            contextSize: nil,
+            lowBudget: nil,
+            mediumBudget: nil,
+            highBudget: nil)
     }
 
     /// The key the engine requires, or nil when it requires none.
@@ -35,7 +57,8 @@ public struct AppSettings: Codable, Equatable {
 }
 
 extension AppSettings {
-    /// Settings saved before requireAPIKey existed still load, with the key required.
+    /// Settings saved before requireAPIKey existed still load, with the key required; settings saved
+    /// before contextSize or the thinking budgets existed load with the defaults.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         modelFolder = try c.decode(String.self, forKey: .modelFolder)
@@ -46,6 +69,10 @@ extension AppSettings {
         apiKey = try c.decode(String.self, forKey: .apiKey)
         deleteDownload = try c.decode(Bool.self, forKey: .deleteDownload)
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        contextSize = try c.decodeIfPresent(Int.self, forKey: .contextSize)
+        lowBudget = try c.decodeIfPresent(Int.self, forKey: .lowBudget)
+        mediumBudget = try c.decodeIfPresent(Int.self, forKey: .mediumBudget)
+        highBudget = try c.decodeIfPresent(Int.self, forKey: .highBudget)
     }
 }
 
@@ -194,6 +221,15 @@ enum ConfigWriter {
         args["model"] = model.gguf.path
         args["moe-experts"] = model.experts.path
         args["reasoning-effort"] = settings.reasoningEffort ?? spec.defaultReasoningEffort
+        if let size = settings.contextSize { args["ctx-size"] = size }
+        for (key, value) in [("reasoning-budget-low", settings.lowBudget), ("reasoning-budget-medium", settings.mediumBudget),
+                             ("reasoning-budget-high", settings.highBudget)] {
+            guard let value else { continue }
+            guard AppSettings.budgetRange.contains(value) else {
+                throw AppError("Thinking limits must be from \(AppSettings.budgetRange.lowerBound) to \(AppSettings.budgetRange.upperBound) tokens.")
+            }
+            args[key] = value
+        }
         profile["args"] = args
         var config: [String: Any] = [
             "host": settings.shareOnNetwork ? "0.0.0.0" : "127.0.0.1",

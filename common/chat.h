@@ -288,10 +288,11 @@ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::strin
 
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates);
 
-// Thinking for an OpenAI-style reasoning effort: none and minimal turn it off, low and medium cap
-// it at 1024 and 4096 tokens, and high, xhigh and max leave it unlimited (budget -1). Returns false
-// for any other value.
-bool common_chat_reasoning_effort(const std::string & effort, bool & enable_thinking, int & budget);
+// Thinking for an OpenAI-style reasoning effort: none and minimal turn it off, low, medium and high
+// cap it at budget_low, budget_medium and budget_high tokens (by default 1024, 4096 and unlimited,
+// -1), and xhigh and max leave it unlimited. Returns false for any other value.
+bool common_chat_reasoning_effort(const std::string & effort, bool & enable_thinking, int & budget,
+                                  int budget_low = 1024, int budget_medium = 4096, int budget_high = -1);
 
 // Parses a JSON array of messages in OpenAI's chat completion API format.
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const nlohmann::ordered_json & messages);

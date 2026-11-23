@@ -300,10 +300,12 @@ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::strin
     throw std::invalid_argument("Invalid tool_choice: " + tool_choice);
 }
 
-bool common_chat_reasoning_effort(const std::string & effort, bool & enable_thinking, int & budget) {
+bool common_chat_reasoning_effort(const std::string & effort, bool & enable_thinking, int & budget,
+                                  int budget_low, int budget_medium, int budget_high) {
     enable_thinking = effort != "none" && effort != "minimal";
-    budget = effort == "low" ? 1024 : effort == "medium" ? 4096 : -1;
-    return !enable_thinking || budget > 0 || effort == "high" || effort == "xhigh" || effort == "max";
+    budget = effort == "low" ? budget_low : effort == "medium" ? budget_medium : effort == "high" ? budget_high : -1;
+    return !enable_thinking || effort == "low" || effort == "medium" || effort == "high" || effort == "xhigh" ||
+           effort == "max";
 }
 
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates) {

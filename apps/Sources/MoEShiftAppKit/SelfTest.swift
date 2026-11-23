@@ -36,6 +36,26 @@ enum SelfTest {
         if args.contains("--lan") { model.settings.shareOnNetwork = true }
         if args.contains("--no-key") { model.settings.requireAPIKey = false }
         if let i = args.firstIndex(of: "--effort"), i + 1 < args.count { model.settings.reasoningEffort = args[i + 1] }
+        if let i = args.firstIndex(of: "--budgets"), i + 1 < args.count {
+            // LOW,MEDIUM,HIGH in tokens; HIGH may be -1 (no limit).
+            let parts = args[i + 1].split(separator: ",").map { Int($0) }
+            guard parts.count == 3, let low = parts[0], let medium = parts[1], let high = parts[2],
+                  AppSettings.budgetRange.contains(low), AppSettings.budgetRange.contains(medium),
+                  high == -1 || AppSettings.budgetRange.contains(high) else {
+                print("selftest: --budgets takes LOW,MEDIUM,HIGH from \(AppSettings.budgetRange.lowerBound) to \(AppSettings.budgetRange.upperBound) tokens, HIGH or -1")
+                return 1
+            }
+            model.settings.lowBudget = low
+            model.settings.mediumBudget = medium
+            model.settings.highBudget = high == -1 ? nil : high
+        }
+        if let i = args.firstIndex(of: "--context"), i + 1 < args.count, let size = Int(args[i + 1]) {
+            guard AppSettings.contextSizes.contains(size) else {
+                print("selftest: --context takes one of \(AppSettings.contextSizes.map(String.init).joined(separator: ", "))")
+                return 1
+            }
+            model.settings.contextSize = size
+        }
         if let i = args.firstIndex(of: "--model-folder"), i + 1 < args.count {
             model.settings.modelFolder = args[i + 1]
             model.refreshInstalled()
@@ -50,7 +70,27 @@ enum SelfTest {
         model.startEngine()
         guard await ready(model.engine) else { return 1 }
         print(String(format: "selftest: ready on port %d after %.1f s", model.engine.port ?? 0, Date().timeIntervalSince(start)))
-        if model.settings.shareOnNetwork, let url = model.networkURLs.first.flatMap({ URL(string: $0 + "/chat/completions") }) {
+        // The Anthropic URL, as an Anthropic client uses it: base URL + /v1/messages, key in x-api-key.
+        if let url = URL(string: model.localBaseURL + "/v1/messages") {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 300
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            if let key = model.settings.engineAPIKey { request.setValue(key, forHTTPHeaderField: "x-api-key") }
+            let body: [String: Any] = ["model": model.spec.alias, "max_tokens": 1, "thinking": ["type": "disabled"],
+                                       "messages": [["role": "user", "content": "Hi"]]]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            let reply = try? await URLSession.shared.data(for: request)
+            let status = reply.flatMap { ($0.1 as? HTTPURLResponse)?.statusCode } ?? 0
+            let type = reply.flatMap { try? JSONSerialization.jsonObject(with: $0.0) as? [String: Any] }?["type"] as? String
+            print("selftest: \(url.absoluteString): HTTP \(status), type \(type ?? "none"), expected 200 and message")
+            guard status == 200, type == "message" else {
+                model.engine.stopAndWait()
+                return 1
+            }
+        }
+        if model.settings.shareOnNetwork, let url = model.networkBaseURLs.first.flatMap({ URL(string: $0 + "/v1/chat/completions") }) {
             // A body that is not a JSON object is refused before inference: 401 without the key,
             // 400 once past it.
             var request = URLRequest(url: url)

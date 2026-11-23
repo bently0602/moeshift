@@ -3321,7 +3321,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--reasoning-effort"}, "LEVEL",
         "reasoning effort for chat requests that set none: none or minimal (thinking off), low (1024-token thinking budget), "
-        "medium (4096), high, xhigh or max (unlimited) (default: unset, thinking unlimited)",
+        "medium (4096), high, xhigh or max (unlimited; see --reasoning-budget-low/-medium/-high) (default: unset, thinking unlimited)",
         [](common_params & params, const std::string & value) {
             bool thinking;
             int budget;
@@ -3330,6 +3330,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("error: unknown value for --reasoning-effort: '%s'\n", value.c_str()));
             }
             params.reasoning_effort = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--reasoning-budget-low"}, "N",
+        "thinking tokens for reasoning effort low, from the request or --reasoning-effort: N>0, or -1 for unlimited; "
+        "a request's own thinking budget overrides it (default: 1024)",
+        [](common_params & params, int value) {
+            if (value < -1 || value == 0) { throw std::invalid_argument("invalid value: use N>0, or -1 for unlimited"); }
+            params.reasoning_budget_low = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--reasoning-budget-medium"}, "N",
+        "thinking tokens for reasoning effort medium, as --reasoning-budget-low (default: 4096)",
+        [](common_params & params, int value) {
+            if (value < -1 || value == 0) { throw std::invalid_argument("invalid value: use N>0, or -1 for unlimited"); }
+            params.reasoning_budget_medium = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--reasoning-budget-high"}, "N",
+        "thinking tokens for reasoning effort high, as --reasoning-budget-low; xhigh and max stay unlimited "
+        "(default: -1, unlimited)",
+        [](common_params & params, int value) {
+            if (value < -1 || value == 0) { throw std::invalid_argument("invalid value: use N>0, or -1 for unlimited"); }
+            params.reasoning_budget_high = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

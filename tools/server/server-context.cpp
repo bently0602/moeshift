@@ -1307,6 +1307,9 @@ private:
                 /* force_pure_content    */ params_base.force_pure_content_parser,
                 /* reasoning_effort      */ params_base.reasoning_effort
             };
+            chat_params.reasoning_budget_low    = params_base.reasoning_budget_low;
+            chat_params.reasoning_budget_medium = params_base.reasoning_budget_medium;
+            chat_params.reasoning_budget_high   = params_base.reasoning_budget_high;
         }
 
         return true;

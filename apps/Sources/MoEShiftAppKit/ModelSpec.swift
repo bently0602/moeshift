@@ -54,6 +54,27 @@ public struct ModelSpec: Sendable {
         // Gave the unlimited output on all 16 measured problems and caps runaway thinking.
         defaultReasoningEffort: "medium")
 
+    /// Flash Next with half of its routed experts removed (256 of 512 per layer), chosen for code,
+    /// agentic tool use and vision. Shard 2, the per-layer n-gram table, is byte for byte the same
+    /// as Flash Next's.
+    public static let flashNextCoder = ModelSpec(
+        alias: "qwen-3.8-flash-next-coder-rco-gsq-iq1-m",
+        displayName: "Qwen 3.8 Flash Next Coder",
+        repo: "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
+        files: [
+            ModelFile(remotePath: "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+                      size: 29_608_446_496,
+                      sha256: "bfa3644db4adfff072fc946c20994f2909d2cf89879d83f80a4c811d4016c211"),
+            ModelFile(remotePath: "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+                      size: 28_800_138_432,
+                      sha256: "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+        ],
+        expertBytes: 25_146_163_200,
+        strippedName: "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-les.gguf",
+        defaultPort: 8082,
+        tagline: "GSQ-RCO Coder, 256 of 512 experts",
+        defaultReasoningEffort: "medium")
+
     public static let a3b = ModelSpec(
         alias: "qwen-3.6-35b-a3b-q6-xl",
         displayName: "Qwen3.6 35B A3B",
