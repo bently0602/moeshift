@@ -20,27 +20,27 @@ are not general benchmarks.
 - A CPU profile found that each long prompt starts with about 2.1 s of serial,
   uncached 16 KiB reads from the 27 GB per-layer embedding table. The GPU has no
   work during that time. A change to `src/llama-ssd-rows.cpp` (commit
-  `d38cb01`) reads these pages up to 16 at a time. It made prompt processing 12.8% faster
+  `1619fe2`) reads these pages up to 16 at a time. It made prompt processing 12.8% faster
   (10.29 s → 8.97 s), with identical output.
 - An `f16` KV cache made prompt processing 3.2% faster at a cost of about
   0.7 GiB more memory at full context. Turning off the GPU keepalive made
   generation 22% slower.
 - MoEShift wrote nothing measurable to disk while running: the internal SSD wrote
   54–92 MB in total during each 4-request run, for the whole system.
-- Copying each layer's experts with 8 threads instead of one (`d38cb01`)
+- Copying each layer's experts with 8 threads instead of one (`1619fe2`)
   saved another 0.37 s (4.1%).
-- Double-buffered prefill reads (`6de789b`) let one reader stream layers
+- Double-buffered prefill reads (`af46b3b`) let one reader stream layers
   back to back. The wait for expert reads fell from 0.55 s to 0.13 s per
   prompt, saving another 0.37 s (4.5%).
-- Five graph changes in `src/models/qwen4exp.cpp` (`6de789b`) avoid full
+- Five graph changes in `src/models/qwen4exp.cpp` (`af46b3b`) avoid full
   passes over the 4-stream hyper-connection state. They saved another 0.32 s
   (4.0%), with identical output. Generation after a short prompt was 3.0%
   faster in an interleaved benchmark.
-- A fused Metal kernel for the end of the hyper-connection mix (`6de789b`,
+- A fused Metal kernel for the end of the hyper-connection mix (`af46b3b`,
   based on Strata's `gr_epi_up`) saved another 0.16 s (2.1%). Generation was 2.0%
   faster, with identical output.
 - Persistent reader threads for decode-time expert misses, with each expert's
-  matrices read in parallel (`6de789b`), made generation 4.3% faster.
+  matrices read in parallel (`af46b3b`), made generation 4.3% faster.
 - Combined, with `f16` KV, the long prompt takes 7.44 s, against 10.29 s on the
   original build: 28% faster. It took 15.47 s with the original 3,072-token
   batches. A 12,121-token prompt (two batches) took 16.6 s, against 21.8 s on
@@ -335,7 +335,7 @@ parallel (16–32 at a time) would take roughly 0.15–0.25 s instead of about
 2.1 s. That would save about 1.9 s, roughly 18% of a 10.3 s prompt. Reads stay
 uncached, so memory use and SSD writes would not change.
 
-### Parallel PLE reads (commit `d38cb01`)
+### Parallel PLE reads (commit `1619fe2`)
 
 `llama_ssd_rows::read_rows` now gathers the pages for as many of the batch's
 rows as fit in the 32 MiB cache, reads the missing pages with up to 16 threads,
@@ -371,7 +371,7 @@ per-layer GPU gap is time the thread spends waiting, which sampling cannot
 show. Comparing it with the `pmgmt` total suggests about 12 ms per layer of
 waiting for the next layer's read to finish.
 
-### Threaded expert copy (commit `d38cb01`)
+### Threaded expert copy (commit `1619fe2`)
 
 `install_prefill_pipeline` (`src/llama-moe-slot.cpp`) now copies the layer's
 experts from the staging buffer into their slots with 8 threads instead of one
@@ -577,7 +577,7 @@ it, add to the Flash Next profile's `env` in `config-source.json`:
 
 Restart MoEShift after changing the configuration.
 
-## Double-buffered prefill reads (commit `6de789b`)
+## Double-buffered prefill reads (commit `af46b3b`)
 
 Temporary timers in `install_prefill_pipeline` (removed afterwards) split the
 per-layer expert stall, summed over one long prompt with the threaded copy:
@@ -606,7 +606,7 @@ With the same temporary timers, the read wait fell from 0.55 s to 0.13 s per
 prompt. Most of what remains is the first layer's read, which nothing
 overlaps. The copy time did not change.
 
-## Hyper-connection graph changes (commit `6de789b`)
+## Hyper-connection graph changes (commit `af46b3b`)
 
 The model keeps its residual as 4 parallel streams (`dsv4_hc_mult`). For a
 6,056-token batch that is a 248 MB f32 tensor. Each element-wise pass over it
@@ -635,7 +635,7 @@ native checks passed.
 Not done: a faster expert-output sum (3.5 ms per layer, in the MoE code shared
 with Qwen3.6).
 
-## Fused hyper-connection mix tail (F1, commit `6de789b`)
+## Fused hyper-connection mix tail (F1, commit `af46b3b`)
 
 Strata's prompt path (`metal/kernels/prompt.metal`, `gr_epi_up`, MIT license)
 computes the end of the hyper-connection read in one pass:
@@ -733,7 +733,7 @@ command buffer (`metal/probe/mtl_doorbell.cpp`, `busy_flag_probe.mm`).
 
 ## Prefetch use, cache size and handshake cost (G1a, G2, G5 probe)
 
-**Prefetch use (G1a, commit `6de789b`).** Window mode now counts prefetched experts
+**Prefetch use (G1a, commit `af46b3b`).** Window mode now counts prefetched experts
 that the router later used, and those evicted unused
 (`lookahead-prefetch window:` in the final diagnostics). For each layer slot,
 `src/llama-moe-slot.cpp` records whether a prefetched entry has been used yet.
@@ -866,7 +866,7 @@ How the reads are issued today:
 Reusing persistent threads, and splitting each expert's three matrices across
 threads, are the next things to try.
 
-**Persistent split demand reads (R1, commit `6de789b`).** In `src/llama-moe-slot.cpp`,
+**Persistent split demand reads (R1, commit `af46b3b`).** In `src/llama-moe-slot.cpp`,
 `start_demand` now queues one read per matrix of each missing expert, about ten
 reads per layer, to a pool of 12 persistent reader threads
 (`kDemandReadThreads`, QoS user-interactive). It no longer creates a
@@ -900,7 +900,7 @@ current layer's hidden state and reads them in the background. The shipped
 profile predicts 3 (`LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`) and reads 2
 (`LLAMA_MOE_PREFETCH_READ`). Positive protected slots used to require depth 3.
 That rule now accepts depths 1–16. The protected cache's recent group is the
-decode window plus the depth (commit `6de789b`: `src/llama-moe-tensor-loader.h`,
+decode window plus the depth (commit `af46b3b`: `src/llama-moe-tensor-loader.h`,
 `src/llama-moe-slot.cpp`, `tools/server/server-les-router.cpp`,
 `configs/README.md`, `docs/les/protected-decode-cache.md`).
 
@@ -1344,7 +1344,7 @@ was a warmup and two `short.json` requests, then `long.json`, each generating 51
 
 | Build | After a short prompt | After the long prompt | Long prompt |
 |---|---:|---:|---:|
-| Memory fix (commit `5335427`) | 22.85 tok/s | 20.51 tok/s | 7.42 s |
+| Memory fix (commit `114eb11`) | 22.85 tok/s | 20.51 tok/s | 7.42 s |
 | Phases A and B (1 row) | 22.84 tok/s | 20.36 tok/s | 7.40 s |
 | **With C1a** | **24.31 tok/s (+6.4%)** | **21.54 tok/s (+5.0%)** | 7.39 s |
 
@@ -1429,11 +1429,11 @@ Applied to prompt batches as well, it made the long prompt about 1% slower (7.51
 also with the build order reversed; tracking only the real reads did not help). The cause was not
 found, so the skip is limited to one-token steps; prompt time is then unchanged.
 
-Interleaved A/B against commit `0731c56` (C1a and C1c), same setup as above. Medians:
+Interleaved A/B against commit `e858675` (C1a and C1c), same setup as above. Medians:
 
 | Build | After a short prompt | After the long prompt | Long prompt |
 |---|---:|---:|---:|
-| `0731c56` | 25.09 tok/s | 22.15 tok/s | 7.45 s |
+| `e858675` | 25.09 tok/s | 22.15 tok/s | 7.45 s |
 | **With C1b** | **25.79 tok/s (+2.8%)** | **22.41 tok/s (+1.2%)** | 7.46 s |
 
 After a short prompt the ranges did not overlap (25.01–25.30 against 25.62–26.15). After the long
@@ -1601,7 +1601,7 @@ writing a later node's output early) was checked in the other merges (`ggml_meta
 whose memory goes to the next tensor (it fails without the fix), and the routing chain with the
 probabilities' memory reused.
 
-Interleaved A/B of the fix against commit `81d0038`, same setup as above: 26.34 and 26.33 tok/s
+Interleaved A/B of the fix against commit `d4a01bc`, same setup as above: 26.34 and 26.33 tok/s
 after a short prompt, 23.24 and 23.26 tok/s after the long one, 7.45 s for the long prompt in
 both. Every response matched, the four n-gram speculation requests matched their references, and
 peak memory was 9,446 MB (about 10 GB with speculation). This machine ran about 3% faster than
@@ -1815,7 +1815,7 @@ are the SSD misses, and those did not change. Not kept.
 ## Protected decode slots (P0)
 
 The zero-copy tests suggested that macOS's file cache already holds what the 24 protected decode
-slots per layer do. Interleaved A/B on the current build (commit after `d81e49f`), same setup as
+slots per layer do. Interleaved A/B on the current build (commit after `b23b592`), same setup as
 above: three rounds, fresh server each, warmup + 2 short requests + the long one, 512 tokens
 each; `config-source.json` with only `LLAMA_MOE_PROTECTED_SLOTS` changed. Medians; peak and final
 footprint per server; internal-SSD transfer per server run (`iostat`, reads and writes, almost
@@ -2129,7 +2129,7 @@ bound) would save 2.4%.
 - The copy into the bank is gone. If the staging buffer cannot be allocated or released, the
   worker logs it and uses the bank for every batch, as with `LLAMA_MOE_PREFILL_PIPELINE=0`.
 
-Interleaved A/B against the committed build (`09a6193`), two rounds, fresh worker each,
+Interleaved A/B against the committed build (`528eed8`), two rounds, fresh worker each,
 `config-source.json` settings, the same four requests as R2:
 
 | Request | Footprint peak | System peak | Prompt |
@@ -3450,7 +3450,7 @@ and are unaffected.
 
 **Result.** In the microbenchmark, attention with random selections: 9.7 → 7.0 s per batch at
 32k, 20.7 → 10.6 s at 64k; all-cell and adjacent selections unchanged. Interleaved A/B against
-commit `44b8828` (L2), two rounds in opposite orders, `config-source.json` settings with
+commit `209a138` (L2), two rounds in opposite orders, `config-source.json` settings with
 `--ctx-size 131072`:
 
 | Prompt | Before | After | Change |
@@ -4134,7 +4134,7 @@ experts) and was not tuned further. It runs in its own app, MoEShift Flash Next 
 | Stripped GGUF | (original shards used) | 33.3 GB |
 
 Speed, from `benchmarks/run.py` (fresh server, one warmup and three measured requests per prompt;
-medians), on the build at `209d655` plus this change, with each model's tracked profile, in the
+medians), on the build at `7d4e28f` plus this change, with each model's tracked profile, in the
 internal SSD's `~/.moeshift/models/`. The two models ran alternately, twice:
 
 | Measurement | Flash Next, round 1 / 2 | Coder, round 1 / 2 |
