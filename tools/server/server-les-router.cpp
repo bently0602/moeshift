@@ -190,7 +190,7 @@ void apply_overrides(json & config, int argc, char ** argv) {
 
 void validate_config(const json & config, const std::filesystem::path & base, std::string & binary,
                      common_params & params, std::set<std::string> & aliases) {
-    check_keys(config, {"binary", "host", "port", "api-key", "no-api-key", "models"});
+    check_keys(config, {"binary", "host", "port", "api-key", "no-api-key", "web-chat", "models"});
     if (config.contains("binary")) binary = resolve_path(base, config.at("binary"));
     else {
 #ifdef __APPLE__
@@ -228,6 +228,12 @@ void validate_config(const json & config, const std::filesystem::path & base, st
     require(config.at("port") > 0 && config.at("port") <= 65535, "port must be in 1..65535");
     params.port = config.at("port").get<int>();
     params.timeout_read = params.timeout_write = 600;
+    // The web chat (llama.cpp's UI) at /, on by default.
+    params.ui = true;
+    if (config.contains("web-chat")) {
+        require(config.at("web-chat").is_boolean(), "web-chat must be true or false");
+        params.ui = config.at("web-chat").get<bool>();
+    }
     const auto & models = config.at("models");
     require(models.is_object() && !models.empty(), "models must be a nonempty object");
     const std::set<std::string> allowed_env{
@@ -327,6 +333,58 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
             }
             return reply(200, {{"object", "list"}, {"data", data}});
         });
+        // The loaded worker's port, under `mutex`; 0 until a request has loaded it.
+        int worker_port = 0;
+        // Waits until no request is running, then marks one as running until the returned lease
+        // is released; nullptr if the request was cancelled first.
+        const auto acquire = [&](const std::function<bool()> & cancelled) -> std::shared_ptr<void> {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (busy && !cancelled()) { cv.wait_for(lock, 100ms); }
+            if (cancelled()) { return nullptr; }
+            busy = true;
+            // Not null, so that the lease tests true; the deleter only releases the worker.
+            return std::shared_ptr<void>(&worker, [&](void *) {
+                std::lock_guard<std::mutex> guard(mutex);
+                busy = false;
+                cv.notify_all();
+            });
+        };
+        const auto load = [&](const std::string & name, const std::function<bool()> & cancelled) {
+            worker.load(binary, name, models.at(name), base, cancelled);
+            std::lock_guard<std::mutex> guard(mutex);
+            worker_port = worker.port;
+        };
+        // The web chat (llama.cpp's UI, served at /) reads the worker's settings and slots. These
+        // reads do not wait for a running request; only the first one, with no worker yet, loads it.
+        const auto worker_get = [&](const server_http_req & req) -> server_http_res_ptr {
+            const auto cancelled = [&req, &stop_requested] { return stop_requested || req.should_stop(); };
+            const auto path = req.query_string.empty() ? req.path : req.path + "?" + req.query_string;
+            std::shared_ptr<void> lease;
+            int port;
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                port = worker_port;
+            }
+            if (!port) {
+                if (models.size() != 1) { return error(404, "Name a model in a request first"); }
+                lease = acquire(cancelled);
+                if (!lease) { return error(503, "Request cancelled or server stopping"); }
+                try {
+                    load(models.begin().key(), cancelled);
+                } catch (const std::exception & e) {
+                    return error(503, e.what());
+                }
+                port = worker.port;
+            }
+            auto proxy = std::make_unique<server_http_proxy>("GET", "http", "127.0.0.1", port, path,
+                    req.headers, "", req.files, cancelled, 600, 600);
+            proxy->next = [next = std::move(proxy->next), lease](std::string & output) { return next(output); };
+            return proxy;
+        };
+        if (params.ui) {
+            http.get("/props", worker_get);
+            http.get("/slots", worker_get);
+        }
         const auto infer = [&](const server_http_req & req) -> server_http_res_ptr {
             auto body = json::parse(req.body, nullptr, false);
             if (!body.is_object()) {
@@ -348,19 +406,11 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
                 return error(404, "Unknown model: " + name);
             }
             const auto cancelled = [&req, &stop_requested] { return stop_requested || req.should_stop(); };
-            std::unique_lock<std::mutex> lock(mutex);
-            while (busy && !cancelled()) { cv.wait_for(lock, 100ms); }
-            if (cancelled()) { return error(503, "Request cancelled or server stopping"); }
-            busy = true;
             // The lease survives until the complete HTTP response, including SSE, is released.
-            const auto lease = std::shared_ptr<void>(nullptr, [&](void *) {
-                std::lock_guard<std::mutex> guard(mutex);
-                busy = false;
-                cv.notify_all();
-            });
-            lock.unlock();
+            const auto lease = acquire(cancelled);
+            if (!lease) { return error(503, "Request cancelled or server stopping"); }
             try {
-                worker.load(binary, name, models.at(name), base, cancelled);
+                load(name, cancelled);
                 auto proxy = std::make_unique<server_http_proxy>("POST", "http", "127.0.0.1", worker.port,
                         req.path, req.headers, forwarded, req.files, cancelled, 600, 600);
                 proxy->next = [next = std::move(proxy->next), lease](std::string & output) { return next(output); };
@@ -382,6 +432,7 @@ int run_les_router(const char * config_path, const volatile std::sig_atomic_t & 
             std::cerr << "\n" << (color ? "\033[1;32m" : "") << "✓  MoEShift is ready!"
                       << (color ? "\033[0m" : "") << "\n\n"
                       << "   Local API   " << http.listening_address << "/v1\n";
+            if (params.ui) { std::cerr << "   Web chat    " << http.listening_address << "/\n"; }
             for (const auto & alias : aliases) std::cerr << "   Model       " << alias << '\n';
             std::cerr << "\n   Press Ctrl-C to stop.\n\n";
         } else {

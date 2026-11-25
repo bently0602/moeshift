@@ -2,7 +2,7 @@ import Foundation
 
 /// Headless checks of the app's non-UI paths, run from a built bundle:
 ///
-///   <App>.app/Contents/MacOS/<exe> --selftest-engine [--port N] [--lan] [--model-folder DIR] [--switch-port M]
+///   <App>.app/Contents/MacOS/<exe> --selftest-engine [--port N] [--lan] [--no-web-chat] [--model-folder DIR] [--switch-port M]
 ///       starts the engine with the saved settings (and this port, shared on the network with the
 ///       saved API key, or this model folder), waits until the model is loaded, stops it. With --switch-port, it first
 ///       enters port M as the port field does, restarts the engine on it and checks that only M answers.
@@ -35,6 +35,7 @@ enum SelfTest {
         }
         if args.contains("--lan") { model.settings.shareOnNetwork = true }
         if args.contains("--no-key") { model.settings.requireAPIKey = false }
+        if args.contains("--no-web-chat") { model.settings.webChat = false }
         if let i = args.firstIndex(of: "--effort"), i + 1 < args.count { model.settings.reasoningEffort = args[i + 1] }
         if let i = args.firstIndex(of: "--budgets"), i + 1 < args.count {
             // LOW,MEDIUM,HIGH in tokens; HIGH may be -1 (no limit).
@@ -86,6 +87,20 @@ enum SelfTest {
             let type = reply.flatMap { try? JSONSerialization.jsonObject(with: $0.0) as? [String: Any] }?["type"] as? String
             print("selftest: \(url.absoluteString): HTTP \(status), type \(type ?? "none"), expected 200 and message")
             guard status == 200, type == "message" else {
+                model.engine.stopAndWait()
+                return 1
+            }
+        }
+        // The web chat page at the base URL, as Open Chat opens it; with the setting off the engine
+        // serves no page there.
+        if let url = URL(string: model.localBaseURL + "/") {
+            let reply = try? await URLSession.shared.data(from: url)
+            let response = reply?.1 as? HTTPURLResponse
+            let status = response?.statusCode ?? 0
+            let html = (response?.value(forHTTPHeaderField: "Content-Type") ?? "").hasPrefix("text/html")
+            let expected = model.settings.webChat ? 200 : 404
+            print("selftest: \(url.absoluteString): HTTP \(status)\(html ? ", HTML" : ""), expected \(expected)\(model.settings.webChat ? ", HTML" : "")")
+            guard status == expected, html == model.settings.webChat else {
                 model.engine.stopAndWait()
                 return 1
             }

@@ -89,6 +89,11 @@ final class AppModel: ObservableObject {
     var localBaseURL: String { "http://127.0.0.1:\(activePort)" }
     var localURL: String { localBaseURL + "/v1" }
     var networkBaseURLs: [String] { localNetworkAddresses().map { "http://\($0):\(activePort)" } }
+
+    /// Opens the engine's web chat in the default browser.
+    func openChat() {
+        if let url = URL(string: localBaseURL + "/") { NSWorkspace.shared.open(url) }
+    }
 }
 
 func copyToPasteboard(_ text: String) {

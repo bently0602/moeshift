@@ -1,21 +1,28 @@
 # Build MoEShift from source
 
-Requires Apple Silicon, Apple Command Line Tools and CMake. Python 3.10+ is
+Requires Apple Silicon, Apple Command Line Tools, CMake and npm (`brew install node`, to build
+the web chat). Python 3.10+ is
 needed for expert preparation and the Python checks. Use the existing GGUF
 package dependencies; see `gguf-py/pyproject.toml`.
 
 ```sh
+(cd tools/ui && npm ci --ignore-scripts --no-audit --no-fund)  # once
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
   -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=ON \
-  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_APP=OFF \
+  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_APP=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=ON \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local"
 cmake --build build --target moeshift -j 8
 cmake --install build --component moeshift
 ```
 
-`scripts/build-moeshift.sh` runs the same configuration and build. `apps/build.sh` runs it and
-then builds the two Mac apps into `build/apps/` (see [apps](../apps/README.md)). Add
+The web chat (llama.cpp's UI in `tools/ui`) is built with npm from the packages in its
+`package-lock.json` and compiled into the binary; the router serves it at `/` (see `web-chat` in
+[configuration](../configs/README.md#configuration-reference)).
+
+`scripts/build-moeshift.sh` runs the same configuration and build, installs the web chat's packages
+the first time, and stops if the web chat was not built. `apps/build.sh` runs it and
+then builds the three Mac apps into `build/apps/` (see [apps](../apps/README.md)). Add
 `--test` to run the focused checks below, `--install [PREFIX]` to install
 (default `$HOME/.local`), or `--run [ARGS...]` to start `build/bin/moeshift`
 afterwards with the remaining arguments. The router check uses `PYTHON` when set, otherwise

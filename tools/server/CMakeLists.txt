@@ -77,9 +77,9 @@ target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 
 # Minimal OpenAI-compatible server using the current server runtime
 
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ui.h"
-    "#pragma once\n"
-)
+# The web chat comes from llama-ui (tools/ui): its ui.h, and the assets when they were built.
+# Builds before this used an empty ui.h here, which would hide llama-ui's.
+file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/ui.h")
 
 add_executable(moeshift
     server-les.cpp
@@ -93,6 +93,7 @@ set_target_properties(moeshift PROPERTIES OUTPUT_NAME moeshift INSTALL_RPATH "@l
 target_link_libraries(moeshift PRIVATE
     server-context
     llama-common
+    llama-ui
     cpp-httplib
     ${CMAKE_THREAD_LIBS_INIT}
 )

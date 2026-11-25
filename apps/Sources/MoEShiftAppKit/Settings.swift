@@ -29,6 +29,8 @@ public struct AppSettings: Codable, Equatable {
     public var lowBudget: Int?
     public var mediumBudget: Int?
     public var highBudget: Int?
+    /// Whether the engine serves llama.cpp's web chat at its base URL, for chatting in a browser.
+    public var webChat: Bool
 
     public static let defaultLowBudget = 1_024
     public static let defaultMediumBudget = 4_096
@@ -49,7 +51,8 @@ public struct AppSettings: Codable, Equatable {
             contextSize: nil,
             lowBudget: nil,
             mediumBudget: nil,
-            highBudget: nil)
+            highBudget: nil,
+            webChat: true)
     }
 
     /// The key the engine requires, or nil when it requires none.
@@ -58,7 +61,7 @@ public struct AppSettings: Codable, Equatable {
 
 extension AppSettings {
     /// Settings saved before requireAPIKey existed still load, with the key required; settings saved
-    /// before contextSize or the thinking budgets existed load with the defaults.
+    /// before contextSize, the thinking budgets or webChat existed load with the defaults.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         modelFolder = try c.decode(String.self, forKey: .modelFolder)
@@ -73,6 +76,7 @@ extension AppSettings {
         lowBudget = try c.decodeIfPresent(Int.self, forKey: .lowBudget)
         mediumBudget = try c.decodeIfPresent(Int.self, forKey: .mediumBudget)
         highBudget = try c.decodeIfPresent(Int.self, forKey: .highBudget)
+        webChat = try c.decodeIfPresent(Bool.self, forKey: .webChat) ?? true
     }
 }
 
@@ -235,6 +239,7 @@ enum ConfigWriter {
             "host": settings.shareOnNetwork ? "0.0.0.0" : "127.0.0.1",
             "port": settings.port,
             "models": [spec.alias: profile],
+            "web-chat": settings.webChat,
         ]
         if let key = settings.engineAPIKey { config["api-key"] = key }
         else if settings.shareOnNetwork { config["no-api-key"] = true }

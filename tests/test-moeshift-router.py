@@ -43,7 +43,7 @@ def fake_worker():
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            self.wfile.write(json.dumps({"status": "ok", "path": self.path}).encode())
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -227,6 +227,44 @@ class RouterTest(unittest.TestCase):
             self.assertEqual(reply["args"]["--alias"], "a")
             self.assertEqual(reply["model"], "a")
         self.assertEqual(self.request("POST", "/v1/chat/completions", [])[0], 400)
+
+    def test_web_chat(self):
+        self.stop()
+        path = self.root / "chat.json"
+        single = dict(self.config, models={"a": self.config["models"]["a"]})
+        path.write_text(json.dumps(dict(single, **{"web-chat": "yes"})))
+        result = subprocess.run([BINARY, "--config", str(path)], capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"web-chat must be true or false", result.stderr)
+        for extra, enabled in (({}, True), ({"web-chat": False}, False)):
+            path.write_text(json.dumps(dict(single, **extra)))
+            self.proc = subprocess.Popen([BINARY, "--config", str(path)], stdout=self.log, stderr=self.log,
+                                         env=dict(os.environ, MOESHIFT_ROUTER_TEST_LOG=str(self.events)))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    if self.request("GET", "/health")[0] == 200:
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+            try:
+                conn.request("GET", "/")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200 if enabled else 404)
+                if enabled:
+                    self.assertTrue(response.getheader("Content-Type", "").startswith("text/html"))
+            finally:
+                conn.close()
+            if enabled:
+                # Forwarded to the worker, which is loaded by the first one; the query is kept.
+                self.assertEqual(self.request("GET", "/props"), (200, {"status": "ok", "path": "/props"}))
+                self.assertEqual(self.request("GET", "/slots?model=a"),
+                                 (200, {"status": "ok", "path": "/slots?model=a"}))
+            else:
+                self.assertEqual(self.request("GET", "/props")[0], 404)
+            self.stop()
 
     def test_worker_rejects_speculative_options(self):
         for option in ("--spec-type", "--model-draft", "--parallel"):

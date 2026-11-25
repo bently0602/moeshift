@@ -22,7 +22,8 @@ again, copy `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf` into the do
 ## Build
 
 Requires Apple Silicon, macOS 14 or later, the Apple Command Line Tools (`xcode-select --install`)
-and CMake (`brew install cmake`). Xcode is not needed. From the repository root:
+CMake (`brew install cmake`) and npm (`brew install node`, to build the web chat). Xcode is not
+needed. From the repository root:
 
 ```sh
 apps/build.sh
@@ -67,6 +68,12 @@ GGUF, run setup from it and delete the original shards once the stripped GGUF is
 - **Start / Stop.** Start also loads the model, so the first request does not wait for it.
   Quitting the app stops the engine. If the engine or the model fails to load, the app stops the
   engine and shows the error; the Log has the engine's output.
+- **Open Chat** opens a chat page in the browser once the model is ready: llama.cpp's web chat,
+  served by the engine at its base URL (`http://127.0.0.1:<port>/`, shown as **Chat URL**). It
+  needs nothing else installed, and it keeps its conversations in the browser. With **Share on the
+  local network** on, other computers can open it at the network address shown; when the API key
+  is required, the page asks for it once. Turning off **Chat in the browser** (on by default)
+  removes the page, leaving only the API; change it while the engine is stopped.
 - **Connect a client** with the model ID shown and one of two URLs; a client that sends another
   model ID, or none, gets this model:
   - **OpenAI URL** (`http://127.0.0.1:<port>/v1`): chat completions (`/v1/chat/completions`),
@@ -124,14 +131,15 @@ and the file cache.
 From a terminal, without a window:
 
 ```sh
-"build/apps/MoEShift A3B.app/Contents/MacOS/A3BApp" --selftest-engine [--port N] [--lan [--no-key]] [--effort LEVEL] [--budgets LOW,MEDIUM,HIGH] [--context TOKENS] [--model-folder DIR] [--switch-port M]
+"build/apps/MoEShift A3B.app/Contents/MacOS/A3BApp" --selftest-engine [--port N] [--lan [--no-key]] [--no-web-chat] [--effort LEVEL] [--budgets LOW,MEDIUM,HIGH] [--context TOKENS] [--model-folder DIR] [--switch-port M]
 "build/apps/MoEShift A3B.app/Contents/MacOS/A3BApp" --selftest-prepare MODEL_DIR DOWNLOAD_DIR [GGUF]
 ```
 
 The first starts the engine with the saved settings (or the given port, network sharing, with or
 without the key, thinking effort, thinking limits (HIGH `-1` for no limit), context limit or model
 folder), waits until the model is loaded, sends one Anthropic Messages request to the
-Anthropic URL (with the key in `x-api-key` when one is required) and stops it, or prints the
+Anthropic URL (with the key in `x-api-key` when one is required), checks that the web chat page
+answers at the base URL (or, with `--no-web-chat`, that nothing does) and stops it, or prints the
 error the window would show. When sharing, it checks that a request without a key on a network
 address is refused only if the key is required. With `--switch-port` it first restarts the engine
 on port M, as the port field does, and checks that only M answers.

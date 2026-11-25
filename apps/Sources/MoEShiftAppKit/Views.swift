@@ -34,6 +34,9 @@ struct MainView: View {
                         }
                     }
                     Spacer()
+                    if engine.state == .ready, model.settings.webChat {
+                        Button("Open Chat") { model.openChat() }
+                    }
                     if engine.state.isRunning || engine.state == .stopping {
                         Button("Stop") { engine.stop() }.disabled(engine.state == .stopping)
                     } else {
@@ -74,6 +77,25 @@ struct MainView: View {
                             .font(.caption).foregroundStyle(.orange)
                     }
                 }
+            }
+
+            Section("Web chat") {
+                Toggle("Chat in the browser", isOn: $model.settings.webChat)
+                    .disabled(locked)
+                if model.settings.webChat {
+                    CopyRow(label: "Chat URL", value: model.localBaseURL + "/")
+                    if model.settings.shareOnNetwork {
+                        ForEach(model.networkBaseURLs, id: \.self) { base in
+                            CopyRow(label: "Network chat", value: base + "/")
+                        }
+                    }
+                }
+                Text(model.settings.webChat
+                     ? (model.settings.engineAPIKey != nil
+                        ? "Open Chat opens a chat page in your browser once the model is ready. The page asks for the API key once."
+                        : "Open Chat opens a chat page in your browser once the model is ready.")
+                     : "Off: the engine serves only the API.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Connect a client") {

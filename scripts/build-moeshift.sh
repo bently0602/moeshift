@@ -41,6 +41,7 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
 fi
 command -v cmake >/dev/null || { echo "CMake not found; install it with: brew install cmake" >&2; exit 1; }
 xcode-select -p >/dev/null 2>&1 || { echo "Apple Command Line Tools not found; install them with: xcode-select --install" >&2; exit 1; }
+command -v npm >/dev/null || { echo "npm not found (it builds the web chat); install it with: brew install node" >&2; exit 1; }
 
 supported_python() {
   command -v "$1" >/dev/null 2>&1 &&
@@ -65,12 +66,20 @@ cd "$(dirname "$0")/.."
 root="$(pwd)"
 jobs="$(sysctl -n hw.ncpu)"
 
+# The web chat (llama.cpp's UI, served at /) is built from tools/ui with npm and compiled into
+# the binary. Its packages are installed once, exactly as package-lock.json lists them.
+if [ ! -d tools/ui/node_modules ]; then
+  (cd tools/ui && npm ci --ignore-scripts --no-audit --no-fund)
+fi
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
   -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=ON \
-  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_APP=OFF \
+  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_APP=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=ON \
   -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --build build --target moeshift -j "$jobs"
+grep -q LLAMA_UI_HAS_ASSETS build/tools/ui/ui.h ||
+  { echo "The web chat was not built; see the \"UI:\" lines above" >&2; exit 1; }
 
 if [ "$test" = 1 ]; then
   checks="test-les-protected-cache test-les-active-ranges test-metal-moe-phases test-indexer-keys test-kv-grow test-metal-hc-fusion test-metal-fa-group test-ssd-rows"

@@ -225,6 +225,17 @@ int main(int argc, char ** argv) {
                 routes.get_models
             );
 
+            // Read by the web chat, which the router serves at /.
+            http.get(
+                "/props",
+                routes.get_props
+            );
+
+            http.get(
+                "/slots",
+                routes.get_slots
+            );
+
             http.post(
                 "/v1/chat/completions",
                 routes.post_chat_completions
